@@ -24,6 +24,16 @@ from .matv_parser import MatvParser
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SELECTED_CELL = "S1D1"
+VOLTAGE_FACTORS_TO_UV = {
+    "uv": 1.0,
+    "mv": 1_000.0,
+    "v": 1_000_000.0,
+}
+CANONICAL_VOLTAGE_UNITS = {
+    "uv": "uV",
+    "mv": "mV",
+    "v": "V",
+}
 
 
 class RuntimeState:
@@ -145,6 +155,24 @@ def createDashApp(
                         ],
                         style=CONTROL_ITEM_STYLE,
                     ),
+                    html.Div(
+                        [
+                            html.Label("Display unit", style=LABEL_STYLE),
+                            dcc.Dropdown(
+                                id="unit-mode",
+                                value="auto",
+                                clearable=False,
+                                options=[
+                                    {"label": "Auto uV/mV/V", "value": "auto"},
+                                    {"label": "Source unit", "value": "source"},
+                                    {"label": "uV", "value": "uV"},
+                                    {"label": "mV", "value": "mV"},
+                                    {"label": "V", "value": "V"},
+                                ],
+                            ),
+                        ],
+                        style=CONTROL_ITEM_STYLE,
+                    ),
                 ],
                 style=CONTROL_GRID_STYLE,
             ),
@@ -166,11 +194,28 @@ def createDashApp(
                         style=PANEL_STYLE,
                     ),
                     html.Div(
-                        dcc.Graph(
-                            id="history-graph",
-                            config={"displayModeBar": True, "responsive": True},
-                            style={"height": "620px"},
-                        ),
+                        [
+                            html.Div(
+                                [
+                                    html.Label("Cell", style=LABEL_STYLE),
+                                    dcc.Dropdown(
+                                        id="cell-dropdown",
+                                        value=DEFAULT_SELECTED_CELL,
+                                        clearable=False,
+                                        options=[
+                                            {"label": cell_name, "value": cell_name}
+                                            for cell_name in CELL_NAMES
+                                        ],
+                                    ),
+                                ],
+                                style={"margin": "4px 4px 8px 4px"},
+                            ),
+                            dcc.Graph(
+                                id="history-graph",
+                                config={"displayModeBar": True, "responsive": True},
+                                style={"height": "570px"},
+                            ),
+                        ],
                         style=PANEL_STYLE,
                     ),
                 ],
@@ -205,20 +250,25 @@ def createDashApp(
         return new_paused, "Resume" if new_paused else "Pause"
 
     @app.callback(
-        Output("selected-cell-store", "data"),
+        Output("cell-dropdown", "value"),
         Input("heatmap", "clickData"),
-        State("selected-cell-store", "data"),
+        State("cell-dropdown", "value"),
     )
-    def select_cell(click_data: dict | None, current_cell: str | None) -> str:
+    def select_cell_from_heatmap(click_data: dict | None, current_cell: str | None) -> str:
         if not click_data:
             return current_cell or DEFAULT_SELECTED_CELL
 
-        try:
-            custom_data = click_data["points"][0].get("customdata")
-            cell_name = custom_data[0] if isinstance(custom_data, list) else custom_data
-        except Exception:
-            return current_cell or DEFAULT_SELECTED_CELL
+        cell_name = _cell_name_from_click_data(click_data)
+        if cell_name in CELL_NAMES:
+            return cell_name
+        return current_cell or DEFAULT_SELECTED_CELL
 
+    @app.callback(
+        Output("selected-cell-store", "data"),
+        Input("cell-dropdown", "value"),
+        State("selected-cell-store", "data"),
+    )
+    def select_cell_from_dropdown(cell_name: str | None, current_cell: str | None) -> str:
         if cell_name in CELL_NAMES:
             return cell_name
         return current_cell or DEFAULT_SELECTED_CELL
@@ -263,6 +313,7 @@ def createDashApp(
         Input("color-mode", "value"),
         Input("fixed-min", "value"),
         Input("fixed-max", "value"),
+        Input("unit-mode", "value"),
     )
     def refresh_view(
         _n_intervals: int,
@@ -271,16 +322,22 @@ def createDashApp(
         color_mode: str,
         fixed_min: Any,
         fixed_max: Any,
+        unit_mode: str,
     ) -> tuple[go.Figure, go.Figure, list]:
         if not paused:
             _drain_queue(lineQueue, parser, dataStore, csvWriter, runtime_state, maxLinesPerTick)
 
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
-        latest_matrix = dataStore.getLatestMatrix()
+        latest_matrix_raw = dataStore.getLatestMatrix()
         latest_meta = dataStore.getLatestFrameMeta()
         parser_stats = parser.getStats()
         reader_status = reader.getStatus() if reader is not None else {}
         runtime_stats = runtime_state.getStats()
+        latest_matrix, display_unit = _convert_matrix_for_display(
+            latest_matrix_raw,
+            latest_meta.get("unit") or "",
+            unit_mode,
+        )
 
         heatmap = _build_heatmap_figure(
             latest_matrix,
@@ -289,8 +346,13 @@ def createDashApp(
             color_mode,
             fixed_min,
             fixed_max,
+            display_unit,
         )
-        history = _build_history_figure(selected_cell, dataStore.getCellHistory(selected_cell))
+        history = _build_history_figure(
+            selected_cell,
+            dataStore.getCellHistory(selected_cell),
+            unit_mode,
+        )
         status = _build_status_bar(
             latest_meta,
             parser_stats,
@@ -298,6 +360,7 @@ def createDashApp(
             runtime_stats,
             paused,
             _safe_qsize(lineQueue),
+            display_unit,
         )
         return heatmap, history, status
 
@@ -343,8 +406,9 @@ def _build_heatmap_figure(
     color_mode: str,
     fixed_min: Any,
     fixed_max: Any,
+    display_unit: str,
 ) -> go.Figure:
-    unit = meta.get("unit") or ""
+    unit = display_unit or meta.get("unit") or ""
     custom_data = np.array(
         [[f"S{row_index + 1}D{column_index + 1}" for column_index in range(MATRIX_SIZE)] for row_index in range(MATRIX_SIZE)]
     )
@@ -424,7 +488,7 @@ def _build_heatmap_figure(
     return fig
 
 
-def _build_history_figure(cell_name: str, history) -> go.Figure:
+def _build_history_figure(cell_name: str, history, unit_mode: str = "auto") -> go.Figure:
     fig = go.Figure()
     if history.empty:
         fig.add_annotation(
@@ -439,24 +503,30 @@ def _build_history_figure(cell_name: str, history) -> go.Figure:
         title = f"History of {cell_name}"
         y_title = "value"
     else:
-        units = [unit for unit in history["unit"].dropna().unique().tolist() if unit != ""]
-        mixed_units = len(units) > 1
-        unit_label = "mixed units" if mixed_units else (units[0] if units else "value")
+        display_values, unit_label, mixed_units, converted = _convert_history_for_display(
+            history,
+            unit_mode,
+        )
         title = f"History of {cell_name}" + (" (Mixed units)" if mixed_units else "")
         y_title = f"value ({unit_label})" if unit_label != "value" else "value"
-        custom_data = history[["seq", "timestampUs", "unit"]].to_numpy()
+        custom_data = history[["seq", "timestampUs", "unit", "value"]].to_numpy()
+        value_hover = (
+            f"value=%{{y:,.6g}} {unit_label}<br>"
+            "source=%{customdata[3]:,.6g} %{customdata[2]}<br>"
+            if converted
+            else "value=%{y:,.6g}<br>unit=%{customdata[2]}<br>"
+        )
         fig.add_trace(
             go.Scattergl(
                 x=history["timeSeconds"],
-                y=history["value"],
+                y=display_values,
                 mode="lines+markers",
                 line={"color": "#0f766e", "width": 2},
                 marker={"size": 4},
                 customdata=custom_data,
                 hovertemplate=(
                     "time=%{x:.6f}s<br>"
-                    "value=%{y:,.6g}<br>"
-                    "unit=%{customdata[2]}<br>"
+                    + value_hover +
                     "seq=%{customdata[0]}<br>"
                     "timestamp_us=%{customdata[1]}<extra></extra>"
                 ),
@@ -484,6 +554,7 @@ def _build_status_bar(
     runtime_stats: dict,
     paused: bool,
     queue_depth: int | str,
+    display_unit: str,
 ) -> list:
     return [
         _status_item("Input", _reader_label(reader_status, paused)),
@@ -491,6 +562,7 @@ def _build_status_bar(
         _status_item("timestamp_us", _dash_if_none(meta.get("timestampUs"))),
         _status_item("duration_us", _dash_if_none(meta.get("durationUs"))),
         _status_item("unit", meta.get("unit") or "-"),
+        _status_item("display_unit", display_unit or meta.get("unit") or "-"),
         _status_item("received_frames", meta.get("receivedFrames", 0)),
         _status_item("raw_lines", reader_status.get("rawLinesReceived", 0)),
         _status_item("queued_lines", queue_depth),
@@ -553,6 +625,80 @@ def _resolve_color_range(
     return None, None
 
 
+def _convert_matrix_for_display(
+    matrix: np.ndarray,
+    source_unit: str,
+    unit_mode: str,
+) -> tuple[np.ndarray, str]:
+    source_key = _normalize_unit(source_unit)
+    if source_key not in VOLTAGE_FACTORS_TO_UV:
+        return matrix.copy(), source_unit
+
+    source_factor = VOLTAGE_FACTORS_TO_UV[source_key]
+    values_uv = matrix.astype(float, copy=True) * source_factor
+    target_key = _resolve_target_voltage_unit(values_uv, unit_mode, source_key)
+    converted = values_uv / VOLTAGE_FACTORS_TO_UV[target_key]
+    return converted, CANONICAL_VOLTAGE_UNITS[target_key]
+
+
+def _convert_history_for_display(history, unit_mode: str) -> tuple[np.ndarray, str, bool, bool]:
+    raw_values = history["value"].to_numpy(dtype=float)
+    units = [unit for unit in history["unit"].dropna().unique().tolist() if unit != ""]
+    unit_keys = [_normalize_unit(unit) for unit in units]
+    all_voltage = bool(unit_keys) and all(unit_key in VOLTAGE_FACTORS_TO_UV for unit_key in unit_keys)
+
+    if not all_voltage:
+        mixed_units = len(units) > 1
+        unit_label = "mixed units" if mixed_units else (units[0] if units else "value")
+        return raw_values, unit_label, mixed_units, False
+
+    if unit_mode == "source" and len(set(unit_keys)) > 1:
+        return raw_values, "mixed units", True, False
+
+    source_unit_keys = history["unit"].map(_normalize_unit).to_numpy()
+    values_uv = np.array(
+        [
+            value * VOLTAGE_FACTORS_TO_UV.get(unit_key, np.nan)
+            for value, unit_key in zip(raw_values, source_unit_keys)
+        ],
+        dtype=float,
+    )
+    source_key = unit_keys[0]
+    target_key = _resolve_target_voltage_unit(values_uv, unit_mode, source_key)
+    converted_values = values_uv / VOLTAGE_FACTORS_TO_UV[target_key]
+    return converted_values, CANONICAL_VOLTAGE_UNITS[target_key], False, True
+
+
+def _resolve_target_voltage_unit(
+    values_uv: np.ndarray,
+    unit_mode: str,
+    source_key: str,
+) -> str:
+    requested_key = _normalize_unit(unit_mode)
+    if requested_key in VOLTAGE_FACTORS_TO_UV:
+        return requested_key
+    if unit_mode == "source" and source_key in VOLTAGE_FACTORS_TO_UV:
+        return source_key
+    return _choose_auto_voltage_unit(values_uv)
+
+
+def _choose_auto_voltage_unit(values_uv: np.ndarray) -> str:
+    finite_values = values_uv[np.isfinite(values_uv)]
+    if not finite_values.size:
+        return "uv"
+
+    max_abs_uv = float(np.max(np.abs(finite_values)))
+    if max_abs_uv >= VOLTAGE_FACTORS_TO_UV["v"]:
+        return "v"
+    if max_abs_uv >= VOLTAGE_FACTORS_TO_UV["mv"]:
+        return "mv"
+    return "uv"
+
+
+def _normalize_unit(unit: Any) -> str:
+    return str(unit or "").strip().replace("µ", "u").replace("μ", "u").lower()
+
+
 def _format_value(value: float, unit: str = "") -> str:
     if not np.isfinite(value):
         return "NaN"
@@ -561,6 +707,14 @@ def _format_value(value: float, unit: str = "") -> str:
     else:
         value_text = f"{float(value):,.3g}"
     return f"{value_text} {unit}".strip()
+
+
+def _cell_name_from_click_data(click_data: dict | None) -> str | None:
+    try:
+        custom_data = click_data["points"][0].get("customdata")
+    except Exception:
+        return None
+    return custom_data[0] if isinstance(custom_data, list) else custom_data
 
 
 def _split_cell_name(cell_name: str) -> tuple[int | None, int | None]:
@@ -737,4 +891,3 @@ PANEL_STYLE = {
     "padding": "8px",
     "minWidth": 0,
 }
-

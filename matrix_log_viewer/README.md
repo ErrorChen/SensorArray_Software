@@ -111,10 +111,12 @@ S1D1,S1D2,...,S1D8,S2D1,...,S8D8
 - 8x8 热力图实时刷新，行是 `S1` 到 `S8`，列是 `D1` 到 `D8`。
 - 每个格子显示点位名和当前值。
 - 点击热力图格子后，历史曲线自动切换到该点位。
+- 右侧 `Cell` 下拉框可以直接切换不同点位的历史曲线。
 - `Pause / Resume` 可以暂停或继续从队列读取并刷新数据。
 - `Clear History` 清空内存历史数据，当前帧计数归零。
 - `Save Snapshot CSV` 将当前内存宽表数据保存到运行目录的 `exports/` 文件夹。
 - 色阶支持 `Auto`、`Symmetric around zero`、`Fixed range`。
+- 显示单位支持 `Auto uV/mV/V`、`Source unit`、`uV`、`mV`、`V`。单位转换只影响界面显示和图表，不改变内存原始值或 CSV 导出值。
 
 ## CSV 输出
 
