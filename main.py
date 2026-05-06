@@ -10,11 +10,11 @@ def main() -> int:
     if not viewer_dir.exists():
         raise RuntimeError(f"Matrix viewer directory not found: {viewer_dir}")
 
-    # Keep the root-level entry point simple: python main.py opens the GUI launcher.
+    # Default entry point: launch the Dash viewer. COM ports can be selected in the web UI.
     sys.path.insert(0, str(viewer_dir))
-    from run_gui import main as run_gui_main
+    from run_viewer import main as run_viewer_main
 
-    return run_gui_main()
+    return run_viewer_main()
 
 
 if __name__ == "__main__":

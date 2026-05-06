@@ -1,2 +1,24 @@
-/.venv
-/.vscode
+/.venv/
+/.vscode/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+venv/
+env/
+.env
+.env.*
+
+# Runtime outputs
+exports/
+*.log
+*.tmp
+
+# Local protocol/reference checkouts
+_hardware_ref/

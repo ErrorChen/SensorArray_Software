@@ -10,30 +10,26 @@ from typing import Any
 
 import numpy as np
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dcc, html, no_update
+from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 
 from .config import (
     CELL_NAMES,
+    DEFAULT_BAUD,
     DEFAULT_REFRESH_INTERVAL_MS,
     DETECTOR_LABELS,
+    DISPLAY_DOWNSAMPLE_TARGET_POINTS,
     MATRIX_SIZE,
     SOURCE_LABELS,
 )
+from .connection_manager import ConnectionManager
 from .data_store import CsvFrameWriter, MatrixDataStore
-from .matv_parser import MatvParser
+from .protocol_parser import SensorArrayStreamParser
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SELECTED_CELL = "S1D1"
-VOLTAGE_FACTORS_TO_UV = {
-    "uv": 1.0,
-    "mv": 1_000.0,
-    "v": 1_000_000.0,
-}
-CANONICAL_VOLTAGE_UNITS = {
-    "uv": "uV",
-    "mv": "mV",
-    "v": "V",
-}
+DEFAULT_FRAME_TYPES = ["FAST_BINARY", "MATV", "MATV_RAW", "MATV_GAIN", "MATV_ERR"]
+VOLTAGE_FACTORS_TO_UV = {"uv": 1.0, "mv": 1_000.0, "v": 1_000_000.0}
+CANONICAL_VOLTAGE_UNITS = {"uv": "uV", "mv": "mV", "v": "V"}
 
 
 class RuntimeState:
@@ -52,56 +48,36 @@ class RuntimeState:
 
     def getStats(self) -> dict:
         with self._lock:
-            return {
-                "csvRowsWritten": self.csvRowsWritten,
-                "lastCsvError": self.lastCsvError,
-            }
+            return {"csvRowsWritten": self.csvRowsWritten, "lastCsvError": self.lastCsvError}
 
 
 def createDashApp(
-    lineQueue: "queue.Queue[str]",
-    parser: MatvParser,
+    inputQueue: "queue.Queue[bytes]",
+    parser: SensorArrayStreamParser,
     dataStore: MatrixDataStore,
-    reader: Any | None = None,
+    connectionManager: ConnectionManager | None = None,
     csvWriter: CsvFrameWriter | None = None,
-    maxLinesPerTick: int = 1000,
+    maxChunksPerTick: int = 200,
+    maxParseResultsPerTick: int = 5000,
+    **_legacy_kwargs: Any,
 ) -> Dash:
     runtime_state = RuntimeState()
-    app = Dash(__name__, title="Matrix Log Viewer")
+    manager = connectionManager or ConnectionManager(inputQueue)
+    app = Dash(__name__, title="SensorArray Matrix Viewer")
 
     app.layout = html.Div(
         [
             dcc.Store(id="selected-cell-store", data=DEFAULT_SELECTED_CELL),
             dcc.Store(id="paused-store", data=False),
-            dcc.Interval(
-                id="refresh-interval",
-                interval=DEFAULT_REFRESH_INTERVAL_MS,
-                n_intervals=0,
-            ),
+            dcc.Interval(id="refresh-interval", interval=DEFAULT_REFRESH_INTERVAL_MS, n_intervals=0),
             html.Div(
                 [
-                    html.Div(
-                        [
-                            html.H1("Matrix Log Viewer", style=TITLE_STYLE),
-                            html.Div(id="status-bar", style=STATUS_GRID_STYLE),
-                        ],
-                        style={"minWidth": 0},
-                    ),
+                    html.Div([html.H1("SensorArray Matrix Viewer", style=TITLE_STYLE), html.Div(id="status-bar", style=STATUS_GRID_STYLE)]),
                     html.Div(
                         [
                             html.Button("Pause", id="pause-button", n_clicks=0, style=BUTTON_STYLE),
-                            html.Button(
-                                "Clear History",
-                                id="clear-button",
-                                n_clicks=0,
-                                style=SECONDARY_BUTTON_STYLE,
-                            ),
-                            html.Button(
-                                "Save Snapshot CSV",
-                                id="save-button",
-                                n_clicks=0,
-                                style=SECONDARY_BUTTON_STYLE,
-                            ),
+                            html.Button("Clear History", id="clear-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
+                            html.Button("Save Snapshot CSV", id="save-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
                         ],
                         style=BUTTON_ROW_STYLE,
                     ),
@@ -112,123 +88,90 @@ def createDashApp(
                 [
                     html.Div(
                         [
-                            html.Label("Color scale", style=LABEL_STYLE),
-                            dcc.Dropdown(
-                                id="color-mode",
-                                value="auto",
-                                clearable=False,
-                                options=[
-                                    {"label": "Auto", "value": "auto"},
-                                    {"label": "Symmetric around zero", "value": "symmetric"},
-                                    {"label": "Fixed range", "value": "fixed"},
+                            html.H2("Connection", style=SECTION_TITLE_STYLE),
+                            html.Div(
+                                [
+                                    _control("Input Mode", dcc.Dropdown(id="input-mode", value="serial", clearable=False, options=[
+                                        {"label": "Serial", "value": "serial"},
+                                        {"label": "Replay File", "value": "replay"},
+                                        {"label": "Disconnected", "value": "disconnected"},
+                                    ])),
+                                    _control("COM Port", dcc.Dropdown(id="com-port-dropdown", options=[], placeholder="Refresh ports")),
+                                    html.Button("Refresh Ports", id="refresh-ports-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
+                                    _control("Baudrate", dcc.Input(id="baud-input", type="number", value=DEFAULT_BAUD, min=1, step=1, style=INPUT_STYLE)),
+                                    _control("Auto reconnect", dcc.Checklist(id="auto-reconnect", value=[], options=[{"label": "Enabled", "value": "enabled"}], style=CHECKLIST_STYLE)),
+                                    html.Button("Connect", id="connect-button", n_clicks=0, style=BUTTON_STYLE),
+                                    html.Button("Disconnect", id="disconnect-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
+                                    html.Button("Reconnect", id="reconnect-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
+                                    _control("Replay file", dcc.Input(id="replay-file-input", type="text", debounce=True, style=INPUT_STYLE)),
+                                    _control("Replay speed", dcc.Input(id="replay-speed-input", type="number", value=1.0, min=0.01, step=0.5, style=INPUT_STYLE)),
+                                    html.Button("Start Replay", id="start-replay-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
                                 ],
+                                style=CONNECTION_GRID_STYLE,
                             ),
+                            html.Div(id="port-refresh-status", style=MESSAGE_STYLE),
+                            html.Div(id="connection-action-status", style=MESSAGE_STYLE),
+                            html.Div(id="connection-status-panel", style=STATUS_GRID_STYLE),
                         ],
-                        style=CONTROL_ITEM_STYLE,
+                        style=PANEL_STYLE,
                     ),
-                    html.Div(
-                        [
-                            html.Label("Fixed min", style=LABEL_STYLE),
-                            dcc.Input(id="fixed-min", type="number", debounce=True, style=INPUT_STYLE),
-                        ],
-                        style=CONTROL_ITEM_STYLE,
-                    ),
-                    html.Div(
-                        [
-                            html.Label("Fixed max", style=LABEL_STYLE),
-                            dcc.Input(id="fixed-max", type="number", debounce=True, style=INPUT_STYLE),
-                        ],
-                        style=CONTROL_ITEM_STYLE,
-                    ),
-                    html.Div(
-                        [
-                            html.Label("Refresh ms", style=LABEL_STYLE),
-                            dcc.Input(
-                                id="interval-ms",
-                                type="number",
-                                value=DEFAULT_REFRESH_INTERVAL_MS,
-                                min=100,
-                                step=100,
-                                debounce=True,
-                                style=INPUT_STYLE,
-                            ),
-                        ],
-                        style=CONTROL_ITEM_STYLE,
-                    ),
-                    html.Div(
-                        [
-                            html.Label("Display unit", style=LABEL_STYLE),
-                            dcc.Dropdown(
-                                id="unit-mode",
-                                value="auto",
-                                clearable=False,
-                                options=[
-                                    {"label": "Auto uV/mV/V", "value": "auto"},
-                                    {"label": "Source unit", "value": "source"},
-                                    {"label": "uV", "value": "uV"},
-                                    {"label": "mV", "value": "mV"},
-                                    {"label": "V", "value": "V"},
-                                ],
-                            ),
-                        ],
-                        style=CONTROL_ITEM_STYLE,
-                    ),
+                ],
+                style={"marginTop": "16px"},
+            ),
+            html.Div(
+                [
+                    _control("Data stream", dcc.Dropdown(id="frame-type-dropdown", value="FAST_BINARY", clearable=False, options=_frame_type_options(DEFAULT_FRAME_TYPES))),
+                    _control("Cell", dcc.Dropdown(id="cell-dropdown", value=DEFAULT_SELECTED_CELL, clearable=False, options=[{"label": cell, "value": cell} for cell in CELL_NAMES])),
+                    _control("X axis", dcc.Dropdown(id="x-axis", value="timeSeconds", clearable=False, options=[
+                        {"label": "timeSeconds", "value": "timeSeconds"},
+                        {"label": "timestampUs", "value": "timestampUs"},
+                        {"label": "seq", "value": "seq"},
+                    ])),
+                    _control("History window", dcc.Dropdown(id="history-window", value="last_30s", clearable=False, options=[
+                        {"label": "All", "value": "all"},
+                        {"label": "Last 10 s", "value": "last_10s"},
+                        {"label": "Last 30 s", "value": "last_30s"},
+                        {"label": "Last 60 s", "value": "last_60s"},
+                        {"label": "Last 5 min", "value": "last_5min"},
+                        {"label": "Last N points", "value": "last_n"},
+                        {"label": "Custom range", "value": "custom"},
+                    ])),
+                    _control("Last N points", dcc.Input(id="last-n-points", type="number", value=1000, min=1, step=100, style=INPUT_STYLE)),
+                    _control("Custom x min", dcc.Input(id="custom-x-min", type="number", debounce=True, style=INPUT_STYLE)),
+                    _control("Custom x max", dcc.Input(id="custom-x-max", type="number", debounce=True, style=INPUT_STYLE)),
+                    _control("Auto follow latest", dcc.Checklist(id="auto-follow", value=["enabled"], options=[{"label": "Enabled", "value": "enabled"}], style=CHECKLIST_STYLE)),
+                    _control("Color scale", dcc.Dropdown(id="color-mode", value="auto", clearable=False, options=[
+                        {"label": "Auto", "value": "auto"},
+                        {"label": "Symmetric around zero", "value": "symmetric"},
+                        {"label": "Fixed range", "value": "fixed"},
+                    ])),
+                    _control("Fixed min", dcc.Input(id="fixed-min", type="number", debounce=True, style=INPUT_STYLE)),
+                    _control("Fixed max", dcc.Input(id="fixed-max", type="number", debounce=True, style=INPUT_STYLE)),
+                    _control("Display unit", dcc.Dropdown(id="unit-mode", value="auto", clearable=False, options=[
+                        {"label": "Auto uV/mV/V", "value": "auto"},
+                        {"label": "Source unit", "value": "source"},
+                        {"label": "uV", "value": "uV"},
+                        {"label": "mV", "value": "mV"},
+                        {"label": "V", "value": "V"},
+                    ])),
+                    _control("Refresh ms", dcc.Input(id="interval-ms", type="number", value=DEFAULT_REFRESH_INTERVAL_MS, min=100, step=100, debounce=True, style=INPUT_STYLE)),
                 ],
                 style=CONTROL_GRID_STYLE,
             ),
+            html.Div([html.Div(id="save-status", style=MESSAGE_STYLE), html.Div(id="clear-status", style=MESSAGE_STYLE), html.Div(id="history-stats", style=MESSAGE_STYLE)], style=MESSAGE_ROW_STYLE),
             html.Div(
                 [
-                    html.Div(id="save-status", style=MESSAGE_STYLE),
-                    html.Div(id="clear-status", style=MESSAGE_STYLE),
-                ],
-                style=MESSAGE_ROW_STYLE,
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        dcc.Graph(
-                            id="heatmap",
-                            config={"displayModeBar": True, "responsive": True},
-                            style={"height": "620px"},
-                        ),
-                        style=PANEL_STYLE,
-                    ),
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Label("Cell", style=LABEL_STYLE),
-                                    dcc.Dropdown(
-                                        id="cell-dropdown",
-                                        value=DEFAULT_SELECTED_CELL,
-                                        clearable=False,
-                                        options=[
-                                            {"label": cell_name, "value": cell_name}
-                                            for cell_name in CELL_NAMES
-                                        ],
-                                    ),
-                                ],
-                                style={"margin": "4px 4px 8px 4px"},
-                            ),
-                            dcc.Graph(
-                                id="history-graph",
-                                config={"displayModeBar": True, "responsive": True},
-                                style={"height": "570px"},
-                            ),
-                        ],
-                        style=PANEL_STYLE,
-                    ),
+                    html.Div(dcc.Graph(id="heatmap", config={"displayModeBar": True, "responsive": True}, style={"height": "620px"}), style=PANEL_STYLE),
+                    html.Div(dcc.Graph(id="history-graph", config={"displayModeBar": True, "scrollZoom": True, "responsive": True}, style={"height": "620px"}), style=PANEL_STYLE),
                 ],
                 style=MAIN_GRID_STYLE,
             ),
+            html.Div([html.H2("Device Status", style=SECTION_TITLE_STYLE), html.Div(id="device-status-panel")], style={**PANEL_STYLE, "marginTop": "16px"}),
         ],
         style=PAGE_STYLE,
     )
 
-    @app.callback(
-        Output("refresh-interval", "interval"),
-        Input("interval-ms", "value"),
-    )
+    @app.callback(Output("refresh-interval", "interval"), Input("interval-ms", "value"))
     def update_interval(interval_ms: Any) -> int:
         try:
             return max(100, min(10_000, int(interval_ms)))
@@ -245,68 +188,113 @@ def createDashApp(
         if not n_clicks:
             current_paused = bool(paused)
             return current_paused, "Resume" if current_paused else "Pause"
-
         new_paused = not bool(paused)
         return new_paused, "Resume" if new_paused else "Pause"
 
-    @app.callback(
-        Output("cell-dropdown", "value"),
-        Input("heatmap", "clickData"),
-        State("cell-dropdown", "value"),
-    )
+    @app.callback(Output("cell-dropdown", "value"), Input("heatmap", "clickData"), State("cell-dropdown", "value"))
     def select_cell_from_heatmap(click_data: dict | None, current_cell: str | None) -> str:
         if not click_data:
             return current_cell or DEFAULT_SELECTED_CELL
-
         cell_name = _cell_name_from_click_data(click_data)
-        if cell_name in CELL_NAMES:
-            return cell_name
-        return current_cell or DEFAULT_SELECTED_CELL
+        return cell_name if cell_name in CELL_NAMES else (current_cell or DEFAULT_SELECTED_CELL)
 
-    @app.callback(
-        Output("selected-cell-store", "data"),
-        Input("cell-dropdown", "value"),
-        State("selected-cell-store", "data"),
-    )
+    @app.callback(Output("selected-cell-store", "data"), Input("cell-dropdown", "value"), State("selected-cell-store", "data"))
     def select_cell_from_dropdown(cell_name: str | None, current_cell: str | None) -> str:
-        if cell_name in CELL_NAMES:
-            return cell_name
-        return current_cell or DEFAULT_SELECTED_CELL
+        return cell_name if cell_name in CELL_NAMES else (current_cell or DEFAULT_SELECTED_CELL)
 
     @app.callback(
-        Output("clear-status", "children"),
-        Input("clear-button", "n_clicks"),
+        Output("com-port-dropdown", "options"),
+        Output("com-port-dropdown", "value"),
+        Output("port-refresh-status", "children"),
+        Input("refresh-ports-button", "n_clicks"),
+        State("com-port-dropdown", "value"),
+    )
+    def refresh_ports(_n_clicks: int | None, current_value: str | None) -> tuple[list[dict], str | None, str]:
+        ports = manager.listPorts()
+        options = [{"label": port["label"], "value": port["value"]} for port in ports]
+        values = {option["value"] for option in options}
+        next_value = current_value if current_value in values else (options[0]["value"] if options else None)
+        status = "pyserial is not installed." if not ports and manager.getStatus().get("dependencyMissing") else f"{len(options)} port(s) found."
+        return options, next_value, status
+
+    @app.callback(
+        Output("connection-action-status", "children"),
+        Input("connect-button", "n_clicks"),
+        Input("disconnect-button", "n_clicks"),
+        Input("reconnect-button", "n_clicks"),
+        Input("start-replay-button", "n_clicks"),
+        State("input-mode", "value"),
+        State("com-port-dropdown", "value"),
+        State("baud-input", "value"),
+        State("auto-reconnect", "value"),
+        State("replay-file-input", "value"),
+        State("replay-speed-input", "value"),
         prevent_initial_call=True,
     )
+    def handle_connection_action(
+        _connect: int | None,
+        _disconnect: int | None,
+        _reconnect: int | None,
+        _start_replay: int | None,
+        input_mode: str,
+        port: str | None,
+        baud: Any,
+        auto_reconnect: list[str] | None,
+        replay_file: str | None,
+        replay_speed: Any,
+    ) -> str:
+        try:
+            triggered = ctx.triggered_id
+            if triggered == "disconnect-button":
+                manager.disconnect()
+                return "Disconnected."
+            if triggered == "reconnect-button":
+                manager.reconnect()
+                return "Reconnect requested."
+            if triggered == "start-replay-button" or input_mode == "replay":
+                manager.startReplay(str(replay_file or ""), float(replay_speed or 1.0))
+                return "Replay started."
+            if input_mode == "disconnected":
+                manager.disconnect()
+                return "Disconnected."
+            manager.connectSerial(str(port or ""), int(baud or DEFAULT_BAUD), "enabled" in (auto_reconnect or []))
+            return f"Connecting to {port}."
+        except Exception as exc:
+            return f"Connection error: {exc}"
+
+    @app.callback(Output("clear-status", "children"), Input("clear-button", "n_clicks"), prevent_initial_call=True)
     def clear_history(n_clicks: int | None) -> str:
         if not n_clicks:
             return no_update
         dataStore.clear()
         return f"History cleared at {_clock_text()}."
 
-    @app.callback(
-        Output("save-status", "children"),
-        Input("save-button", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def save_snapshot(n_clicks: int | None) -> str:
+    @app.callback(Output("save-status", "children"), Input("save-button", "n_clicks"), State("frame-type-dropdown", "value"), prevent_initial_call=True)
+    def save_snapshot(n_clicks: int | None, frame_type: str | None) -> str:
         if not n_clicks:
             return no_update
-
-        snapshot = dataStore.toWideDataFrame()
+        selected_type = frame_type or "FAST_BINARY"
+        snapshot = dataStore.toWideDataFrame(selected_type)
         if snapshot.empty:
             return "No data to save."
-
         export_dir = Path.cwd() / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
-        output_path = export_dir / f"matrix_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        safe_type = selected_type.replace("/", "_")
+        output_path = export_dir / f"matrix_snapshot_{safe_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         snapshot.to_csv(output_path, index=False)
         return f"Saved {len(snapshot)} rows to {output_path}"
+
+    @app.callback(Output("frame-type-dropdown", "options"), Input("refresh-interval", "n_intervals"))
+    def update_frame_type_options(_n_intervals: int) -> list[dict]:
+        return _frame_type_options(dataStore.getAvailableFrameTypes())
 
     @app.callback(
         Output("heatmap", "figure"),
         Output("history-graph", "figure"),
         Output("status-bar", "children"),
+        Output("connection-status-panel", "children"),
+        Output("device-status-panel", "children"),
+        Output("history-stats", "children"),
         Input("refresh-interval", "n_intervals"),
         Input("paused-store", "data"),
         Input("selected-cell-store", "data"),
@@ -314,6 +302,13 @@ def createDashApp(
         Input("fixed-min", "value"),
         Input("fixed-max", "value"),
         Input("unit-mode", "value"),
+        Input("frame-type-dropdown", "value"),
+        Input("x-axis", "value"),
+        Input("history-window", "value"),
+        Input("last-n-points", "value"),
+        Input("custom-x-min", "value"),
+        Input("custom-x-max", "value"),
+        Input("auto-follow", "value"),
     )
     def refresh_view(
         _n_intervals: int,
@@ -323,80 +318,94 @@ def createDashApp(
         fixed_min: Any,
         fixed_max: Any,
         unit_mode: str,
-    ) -> tuple[go.Figure, go.Figure, list]:
+        frame_type: str | None,
+        x_axis: str,
+        history_window: str,
+        last_n: Any,
+        custom_min: Any,
+        custom_max: Any,
+        auto_follow_values: list[str] | None,
+    ) -> tuple[go.Figure, go.Figure, list, list, list, str]:
         if not paused:
-            _drain_queue(lineQueue, parser, dataStore, csvWriter, runtime_state, maxLinesPerTick)
+            _drain_queue(inputQueue, parser, dataStore, csvWriter, runtime_state, maxChunksPerTick, maxParseResultsPerTick)
 
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
-        latest_matrix_raw = dataStore.getLatestMatrix()
-        latest_meta = dataStore.getLatestFrameMeta()
+        selected_type = frame_type or "FAST_BINARY"
+        latest_matrix_raw = dataStore.getLatestMatrix(selected_type)
+        latest_meta = dataStore.getLatestFrameMeta(selected_type)
         parser_stats = parser.getStats()
-        reader_status = reader.getStatus() if reader is not None else {}
+        connection_status = manager.getStatus()
         runtime_stats = runtime_state.getStats()
-        latest_matrix, display_unit = _convert_matrix_for_display(
-            latest_matrix_raw,
-            latest_meta.get("unit") or "",
-            unit_mode,
-        )
+        display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
 
-        heatmap = _build_heatmap_figure(
-            latest_matrix,
-            latest_meta,
+        heatmap = _build_heatmap_figure(display_matrix, latest_meta, selected_cell, color_mode, fixed_min, fixed_max, display_unit, selected_type)
+
+        history_raw = dataStore.getCellHistory(
+            selected_type,
             selected_cell,
-            color_mode,
-            fixed_min,
-            fixed_max,
-            display_unit,
+            xAxis=x_axis,
+            windowMode=history_window,
+            lastN=_safe_int(last_n),
+            customMin=_safe_float(custom_min),
+            customMax=_safe_float(custom_max),
         )
+        history_rendered, downsampled = MatrixDataStore.downsampleHistoryFrame(history_raw, x_axis, DISPLAY_DOWNSAMPLE_TARGET_POINTS)
+        auto_follow = "enabled" in (auto_follow_values or [])
         history = _build_history_figure(
             selected_cell,
-            dataStore.getCellHistory(selected_cell),
+            selected_type,
+            history_raw,
+            history_rendered,
+            x_axis,
             unit_mode,
+            auto_follow,
+            history_window,
+            _safe_int(last_n),
+            _safe_float(custom_min),
+            _safe_float(custom_max),
         )
-        status = _build_status_bar(
-            latest_meta,
-            parser_stats,
-            reader_status,
-            runtime_stats,
-            paused,
-            _safe_qsize(lineQueue),
-            display_unit,
-        )
-        return heatmap, history, status
+        status = _build_status_bar(latest_meta, parser_stats, connection_status, runtime_stats, paused, _safe_qsize(inputQueue), display_unit)
+        connection_panel = _build_connection_panel(connection_status, _safe_qsize(inputQueue))
+        device_panel = _build_device_panel(latest_meta, parser_stats, dataStore.getLatestDeviceStatus(), dataStore.getRecentDeviceEvents(50))
+        history_stats = f"window raw points: {len(history_raw)} | rendered points: {len(history_rendered)} | downsampled: {'yes' if downsampled else 'no'}"
+        return heatmap, history, status, connection_panel, device_panel, history_stats
 
     return app
 
 
 def _drain_queue(
-    line_queue: "queue.Queue[str]",
-    parser: MatvParser,
+    input_queue: "queue.Queue[bytes]",
+    parser: SensorArrayStreamParser,
     data_store: MatrixDataStore,
     csv_writer: CsvFrameWriter | None,
     runtime_state: RuntimeState,
-    max_lines: int,
+    max_chunks: int,
+    max_parse_results: int,
 ) -> None:
-    processed = 0
-    while processed < max_lines:
+    chunks = 0
+    parse_results = 0
+    while chunks < max_chunks and parse_results < max_parse_results:
         try:
-            line = line_queue.get_nowait()
+            chunk = input_queue.get_nowait()
         except queue.Empty:
             break
-
-        processed += 1
-        frame = parser.parseLine(line)
-        if frame is None:
-            continue
-
-        data_store.addFrame(frame)
-        if csv_writer is None:
-            continue
-
-        try:
-            csv_writer.appendFrame(frame)
-            runtime_state.recordCsvWrite()
-        except Exception as exc:
-            runtime_state.recordCsvError(str(exc))
-            LOGGER.warning("CSV append failed: %s", exc)
+        chunks += 1
+        results = parser.feedBytes(chunk)
+        parse_results += len(results)
+        for result in results:
+            if result.frame is not None:
+                data_store.addFrame(result.frame)
+                if csv_writer is not None:
+                    try:
+                        csv_writer.appendFrame(result.frame)
+                        runtime_state.recordCsvWrite()
+                    except Exception as exc:
+                        runtime_state.recordCsvError(str(exc))
+                        LOGGER.warning("CSV append failed: %s", exc)
+            if result.status is not None:
+                data_store.addDeviceStatus(result.status)
+            if result.event is not None:
+                data_store.addDeviceEvent(result.event)
 
 
 def _build_heatmap_figure(
@@ -407,30 +416,22 @@ def _build_heatmap_figure(
     fixed_min: Any,
     fixed_max: Any,
     display_unit: str,
+    requested_frame_type: str,
 ) -> go.Figure:
     unit = display_unit or meta.get("unit") or ""
-    custom_data = np.array(
-        [[f"S{row_index + 1}D{column_index + 1}" for column_index in range(MATRIX_SIZE)] for row_index in range(MATRIX_SIZE)]
-    )
-    text = np.array(
-        [
-            [
-                f"{custom_data[row_index, column_index]}<br>{_format_value(matrix[row_index, column_index], unit)}"
-                for column_index in range(MATRIX_SIZE)
-            ]
-            for row_index in range(MATRIX_SIZE)
-        ]
-    )
+    if meta.get("seq") is None and not np.isfinite(matrix).any():
+        return _empty_figure(f"No data for selected stream: {requested_frame_type}", "8x8 Matrix")
+
+    cell_names = np.array([[f"S{row + 1}D{col + 1}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
+    validity = np.where(np.isfinite(matrix), "valid", "invalid")
+    custom_data = np.dstack([cell_names, validity])
+    text = np.array([[f"{cell_names[row, col]}<br>{_format_value(matrix[row, col], unit) if np.isfinite(matrix[row, col]) else 'invalid'}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
 
     heatmap_kwargs: dict[str, Any] = {}
     zmin, zmax = _resolve_color_range(matrix, color_mode, fixed_min, fixed_max)
     if zmin is not None and zmax is not None:
         heatmap_kwargs["zmin"] = zmin
         heatmap_kwargs["zmax"] = zmax
-
-    seq_text = _dash_if_none(meta.get("seq"))
-    timestamp_text = _dash_if_none(meta.get("timestampUs"))
-    duration_text = _dash_if_none(meta.get("durationUs"))
 
     fig = go.Figure(
         data=[
@@ -442,12 +443,12 @@ def _build_heatmap_figure(
                 customdata=custom_data,
                 texttemplate="%{text}",
                 hovertemplate=(
-                    "cell=%{customdata}<br>"
+                    "cell=%{customdata[0]}<br>"
+                    "state=%{customdata[1]}<br>"
                     "value=%{z:,.6g}<br>"
                     f"unit={unit or '-'}<br>"
-                    f"seq={seq_text}<br>"
-                    f"timestamp_us={timestamp_text}<br>"
-                    f"duration_us={duration_text}<extra></extra>"
+                    f"seq={_dash_if_none(meta.get('seq'))}<br>"
+                    f"statusFlags={_format_hex(meta.get('statusFlags'), 8)}<extra></extra>"
                 ),
                 colorscale="RdYlBu_r",
                 colorbar={"title": unit or "value"},
@@ -464,151 +465,195 @@ def _build_heatmap_figure(
                 x=[f"D{selected_detector}"],
                 y=[f"S{selected_source}"],
                 mode="markers",
-                marker={
-                    "symbol": "square-open",
-                    "size": 62,
-                    "line": {"color": "#111827", "width": 3},
-                },
+                marker={"symbol": "square-open", "size": 62, "line": {"color": "#111827", "width": 3}},
                 customdata=[selected_cell],
                 hovertemplate="cell=%{customdata}<extra></extra>",
                 showlegend=False,
             )
         )
 
-    fig.update_layout(
-        title="8x8 Matrix",
-        margin={"l": 48, "r": 24, "t": 56, "b": 36},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font={"family": "Segoe UI, Arial, sans-serif", "size": 12, "color": "#17202a"},
-        clickmode="event+select",
-    )
+    fig.update_layout(**_base_figure_layout("8x8 Matrix"), clickmode="event+select")
     fig.update_xaxes(side="top", constrain="domain")
     fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1)
     return fig
 
 
-def _build_history_figure(cell_name: str, history, unit_mode: str = "auto") -> go.Figure:
-    fig = go.Figure()
-    if history.empty:
-        fig.add_annotation(
-            text="No data yet",
-            x=0.5,
-            y=0.5,
-            xref="paper",
-            yref="paper",
-            showarrow=False,
-            font={"size": 18, "color": "#6b7280"},
-        )
-        title = f"History of {cell_name}"
-        y_title = "value"
-    else:
-        display_values, unit_label, mixed_units, converted = _convert_history_for_display(
-            history,
-            unit_mode,
-        )
-        title = f"History of {cell_name}" + (" (Mixed units)" if mixed_units else "")
-        y_title = f"value ({unit_label})" if unit_label != "value" else "value"
-        custom_data = history[["seq", "timestampUs", "unit", "value"]].to_numpy()
-        value_hover = (
-            f"value=%{{y:,.6g}} {unit_label}<br>"
-            "source=%{customdata[3]:,.6g} %{customdata[2]}<br>"
-            if converted
-            else "value=%{y:,.6g}<br>unit=%{customdata[2]}<br>"
-        )
-        fig.add_trace(
-            go.Scattergl(
-                x=history["timeSeconds"],
-                y=display_values,
-                mode="lines+markers",
-                line={"color": "#0f766e", "width": 2},
-                marker={"size": 4},
-                customdata=custom_data,
-                hovertemplate=(
-                    "time=%{x:.6f}s<br>"
-                    + value_hover +
-                    "seq=%{customdata[0]}<br>"
-                    "timestamp_us=%{customdata[1]}<extra></extra>"
-                ),
-            )
-        )
+def _build_history_figure(
+    cell_name: str,
+    frame_type: str,
+    history_raw,
+    history_rendered,
+    x_axis: str,
+    unit_mode: str,
+    auto_follow: bool,
+    window_mode: str,
+    last_n: int | None,
+    custom_min: float | None,
+    custom_max: float | None,
+) -> go.Figure:
+    if history_raw.empty:
+        return _empty_figure(f"No data for selected stream: {frame_type}", f"History of {cell_name}")
 
-    fig.update_layout(
-        title=title,
-        margin={"l": 58, "r": 24, "t": 56, "b": 52},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font={"family": "Segoe UI, Arial, sans-serif", "size": 12, "color": "#17202a"},
-        xaxis_title="timeSeconds (s)",
-        yaxis_title=y_title,
+    x_column = x_axis if x_axis in history_rendered.columns else "timeSeconds"
+    display_values, unit_label, mixed_units, converted = _convert_history_for_display(history_rendered, unit_mode)
+    fig = go.Figure()
+    custom_data = history_rendered[["seq", "timestampUs", "unit", "value"]].to_numpy()
+    value_hover = (
+        f"value=%{{y:,.6g}} {unit_label}<br>source=%{{customdata[3]:,.6g}} %{{customdata[2]}}<br>"
+        if converted
+        else "value=%{y:,.6g}<br>unit=%{customdata[2]}<br>"
     )
+    fig.add_trace(
+        go.Scattergl(
+            x=history_rendered[x_column],
+            y=display_values,
+            mode="lines+markers",
+            line={"color": "#0f766e", "width": 2},
+            marker={"size": 4},
+            customdata=custom_data,
+            hovertemplate=f"{x_column}=%{{x}}<br>{value_hover}seq=%{{customdata[0]}}<br>timestamp_us=%{{customdata[1]}}<extra></extra>",
+        )
+    )
+    title = f"History of {cell_name} / {frame_type}" + (" (Mixed units)" if mixed_units else "")
+    fig.update_layout(**_base_figure_layout(title), xaxis_title=x_column, yaxis_title=f"value ({unit_label})" if unit_label != "value" else "value")
+    fig.update_layout(uirevision="history-auto-follow" if auto_follow else "history-manual")
     fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb")
     fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb")
+
+    if auto_follow:
+        range_value = _resolve_follow_range(history_raw, x_column, window_mode, last_n, custom_min, custom_max)
+        if range_value is None:
+            fig.update_xaxes(autorange=True)
+        else:
+            fig.update_xaxes(range=range_value)
     return fig
 
 
-def _build_status_bar(
-    meta: dict,
-    parser_stats: dict,
-    reader_status: dict,
-    runtime_stats: dict,
-    paused: bool,
-    queue_depth: int | str,
-    display_unit: str,
-) -> list:
+def _resolve_follow_range(history, x_column: str, window_mode: str, last_n: int | None, custom_min: float | None, custom_max: float | None) -> list[float] | None:
+    if history.empty:
+        return None
+    if window_mode == "all":
+        return None
+    if window_mode == "custom":
+        if custom_min is not None and custom_max is not None and custom_min < custom_max:
+            return [float(custom_min), float(custom_max)]
+        return None
+    if window_mode == "last_n":
+        subset = history.tail(max(1, int(last_n or 1000)))
+        return [float(subset[x_column].iloc[0]), float(subset[x_column].iloc[-1])] if x_column in subset.columns else None
+
+    seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(window_mode)
+    if seconds is None:
+        return None
+    if x_column == "timeSeconds":
+        latest = float(history[x_column].iloc[-1])
+        return [latest - seconds, latest]
+    return [float(history[x_column].iloc[0]), float(history[x_column].iloc[-1])]
+
+
+def _build_status_bar(meta: dict, parser_stats: dict, connection_status: dict, runtime_stats: dict, paused: bool, queue_depth: int | str, display_unit: str) -> list:
+    dropped = int(meta.get("droppedFrames") or 0)
+    decimated = int(meta.get("outputDecimatedFrames") or 0)
     return [
-        _status_item("Input", _reader_label(reader_status, paused)),
+        _status_item("Input", _connection_label(connection_status, paused)),
+        _status_item("frame_type", meta.get("frameType") or "-"),
         _status_item("seq", _dash_if_none(meta.get("seq"))),
         _status_item("timestamp_us", _dash_if_none(meta.get("timestampUs"))),
         _status_item("duration_us", _dash_if_none(meta.get("durationUs"))),
         _status_item("unit", meta.get("unit") or "-"),
         _status_item("display_unit", display_unit or meta.get("unit") or "-"),
-        _status_item("received_frames", meta.get("receivedFrames", 0)),
-        _status_item("raw_lines", reader_status.get("rawLinesReceived", 0)),
-        _status_item("queued_lines", queue_depth),
-        _status_item("parsed_total", parser_stats.get("matvFramesParsed", 0)),
-        _status_item("skipped_lines", parser_stats.get("skippedLines", 0)),
-        _status_item("parse_errors", parser_stats.get("parseErrors", 0)),
-        _status_item("warnings", parser_stats.get("warnings", 0)),
-        _status_item("last_line", _format_wall_time(reader_status.get("lastLineTime"))),
+        _status_item("status_code", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=bool(meta.get("lastStatusCode"))),
+        _status_item("dropped", dropped, warning=dropped > 0),
+        _status_item("decimated", decimated, warning=decimated > 0),
+        _status_item("adsDr", _dash_if_none(meta.get("adsDr"))),
+        _status_item("outputDiv", _dash_if_none(meta.get("outputDivider"))),
+        _status_item("bytes", connection_status.get("bytesReceived", 0)),
+        _status_item("chunks", connection_status.get("chunksReceived", 0)),
+        _status_item("queue_depth", queue_depth),
+        _status_item("parsed_total", parser_stats.get("parsedFramesTotal", 0)),
+        _status_item("crc_errors", parser_stats.get("binaryCrcErrors", 0), warning=parser_stats.get("binaryCrcErrors", 0) > 0),
+        _status_item("parse_errors", parser_stats.get("parseErrors", 0), warning=parser_stats.get("parseErrors", 0) > 0),
         _status_item("csv_rows", runtime_stats.get("csvRowsWritten", 0)),
-        _status_item("last_error", _first_non_empty(
-            runtime_stats.get("lastCsvError", ""),
-            reader_status.get("lastError", ""),
-            parser_stats.get("lastError", ""),
-            "-",
-        )),
+        _status_item("last_error", _first_non_empty(runtime_stats.get("lastCsvError", ""), connection_status.get("lastError", ""), parser_stats.get("lastError", ""), "-"), warning=bool(_first_non_empty(runtime_stats.get("lastCsvError", ""), connection_status.get("lastError", ""), parser_stats.get("lastError", ""), ""))),
     ]
 
 
-def _status_item(label: str, value: Any) -> html.Div:
-    return html.Div(
-        [html.Div(label, style=STATUS_LABEL_STYLE), html.Div(str(value), style=STATUS_VALUE_STYLE)],
-        style=STATUS_ITEM_STYLE,
-    )
+def _build_connection_panel(status: dict, queue_depth: int | str) -> list:
+    return [
+        _status_item("mode", status.get("mode", "disconnected")),
+        _status_item("serial_port", status.get("serialPort") or status.get("port") or "-"),
+        _status_item("baud", _dash_if_none(status.get("baud"))),
+        _status_item("connected", "yes" if status.get("serialConnected") else "no", warning=status.get("mode") == "serial" and not status.get("serialConnected")),
+        _status_item("bytes_received", status.get("bytesReceived", 0)),
+        _status_item("chunks_received", status.get("chunksReceived", 0)),
+        _status_item("queue_depth", queue_depth),
+        _status_item("last_data", _format_wall_time(status.get("lastDataTime"))),
+        _status_item("reconnects", status.get("reconnectAttempts", 0)),
+        _status_item("auto_reconnect", "on" if status.get("autoReconnect") else "off"),
+        _status_item("last_serial_error", status.get("lastError") or "-", warning=bool(status.get("lastError"))),
+    ]
 
 
-def _reader_label(reader_status: dict, paused: bool) -> str:
+def _build_device_panel(meta: dict, parser_stats: dict, latest_status: dict, events: list[dict]) -> list:
+    event_rows = []
+    for event in reversed(events[-12:]):
+        fields = event.get("fields") or {}
+        event_rows.append(
+            html.Tr(
+                [
+                    html.Td(event.get("eventType") or "-", style=TABLE_CELL_STYLE),
+                    html.Td(_format_hex(event.get("code"), 4), style=TABLE_CELL_STYLE),
+                    html.Td(event.get("name") or "-", style=TABLE_CELL_STYLE),
+                    html.Td(", ".join(f"{key}={value}" for key, value in list(fields.items())[:6]) or event.get("rawLine") or "-", style=TABLE_CELL_STYLE),
+                ]
+            )
+        )
+    if not event_rows:
+        event_rows.append(html.Tr([html.Td("No recent events", colSpan=4, style=TABLE_CELL_STYLE)]))
+
+    status_fields = latest_status.get("fields") or {}
+    status_text = latest_status.get("rawLine") or ", ".join(f"{key}={value}" for key, value in status_fields.items()) or "-"
+    return [
+        html.Div(
+            [
+                _status_item("lastStatusCode", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=bool(meta.get("lastStatusCode"))),
+                _status_item("statusFlags", _format_hex(meta.get("statusFlags"), 8), warning=bool(meta.get("statusFlags"))),
+                _status_item("droppedFrames", _dash_if_none(meta.get("droppedFrames")), warning=bool(meta.get("droppedFrames"))),
+                _status_item("outputDecimatedFrames", _dash_if_none(meta.get("outputDecimatedFrames")), warning=bool(meta.get("outputDecimatedFrames"))),
+                _status_item("last parser status", parser_stats.get("lastStatusCodeName") or "-"),
+            ],
+            style=STATUS_GRID_STYLE,
+        ),
+        html.Div(status_text, style={**MESSAGE_STYLE, "marginTop": "10px", "whiteSpace": "pre-wrap"}),
+        html.Table(
+            [
+                html.Thead(html.Tr([html.Th("Type", style=TABLE_HEADER_STYLE), html.Th("Code", style=TABLE_HEADER_STYLE), html.Th("Name", style=TABLE_HEADER_STYLE), html.Th("Fields", style=TABLE_HEADER_STYLE)])),
+                html.Tbody(event_rows),
+            ],
+            style=TABLE_STYLE,
+        ),
+    ]
+
+
+def _status_item(label: str, value: Any, warning: bool = False) -> html.Div:
+    style = dict(STATUS_ITEM_STYLE)
+    if warning:
+        style.update(WARNING_STATUS_ITEM_STYLE)
+    return html.Div([html.Div(label, style=STATUS_LABEL_STYLE), html.Div(str(value), style=STATUS_VALUE_STYLE)], style=style)
+
+
+def _connection_label(status: dict, paused: bool) -> str:
     prefix = "Paused / " if paused else ""
-    mode = reader_status.get("mode", "waiting")
+    mode = status.get("mode", "disconnected")
     if mode == "replay":
-        suffix = "finished" if reader_status.get("replayFinished") else "running"
-        return f"{prefix}Replay File ({suffix})"
+        suffix = "finished" if status.get("replayFinished") else "running"
+        return f"{prefix}Replay ({suffix})"
     if mode == "serial":
-        if reader_status.get("serialConnected"):
-            return f"{prefix}Connected"
-        if reader_status.get("rawLinesReceived", 0) == 0 and not reader_status.get("lastError"):
-            return f"{prefix}Waiting"
-        return f"{prefix}Disconnected"
-    return f"{prefix}Waiting"
+        return f"{prefix}Connected" if status.get("serialConnected") else f"{prefix}Disconnected"
+    return f"{prefix}Disconnected"
 
 
-def _resolve_color_range(
-    matrix: np.ndarray,
-    color_mode: str,
-    fixed_min: Any,
-    fixed_max: Any,
-) -> tuple[float | None, float | None]:
+def _resolve_color_range(matrix: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
     finite_values = matrix[np.isfinite(matrix)]
     if color_mode == "symmetric" and finite_values.size:
         max_abs = float(np.max(np.abs(finite_values)))
@@ -625,20 +670,14 @@ def _resolve_color_range(
     return None, None
 
 
-def _convert_matrix_for_display(
-    matrix: np.ndarray,
-    source_unit: str,
-    unit_mode: str,
-) -> tuple[np.ndarray, str]:
+def _convert_matrix_for_display(matrix: np.ndarray, source_unit: str, unit_mode: str) -> tuple[np.ndarray, str]:
     source_key = _normalize_unit(source_unit)
     if source_key not in VOLTAGE_FACTORS_TO_UV:
         return matrix.copy(), source_unit
-
     source_factor = VOLTAGE_FACTORS_TO_UV[source_key]
     values_uv = matrix.astype(float, copy=True) * source_factor
     target_key = _resolve_target_voltage_unit(values_uv, unit_mode, source_key)
-    converted = values_uv / VOLTAGE_FACTORS_TO_UV[target_key]
-    return converted, CANONICAL_VOLTAGE_UNITS[target_key]
+    return values_uv / VOLTAGE_FACTORS_TO_UV[target_key], CANONICAL_VOLTAGE_UNITS[target_key]
 
 
 def _convert_history_for_display(history, unit_mode: str) -> tuple[np.ndarray, str, bool, bool]:
@@ -646,34 +685,19 @@ def _convert_history_for_display(history, unit_mode: str) -> tuple[np.ndarray, s
     units = [unit for unit in history["unit"].dropna().unique().tolist() if unit != ""]
     unit_keys = [_normalize_unit(unit) for unit in units]
     all_voltage = bool(unit_keys) and all(unit_key in VOLTAGE_FACTORS_TO_UV for unit_key in unit_keys)
-
     if not all_voltage:
         mixed_units = len(units) > 1
-        unit_label = "mixed units" if mixed_units else (units[0] if units else "value")
-        return raw_values, unit_label, mixed_units, False
-
+        return raw_values, "mixed units" if mixed_units else (units[0] if units else "value"), mixed_units, False
     if unit_mode == "source" and len(set(unit_keys)) > 1:
         return raw_values, "mixed units", True, False
-
     source_unit_keys = history["unit"].map(_normalize_unit).to_numpy()
-    values_uv = np.array(
-        [
-            value * VOLTAGE_FACTORS_TO_UV.get(unit_key, np.nan)
-            for value, unit_key in zip(raw_values, source_unit_keys)
-        ],
-        dtype=float,
-    )
+    values_uv = np.array([value * VOLTAGE_FACTORS_TO_UV.get(unit_key, np.nan) for value, unit_key in zip(raw_values, source_unit_keys)], dtype=float)
     source_key = unit_keys[0]
     target_key = _resolve_target_voltage_unit(values_uv, unit_mode, source_key)
-    converted_values = values_uv / VOLTAGE_FACTORS_TO_UV[target_key]
-    return converted_values, CANONICAL_VOLTAGE_UNITS[target_key], False, True
+    return values_uv / VOLTAGE_FACTORS_TO_UV[target_key], CANONICAL_VOLTAGE_UNITS[target_key], False, True
 
 
-def _resolve_target_voltage_unit(
-    values_uv: np.ndarray,
-    unit_mode: str,
-    source_key: str,
-) -> str:
+def _resolve_target_voltage_unit(values_uv: np.ndarray, unit_mode: str, source_key: str) -> str:
     requested_key = _normalize_unit(unit_mode)
     if requested_key in VOLTAGE_FACTORS_TO_UV:
         return requested_key
@@ -686,7 +710,6 @@ def _choose_auto_voltage_unit(values_uv: np.ndarray) -> str:
     finite_values = values_uv[np.isfinite(values_uv)]
     if not finite_values.size:
         return "uv"
-
     max_abs_uv = float(np.max(np.abs(finite_values)))
     if max_abs_uv >= VOLTAGE_FACTORS_TO_UV["v"]:
         return "v"
@@ -696,7 +719,7 @@ def _choose_auto_voltage_unit(values_uv: np.ndarray) -> str:
 
 
 def _normalize_unit(unit: Any) -> str:
-    return str(unit or "").strip().replace("µ", "u").replace("μ", "u").lower()
+    return str(unit or "").strip().replace("碌", "u").replace("渭", "u").lower()
 
 
 def _format_value(value: float, unit: str = "") -> str:
@@ -709,12 +732,39 @@ def _format_value(value: float, unit: str = "") -> str:
     return f"{value_text} {unit}".strip()
 
 
+def _empty_figure(message: str, title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(text=message, x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False, font={"size": 18, "color": "#6b7280"})
+    fig.update_layout(**_base_figure_layout(title))
+    return fig
+
+
+def _base_figure_layout(title: str) -> dict:
+    return {
+        "title": title,
+        "margin": {"l": 58, "r": 24, "t": 56, "b": 52},
+        "paper_bgcolor": "white",
+        "plot_bgcolor": "white",
+        "font": {"family": "Segoe UI, Arial, sans-serif", "size": 12, "color": "#17202a"},
+    }
+
+
+def _control(label: str, child: Any) -> html.Div:
+    return html.Div([html.Label(label, style=LABEL_STYLE), child], style=CONTROL_ITEM_STYLE)
+
+
+def _frame_type_options(frame_types: list[str]) -> list[dict]:
+    return [{"label": frame_type, "value": frame_type} for frame_type in list(dict.fromkeys([*DEFAULT_FRAME_TYPES, *frame_types]))]
+
+
 def _cell_name_from_click_data(click_data: dict | None) -> str | None:
     try:
         custom_data = click_data["points"][0].get("customdata")
     except Exception:
         return None
-    return custom_data[0] if isinstance(custom_data, list) else custom_data
+    if isinstance(custom_data, list):
+        return custom_data[0]
+    return custom_data
 
 
 def _split_cell_name(cell_name: str) -> tuple[int | None, int | None]:
@@ -725,11 +775,26 @@ def _split_cell_name(cell_name: str) -> tuple[int | None, int | None]:
         return None, None
 
 
-def _safe_qsize(line_queue: "queue.Queue[str]") -> int | str:
+def _safe_qsize(input_queue: "queue.Queue[bytes]") -> int | str:
     try:
-        return line_queue.qsize()
+        return input_queue.qsize()
     except NotImplementedError:
         return "-"
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _format_wall_time(timestamp: float | None) -> str:
@@ -753,6 +818,15 @@ def _first_non_empty(*values: Any) -> Any:
     return "-"
 
 
+def _format_hex(value: Any, width: int = 4) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        return f"0x{int(value):0{width}X}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 PAGE_STYLE = {
     "minHeight": "100vh",
     "padding": "20px",
@@ -761,133 +835,27 @@ PAGE_STYLE = {
     "fontFamily": "Segoe UI, Arial, sans-serif",
     "boxSizing": "border-box",
 }
-
-TITLE_STYLE = {
-    "margin": "0 0 14px 0",
-    "fontSize": "30px",
-    "fontWeight": 700,
-    "letterSpacing": "0",
-}
-
-TOP_GRID_STYLE = {
-    "display": "grid",
-    "gridTemplateColumns": "minmax(360px, 1fr) auto",
-    "gap": "16px",
-    "alignItems": "start",
-}
-
-STATUS_GRID_STYLE = {
-    "display": "grid",
-    "gridTemplateColumns": "repeat(auto-fit, minmax(138px, 1fr))",
-    "gap": "8px",
-}
-
-STATUS_ITEM_STYLE = {
-    "background": "white",
-    "border": "1px solid #d9e2ec",
-    "borderRadius": "8px",
-    "padding": "9px 10px",
-    "minHeight": "54px",
-    "boxSizing": "border-box",
-}
-
-STATUS_LABEL_STYLE = {
-    "fontSize": "11px",
-    "color": "#52606d",
-    "lineHeight": "15px",
-}
-
-STATUS_VALUE_STYLE = {
-    "fontSize": "14px",
-    "fontWeight": 600,
-    "lineHeight": "18px",
-    "whiteSpace": "nowrap",
-    "overflow": "hidden",
-    "textOverflow": "ellipsis",
-}
-
-BUTTON_ROW_STYLE = {
-    "display": "flex",
-    "flexWrap": "wrap",
-    "gap": "8px",
-    "justifyContent": "flex-end",
-}
-
-BUTTON_STYLE = {
-    "height": "38px",
-    "border": "1px solid #0f766e",
-    "background": "#0f766e",
-    "color": "white",
-    "borderRadius": "8px",
-    "padding": "0 14px",
-    "fontWeight": 700,
-    "cursor": "pointer",
-}
-
-SECONDARY_BUTTON_STYLE = {
-    "height": "38px",
-    "border": "1px solid #a7b7c7",
-    "background": "white",
-    "color": "#17202a",
-    "borderRadius": "8px",
-    "padding": "0 14px",
-    "fontWeight": 600,
-    "cursor": "pointer",
-}
-
-CONTROL_GRID_STYLE = {
-    "display": "grid",
-    "gridTemplateColumns": "repeat(auto-fit, minmax(180px, 1fr))",
-    "gap": "12px",
-    "marginTop": "16px",
-    "alignItems": "end",
-}
-
-CONTROL_ITEM_STYLE = {
-    "minWidth": 0,
-}
-
-LABEL_STYLE = {
-    "display": "block",
-    "fontSize": "12px",
-    "fontWeight": 700,
-    "color": "#334e68",
-    "marginBottom": "5px",
-}
-
-INPUT_STYLE = {
-    "width": "100%",
-    "height": "38px",
-    "border": "1px solid #cbd5e1",
-    "borderRadius": "6px",
-    "padding": "0 10px",
-    "boxSizing": "border-box",
-}
-
-MESSAGE_ROW_STYLE = {
-    "display": "flex",
-    "gap": "16px",
-    "minHeight": "24px",
-    "marginTop": "10px",
-    "flexWrap": "wrap",
-}
-
-MESSAGE_STYLE = {
-    "fontSize": "13px",
-    "color": "#334e68",
-}
-
-MAIN_GRID_STYLE = {
-    "display": "grid",
-    "gridTemplateColumns": "repeat(auto-fit, minmax(360px, 1fr))",
-    "gap": "16px",
-    "marginTop": "12px",
-}
-
-PANEL_STYLE = {
-    "background": "white",
-    "border": "1px solid #d9e2ec",
-    "borderRadius": "8px",
-    "padding": "8px",
-    "minWidth": 0,
-}
+TITLE_STYLE = {"margin": "0 0 14px 0", "fontSize": "30px", "fontWeight": 700, "letterSpacing": "0"}
+SECTION_TITLE_STYLE = {"margin": "0 0 10px 0", "fontSize": "18px", "fontWeight": 700, "letterSpacing": "0"}
+TOP_GRID_STYLE = {"display": "grid", "gridTemplateColumns": "minmax(360px, 1fr) auto", "gap": "16px", "alignItems": "start"}
+STATUS_GRID_STYLE = {"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(138px, 1fr))", "gap": "8px"}
+STATUS_ITEM_STYLE = {"background": "white", "border": "1px solid #d9e2ec", "borderRadius": "8px", "padding": "9px 10px", "minHeight": "54px", "boxSizing": "border-box"}
+WARNING_STATUS_ITEM_STYLE = {"border": "1px solid #d97706", "background": "#fff7ed"}
+STATUS_LABEL_STYLE = {"fontSize": "11px", "color": "#52606d", "lineHeight": "15px"}
+STATUS_VALUE_STYLE = {"fontSize": "14px", "fontWeight": 600, "lineHeight": "18px", "whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
+BUTTON_ROW_STYLE = {"display": "flex", "flexWrap": "wrap", "gap": "8px", "justifyContent": "flex-end"}
+BUTTON_STYLE = {"height": "38px", "border": "1px solid #0f766e", "background": "#0f766e", "color": "white", "borderRadius": "8px", "padding": "0 14px", "fontWeight": 700, "cursor": "pointer"}
+SECONDARY_BUTTON_STYLE = {"height": "38px", "border": "1px solid #a7b7c7", "background": "white", "color": "#17202a", "borderRadius": "8px", "padding": "0 14px", "fontWeight": 600, "cursor": "pointer"}
+CONNECTION_GRID_STYLE = {"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(150px, 1fr))", "gap": "10px", "alignItems": "end"}
+CONTROL_GRID_STYLE = {"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(160px, 1fr))", "gap": "12px", "marginTop": "16px", "alignItems": "end"}
+CONTROL_ITEM_STYLE = {"minWidth": 0}
+LABEL_STYLE = {"display": "block", "fontSize": "12px", "fontWeight": 700, "color": "#334e68", "marginBottom": "5px"}
+INPUT_STYLE = {"width": "100%", "height": "38px", "border": "1px solid #cbd5e1", "borderRadius": "6px", "padding": "0 10px", "boxSizing": "border-box"}
+CHECKLIST_STYLE = {"height": "38px", "display": "flex", "alignItems": "center"}
+MESSAGE_ROW_STYLE = {"display": "flex", "gap": "16px", "minHeight": "24px", "marginTop": "10px", "flexWrap": "wrap"}
+MESSAGE_STYLE = {"fontSize": "13px", "color": "#334e68"}
+MAIN_GRID_STYLE = {"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(360px, 1fr))", "gap": "16px", "marginTop": "12px"}
+PANEL_STYLE = {"background": "white", "border": "1px solid #d9e2ec", "borderRadius": "8px", "padding": "10px", "minWidth": 0}
+TABLE_STYLE = {"width": "100%", "borderCollapse": "collapse", "marginTop": "10px", "fontSize": "12px"}
+TABLE_HEADER_STYLE = {"textAlign": "left", "borderBottom": "1px solid #d9e2ec", "padding": "6px", "color": "#334e68"}
+TABLE_CELL_STYLE = {"borderBottom": "1px solid #eef2f5", "padding": "6px", "verticalAlign": "top"}

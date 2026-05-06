@@ -1,8 +1,16 @@
 # Matrix Log Viewer
 
-Matrix Log Viewer 用于从串口实时读取检测矩阵输出的 `MATV` 日志，并把 8x8 检测矩阵显示成可点击的热力图。每个格子显示点位名和当前数值，点击任一点位后，右侧曲线图会显示该点位随时间变化的历史数据。
+Matrix Log Viewer is the Dash web viewer for the SensorArray 8x8 matrix stream.
 
-## 安装
+Protocol baseline:
+
+- Hardware: `ErrorChen/SensorArray main@6886bfb` (`FastSpeed`)
+- Software: `ErrorChen/SensorArray_Software main@0e80d7c` (`graph`)
+- Do not use `c935f18 RollBack2` as the host protocol baseline. FastSpeed changed the default output.
+
+FastSpeed default output is a compact binary frame (`SAC1`) plus periodic `STAT` text. Legacy `MATV` CSV may be disabled by firmware config and is no longer assumed to be the default.
+
+## Install
 
 ```powershell
 cd matrix_log_viewer
@@ -11,147 +19,191 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Linux/macOS 激活虚拟环境：
+For tests:
 
-```bash
-source .venv/bin/activate
+```powershell
+pip install -r ..\requirements-dev.txt
 ```
 
-## 运行
+## Run
 
-从项目根目录打开图形化启动器：
+Recommended:
 
 ```powershell
 python main.py
 ```
 
-也可以在 `matrix_log_viewer` 目录内直接运行启动器：
+Then open the web UI and choose a COM port in the Connection panel.
+
+CLI initial serial connection:
 
 ```powershell
-python run_gui.py
+python matrix_log_viewer/run_viewer.py --port COM5 --baud 115200 --auto-reconnect
 ```
 
-启动器可以选择串口或历史日志文件，并一键打开浏览器图形界面。
-
-Windows 串口实时读取示例：
+Replay:
 
 ```powershell
-python run_viewer.py --port COM5 --baud 115200
+python matrix_log_viewer/run_viewer.py --replay-file sample_logs/sample_matv.log --replay-speed 10
 ```
 
-Linux/macOS 串口示例：
-
-```bash
-python run_viewer.py --port /dev/ttyUSB0 --baud 115200
-```
-
-历史日志重放示例：
+Start disconnected:
 
 ```powershell
-python run_viewer.py --replay-file sample_logs/sample_matv.log --replay-speed 10
+python matrix_log_viewer/run_viewer.py
 ```
 
-启动后在浏览器打开：
+Default URL:
 
 ```text
 http://127.0.0.1:8050
 ```
 
-## 参数说明
+Use `--no-browser` if you do not want the launcher to open a browser automatically.
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--port` | 无 | 串口名称，例如 `COM5`、`/dev/ttyUSB0`、`/dev/ttyACM0`。使用 `--replay-file` 时不需要。 |
-| `--baud` | `115200` | 串口波特率。 |
-| `--max-points` | `5000` | 每个点位最多保留的历史点数。 |
-| `--save-csv` | 无 | 可选路径。每解析到一帧就追加保存到 CSV。 |
-| `--replay-file` | 无 | 从历史日志文件读取，而不是打开串口。 |
-| `--replay-speed` | `1.0` | 历史日志重放速度倍率，`10.0` 表示快 10 倍。 |
-| `--host` | `127.0.0.1` | Dash 服务监听地址。 |
-| `--port-web` | `8050` | Dash 服务端口。 |
-| `--debug` | 关闭 | 开启 DEBUG 日志。 |
+## Supported Input
 
-`--port` 和 `--replay-file` 至少提供一个。提供 `--replay-file` 时程序不会打开串口。
+FastSpeed binary:
 
-## 日志格式
+- `sensorarrayVoltageCompactFrame_t`
+- magic `0x31434153`, bytes `SAC1`
+- little-endian struct format `<IHHIQIIIIIIQ64iBBHI`
+- version `1`
+- frame type `0x1261`
+- IEEE CRC32 over all bytes before the `crc32` field
+- value order `S1D1..S1D8,S2D1..S8D8`
+- `microvolts[64]` are signed int32 `uV`
 
-程序会自动忽略非 `MATV_HEADER` 和非 `MATV` 行，例如 `DBG`、`INIT`、`ERROR`、`WARN`。空行、乱码行、残缺行、字段数量不一致行会被安全跳过，并在页面状态栏显示跳过数量和解析错误数量。
+FastSpeed text:
 
-Header 示例：
+- `STAT,...`
+- `EVENT,...`
+- `RATE_EVENT,...`
+- `RATE_FATAL,...`
+- `APPMODE,...`
+- `VOLTSCAN_INIT,...`
+- `VOLTSCAN_GAIN,...`
+- `VOLTSCAN_FATAL,...`
+- `DBG...`, `WARN...`, `ERROR...`
 
-```text
-MATV_HEADER,seq,timestamp_us,duration_us,unit,S1D1,S1D2,...,S8D8
-```
+Legacy CSV:
 
-数据行示例：
+- `MATV_HEADER,seq,timestamp_us,duration_us,unit,S1D1,...,S8D8`
+- `MATV,<seq>,<timestamp_us>,<duration_us>,uV,<64 values>`
+- `MATV_RAW`
+- `MATV_GAIN`
+- `MATV_ERR`
+- Optional `MATV_RAW_HEADER`, `MATV_GAIN_HEADER`, `MATV_ERR_HEADER`
 
-```text
-MATV,8200,512700622,31386,uV,53092,-45237,...,-68588
-```
+CSV parsing uses Python `csv.reader`. Unknown, empty, malformed, or non-UTF-8 text rows are counted and skipped without crashing the UI. `STAT`, `EVENT`, `DBG`, `APPMODE`, and `VOLTSCAN` rows update status/event panels and do not pollute matrix data.
 
-字段含义：
+## Web Connection
 
-| 字段 | 说明 |
-| --- | --- |
-| 第 0 列 | 固定字符串 `MATV`。 |
-| `seq` | 帧序号。 |
-| `timestamp_us` | ESP32 侧时间戳，单位微秒。 |
-| `duration_us` | 一次矩阵扫描持续时间，单位微秒。 |
-| `unit` | 数值单位，例如 `uV`、`mV`、`V`、`pF`、`raw`。 |
-| `S1D1` 到 `S8D8` | 64 个检测矩阵点位读数。 |
+The Connection panel supports:
 
-如果日志中缺少 `MATV_HEADER`，程序会使用默认顺序解析：
+- Input Mode: Serial, Replay File, Disconnected
+- Refresh Ports
+- COM Port dropdown
+- Baudrate
+- Connect
+- Disconnect
+- Reconnect
+- Auto reconnect
+- Replay file path and replay speed
 
-```text
-S1D1,S1D2,...,S1D8,S2D1,...,S8D8
-```
+Refresh Ports does not interrupt an active connection. Connecting to a new COM port stops the old reader first. Disconnect can be clicked repeatedly. If `pyserial` is missing, the port list is empty and the UI shows the dependency error.
 
-## 界面功能
+Common Windows COM port conflicts: VSCode serial monitor, `idf.py monitor`, Arduino IDE, PuTTY, and other serial terminals.
 
-- 8x8 热力图实时刷新，行是 `S1` 到 `S8`，列是 `D1` 到 `D8`。
-- 每个格子显示点位名和当前值。
-- 点击热力图格子后，历史曲线自动切换到该点位。
-- 右侧 `Cell` 下拉框可以直接切换不同点位的历史曲线。
-- `Pause / Resume` 可以暂停或继续从队列读取并刷新数据。
-- `Clear History` 清空内存历史数据，当前帧计数归零。
-- `Save Snapshot CSV` 将当前内存宽表数据保存到运行目录的 `exports/` 文件夹。
-- 色阶支持 `Auto`、`Symmetric around zero`、`Fixed range`。
-- 显示单位支持 `Auto uV/mV/V`、`Source unit`、`uV`、`mV`、`V`。单位转换只影响界面显示和图表，不改变内存原始值或 CSV 导出值。
+## Data Streams
 
-## CSV 输出
+The stream dropdown includes:
 
-启动时使用 `--save-csv path` 可以实时追加保存解析后的帧：
+- `FAST_BINARY`
+- `MATV`
+- `MATV_RAW`
+- `MATV_GAIN`
+- `MATV_ERR`
+
+Actual options are merged with streams seen in the input. `FAST_BINARY` is preferred by default. If no binary frames exist but legacy `MATV` data exists, the default display falls back to `MATV`.
+
+FastSpeed metadata shown in the UI and CSV includes:
+
+- `valid_mask`
+- `status_flags`
+- `first_status_code`
+- `last_status_code`
+- `dropped_frames`
+- `output_decimated_frames`
+- `ads_dr`
+- `output_divider`
+
+Invalid `validMask` points render as `NaN`/invalid in the heatmap. `droppedFrames` is passive loss from queue/stdout pressure. `outputDecimatedFrames` is active rate-control output skipping.
+
+## Dynamic History Graph
+
+The history graph uses Plotly `Scattergl`.
+
+Controls:
+
+- Auto follow latest
+- X axis: `timeSeconds`, `timestampUs`, `seq`
+- Window: All, Last 10 s, Last 30 s, Last 60 s, Last 5 min, Last N points, Custom range
+- Last N points
+- Custom x min / max
+
+When Auto follow latest is enabled, the x-axis follows the selected latest window. When disabled, Plotly `uirevision` is kept stable so manual zoom and pan are not reset by refreshes.
+
+For high-rate input, the graph down-samples only the displayed window to about 5000 points using min/max buckets. Raw in-memory history and CSV export are not down-sampled.
+
+## Status Codes
+
+Known FastSpeed codes are decoded in the UI, including:
+
+- `0x0000 OK`
+- `0x1001 ADS_SPI_FAIL`
+- `0x1002 ADS_DRDY_TIMEOUT`
+- `0x1003 ADS_CRC_FAIL`
+- `0x1004 ADS_REG_VERIFY_FAIL`
+- `0x1005 ADS_REF_POLICY_MISMATCH`
+- `0x1006 ADS_GAIN_CHANGE_FAIL`
+- `0x1007 ADS_DMA_FALLBACK`
+- `0x1008 ADS_INPMUX_WRITE_FAIL`
+- `0x1009 ADS_DIRECT_READ_FAIL`
+- `0x100A ADS_STATUS_BYTE_BAD`
+- `0x2001 TMUX_ROUTE_FAIL`
+- `0x2002 TMUX_SW_POLICY_MISMATCH`
+- `0x2003 TMUX_SOURCE_FAIL`
+- `0x3001 STREAM_QUEUE_FULL`
+- `0x3002 STREAM_FRAME_DROPPED`
+- `0x3003 USB_STDOUT_BLOCKED`
+- `0x3004 USB_STDOUT_WRITE_FAIL`
+- `0x3005 USB_STDOUT_SHORT_WRITE`
+- `0x4001 SPI_BUS_ACQUIRE_FAIL`
+- `0x4002 SPI_BUS_RELEASE_FAIL`
+- `0x5001 MODE_POLICY_MISMATCH`
+- `0x6001 RATE_OUTPUT_DECIMATED`
+- `0x6002 RATE_SCAN_THROTTLED`
+- `0x6003 RATE_ADS_DR_REDUCED`
+- `0x6004 RATE_MUX_SETTLE_INCREASED`
+- `0x6005 RATE_VERIFIED_MUX_FORCED`
+- `0x6006 RATE_SAFE_PROFILE_ENTERED`
+- `0x6007 RATE_FATAL_STOP`
+- `0x7FFF INTERNAL_ASSERT_FAIL`
+
+Unknown codes display as `UNKNOWN_0xXXXX`.
+
+## Test
+
+From the repository root:
 
 ```powershell
-python run_viewer.py --port COM5 --save-csv logs\matv_capture.csv
+.venv\Scripts\python.exe -m pytest
 ```
 
-CSV 表头：
+or install `pytest` first:
 
-```text
-seq,timestamp_us,time_s,duration_us,unit,S1D1,...,S8D8
+```powershell
+pip install -r requirements-dev.txt
+pytest
 ```
-
-如果文件已存在，程序会继续追加；如果文件不存在或为空，会先写入表头。
-
-## 常见问题
-
-**COM 口打不开**
-
-检查串口是否被 VSCode serial monitor、`idf.py monitor`、Arduino IDE 或其他程序占用。关闭占用程序后，viewer 会每隔 1 秒尝试重连。
-
-**没有数据显示**
-
-确认固件正在输出 `MATV` 行，并确认波特率和串口号正确。
-
-**热力图全空**
-
-检查 `MATV_HEADER` 和 `MATV` 字段数量。完整数据行应至少有 `5 + 64 = 69` 个字段。
-
-**数值颜色不明显**
-
-切换到 `Symmetric around zero`，或使用 `Fixed range` 手动设置色阶范围。
-
-**串口中途断开**
-
-程序不会崩溃，页面会显示 `Disconnected`，并每隔 1 秒尝试重新打开串口。恢复连接后会继续读取。

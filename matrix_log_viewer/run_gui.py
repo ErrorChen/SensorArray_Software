@@ -27,9 +27,10 @@ class ViewerLauncher(tk.Tk):
         self.process: subprocess.Popen | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
 
-        self.input_mode = tk.StringVar(value="serial")
+        self.input_mode = tk.StringVar(value="disconnected")
         self.port = tk.StringVar(value="")
         self.baud = tk.StringVar(value="115200")
+        self.auto_reconnect = tk.BooleanVar(value=False)
         self.max_points = tk.StringVar(value="5000")
         self.save_csv = tk.StringVar(value="")
         self.replay_file = tk.StringVar(value="")
@@ -61,20 +62,31 @@ class ViewerLauncher(tk.Tk):
 
         ttk.Radiobutton(
             source_frame,
+            text="Disconnected",
+            variable=self.input_mode,
+            value="disconnected",
+            command=self._sync_mode_state,
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Radiobutton(
+            source_frame,
             text="Serial COM",
             variable=self.input_mode,
             value="serial",
             command=self._sync_mode_state,
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.port_combo = ttk.Combobox(source_frame, textvariable=self.port, width=22)
-        self.port_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        self.port_combo.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(10, 0))
         ttk.Button(source_frame, text="Refresh Ports", command=self._refresh_ports).grid(
-            row=0, column=2, sticky="w"
+            row=1, column=2, sticky="w", pady=(10, 0)
         )
 
-        ttk.Label(source_frame, text="Baud").grid(row=0, column=3, sticky="e", padx=(16, 6))
+        ttk.Label(source_frame, text="Baud").grid(row=1, column=3, sticky="e", padx=(16, 6), pady=(10, 0))
         self.baud_entry = ttk.Entry(source_frame, textvariable=self.baud, width=10)
-        self.baud_entry.grid(row=0, column=4, sticky="w")
+        self.baud_entry.grid(row=1, column=4, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(source_frame, text="Auto reconnect", variable=self.auto_reconnect).grid(
+            row=1, column=5, sticky="w", pady=(10, 0)
+        )
 
         ttk.Radiobutton(
             source_frame,
@@ -82,16 +94,16 @@ class ViewerLauncher(tk.Tk):
             variable=self.input_mode,
             value="replay",
             command=self._sync_mode_state,
-        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.replay_entry = ttk.Entry(source_frame, textvariable=self.replay_file)
-        self.replay_entry.grid(row=1, column=1, columnspan=4, sticky="ew", padx=(8, 8), pady=(10, 0))
+        self.replay_entry.grid(row=2, column=1, columnspan=4, sticky="ew", padx=(8, 8), pady=(10, 0))
         ttk.Button(source_frame, text="Browse", command=self._browse_replay_file).grid(
-            row=1, column=5, sticky="e", pady=(10, 0)
+            row=2, column=5, sticky="e", pady=(10, 0)
         )
 
-        ttk.Label(source_frame, text="Replay speed").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(source_frame, text="Replay speed").grid(row=3, column=0, sticky="w", pady=(10, 0))
         self.replay_speed_entry = ttk.Entry(source_frame, textvariable=self.replay_speed, width=10)
-        self.replay_speed_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        self.replay_speed_entry.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
 
         settings_frame = ttk.LabelFrame(root, text="Viewer Settings", padding=12)
         settings_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -237,7 +249,9 @@ class ViewerLauncher(tk.Tk):
         args.extend(["--max-points", str(max_points), "--host", self.host.get().strip() or "127.0.0.1"])
         args.extend(["--port-web", str(web_port)])
 
-        if self.input_mode.get() == "replay":
+        if self.input_mode.get() == "disconnected":
+            args.extend(["--input-mode", "disconnected"])
+        elif self.input_mode.get() == "replay":
             replay_file = self.replay_file.get().strip()
             if not replay_file:
                 raise ValueError("Please choose a replay log file.")
@@ -251,6 +265,8 @@ class ViewerLauncher(tk.Tk):
                 raise ValueError("Please enter or choose a serial COM port.")
             baud = self._positive_int(self.baud.get(), "--baud")
             args.extend(["--port", port, "--baud", str(baud)])
+            if self.auto_reconnect.get():
+                args.append("--auto-reconnect")
 
         save_csv = self.save_csv.get().strip()
         if save_csv:
@@ -349,4 +365,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
