@@ -5,6 +5,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_SERIAL_READ_SIZE
+
 try:
     from serial.tools import list_ports
 except Exception:  # pragma: no cover - pyserial may not be installed yet.
@@ -29,6 +31,9 @@ class ConnectionManager:
             "bytesReceived": 0,
             "chunksReceived": 0,
             "rawLinesReceived": 0,
+            "droppedInputBytes": 0,
+            "droppedInputChunks": 0,
+            "readSize": DEFAULT_SERIAL_READ_SIZE,
             "lastDataTime": None,
             "lastError": "",
             "reconnectAttempts": 0,
@@ -65,18 +70,36 @@ class ConnectionManager:
             self._status["dependencyMissing"] = ""
         return ports
 
-    def connectSerial(self, port: str, baud: int, autoReconnect: bool) -> None:
+    def connectSerial(
+        self,
+        port: str,
+        baud: int,
+        autoReconnect: bool,
+        readSize: int = DEFAULT_SERIAL_READ_SIZE,
+    ) -> None:
         port = (port or "").strip()
         if not port:
             raise ValueError("Serial port is required.")
         baud = int(baud)
         if baud <= 0:
             raise ValueError("Baudrate must be greater than 0.")
+        read_size = max(4096, int(readSize or DEFAULT_SERIAL_READ_SIZE))
 
         with self._lock:
             self._stop_reader_locked()
-            self._lastSerialConfig = {"port": port, "baud": baud, "autoReconnect": bool(autoReconnect)}
-            self.reader = SerialReaderThread(port, baud, self.inputQueue, autoReconnect=bool(autoReconnect))
+            self._lastSerialConfig = {
+                "port": port,
+                "baud": baud,
+                "autoReconnect": bool(autoReconnect),
+                "readSize": read_size,
+            }
+            self.reader = SerialReaderThread(
+                port,
+                baud,
+                self.inputQueue,
+                autoReconnect=bool(autoReconnect),
+                readSize=read_size,
+            )
             self.reader.start()
             self._status.update(
                 {
@@ -84,6 +107,7 @@ class ConnectionManager:
                     "serialPort": port,
                     "baud": baud,
                     "autoReconnect": bool(autoReconnect),
+                    "readSize": read_size,
                     "lastError": "",
                 }
             )
@@ -106,19 +130,30 @@ class ConnectionManager:
             with self._lock:
                 self._status["lastError"] = "No previous serial connection to reconnect."
             raise RuntimeError("No previous serial connection to reconnect.")
-        self.connectSerial(config["port"], config["baud"], config.get("autoReconnect", False))
+        self.connectSerial(
+            config["port"],
+            config["baud"],
+            config.get("autoReconnect", False),
+            config.get("readSize", DEFAULT_SERIAL_READ_SIZE),
+        )
 
-    def startReplay(self, replayFile: str, replaySpeed: float) -> None:
+    def startReplay(
+        self,
+        replayFile: str,
+        replaySpeed: float,
+        readSize: int = DEFAULT_SERIAL_READ_SIZE,
+    ) -> None:
         replay_path = Path(replayFile)
         if not replay_path.exists():
             raise FileNotFoundError(f"Replay file does not exist: {replay_path}")
         speed = float(replaySpeed)
         if speed <= 0:
             raise ValueError("Replay speed must be greater than 0.")
+        read_size = max(4096, int(readSize or DEFAULT_SERIAL_READ_SIZE))
 
         with self._lock:
             self._stop_reader_locked()
-            self.reader = ReplayReaderThread(replay_path, speed, self.inputQueue)
+            self.reader = ReplayReaderThread(replay_path, speed, self.inputQueue, chunkSize=read_size)
             self.reader.start()
             self._status.update(
                 {
@@ -128,6 +163,7 @@ class ConnectionManager:
                     "serialConnected": False,
                     "replayFile": str(replay_path),
                     "replaySpeed": speed,
+                    "readSize": read_size,
                     "lastError": "",
                 }
             )

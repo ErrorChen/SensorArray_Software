@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_SERIAL_READ_SIZE, DEFAULT_SERIAL_TIMEOUT_SECONDS
+
 try:
     import serial
 except ImportError:  # pragma: no cover - depends on local environment.
@@ -31,6 +33,8 @@ class BaseReaderThread(threading.Thread):
             "bytesReceived": 0,
             "chunksReceived": 0,
             "rawLinesReceived": 0,
+            "droppedInputBytes": 0,
+            "droppedInputChunks": 0,
             "lastDataTime": None,
             "lastLineTime": None,
             "lastError": "",
@@ -53,12 +57,34 @@ class BaseReaderThread(threading.Thread):
     def _put_bytes(self, data: bytes) -> None:
         if not data:
             return
-        self.inputQueue.put(bytes(data))
+        chunk = bytes(data)
+        dropped_bytes = 0
+        dropped_chunks = 0
+        try:
+            self.inputQueue.put_nowait(chunk)
+        except queue.Full:
+            try:
+                dropped = self.inputQueue.get_nowait()
+            except queue.Empty:
+                dropped = None
+            if dropped is not None:
+                dropped_chunks += 1
+                try:
+                    dropped_bytes += len(dropped)
+                except TypeError:
+                    dropped_bytes += 0
+            try:
+                self.inputQueue.put_nowait(chunk)
+            except queue.Full:
+                dropped_chunks += 1
+                dropped_bytes += len(chunk)
         now = time.time()
         with self._statusLock:
-            self._status["bytesReceived"] += len(data)
+            self._status["bytesReceived"] += len(chunk)
             self._status["chunksReceived"] += 1
-            self._status["rawLinesReceived"] += data.count(b"\n")
+            self._status["rawLinesReceived"] += chunk.count(b"\n")
+            self._status["droppedInputBytes"] += dropped_bytes
+            self._status["droppedInputChunks"] += dropped_chunks
             self._status["lastDataTime"] = now
             self._status["lastLineTime"] = now
 
@@ -74,17 +100,25 @@ class SerialReaderThread(BaseReaderThread):
         inputQueue: "queue.Queue[bytes]",
         autoReconnect: bool = False,
         reconnectIntervalSeconds: float = 1.0,
-        readSize: int = 4096,
+        readSize: int = DEFAULT_SERIAL_READ_SIZE,
+        timeoutSeconds: float = DEFAULT_SERIAL_TIMEOUT_SECONDS,
     ):
         super().__init__("SerialReaderThread", "serial", inputQueue)
         self.port = str(port)
         self.baud = int(baud)
         self.autoReconnect = bool(autoReconnect)
         self.reconnectIntervalSeconds = reconnectIntervalSeconds
-        self.readSize = max(1, int(readSize))
+        self.readSize = max(4096, int(readSize))
+        self.timeoutSeconds = max(0.02, min(0.1, float(timeoutSeconds)))
         self._serialLock = threading.Lock()
         self._serialHandle: Any | None = None
-        self._set_status(serialPort=self.port, port=self.port, baud=self.baud, autoReconnect=self.autoReconnect)
+        self._set_status(
+            serialPort=self.port,
+            port=self.port,
+            baud=self.baud,
+            autoReconnect=self.autoReconnect,
+            readSize=self.readSize,
+        )
 
     def run(self) -> None:
         self._set_status(active=True)
@@ -135,7 +169,7 @@ class SerialReaderThread(BaseReaderThread):
             return None
 
         try:
-            serial_handle = serial.Serial(self.port, baudrate=self.baud, timeout=0.1)
+            serial_handle = serial.Serial(self.port, baudrate=self.baud, timeout=self.timeoutSeconds)
         except Exception as exc:
             self._set_status(serialConnected=False, lastError=str(exc))
             LOGGER.debug("Serial open failed: %s", exc)
@@ -169,7 +203,7 @@ class ReplayReaderThread(BaseReaderThread):
         replayFile: str | Path,
         replaySpeed: float,
         inputQueue: "queue.Queue[bytes]",
-        chunkSize: int = 4096,
+        chunkSize: int = DEFAULT_SERIAL_READ_SIZE,
     ):
         super().__init__("ReplayReaderThread", "replay", inputQueue)
         self.replayFile = Path(replayFile)

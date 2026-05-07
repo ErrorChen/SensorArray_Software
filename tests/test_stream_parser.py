@@ -19,7 +19,6 @@ def build_binary_frame(seq: int) -> bytes:
         0,
         0,
         0,
-        0,
         (1 << 64) - 1,
         *list(range(64)),
         15,
@@ -65,3 +64,13 @@ def test_binary_around_garbage_does_not_crash():
     stats = parser.getStats()
     assert stats["skippedBytes"] > 0
     assert stats["parseErrors"] == 0
+
+
+def test_ascii_garbage_without_newline_keeps_only_magic_tail():
+    parser = SensorArrayStreamParser()
+
+    assert parser.feedBytes(b"garbage") == []
+
+    stats = parser.getStats()
+    assert stats["bufferedBytes"] == 3
+    assert stats["skippedBytes"] == 4

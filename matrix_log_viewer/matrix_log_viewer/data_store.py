@@ -99,6 +99,14 @@ class MatrixDataStore:
                 return dict(self._latestMetaByType[resolved])
         return self._empty_meta(frameType)
 
+    def resolveFrameType(self, frameType: str | None = DEFAULT_FRAME_TYPE) -> str:
+        with self._lock:
+            return self._resolve_frame_type(frameType) or (frameType or DEFAULT_FRAME_TYPE)
+
+    def getFrameCount(self, frameType: str) -> int:
+        with self._lock:
+            return int(self._receivedByType.get(frameType, 0))
+
     def getCellHistory(
         self,
         frameType: str,

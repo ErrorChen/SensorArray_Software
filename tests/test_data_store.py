@@ -43,6 +43,21 @@ def test_streams_are_stored_independently_and_valid_mask_sets_nan():
     assert "MATV" in store.getAvailableFrameTypes()
 
 
+def test_fast_binary_is_default_and_matv_is_fallback_only_when_fast_missing():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    store.addFrame(make_frame("MATV", 2, 2_000_000))
+
+    fallback_matrix = store.getLatestMatrix("FAST_BINARY")
+    assert fallback_matrix[0, 0] == 2
+    assert store.resolveFrameType("FAST_BINARY") == "MATV"
+
+    store.addFrame(make_frame("FAST_BINARY", 5, 5_000_000))
+    fast_matrix = store.getLatestMatrix("FAST_BINARY")
+
+    assert fast_matrix[0, 0] == 5
+    assert store.resolveFrameType("FAST_BINARY") == "FAST_BINARY"
+
+
 def test_history_windows_and_wide_csv_meta():
     store = MatrixDataStore(maxPointsPerCell=100)
     for seq in range(60):
@@ -75,3 +90,14 @@ def test_downsample_limits_rendered_points_and_keeps_peaks():
     assert downsampled is True
     assert len(rendered) <= 5000
     assert rendered["value"].max() == 10000.0
+
+
+def test_dropped_frames_increase_generates_device_event():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    store.addFrame(make_frame("FAST_BINARY", 1, 1_000_000))
+    frame = make_frame("FAST_BINARY", 2, 2_000_000)
+    store.addFrame(MatrixFrame(**{**frame.__dict__, "droppedFrames": 3}))
+
+    events = store.getRecentDeviceEvents()
+
+    assert any(event["eventType"] == "DROPPED_FRAMES_INCREASED" for event in events)

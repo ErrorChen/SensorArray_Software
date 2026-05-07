@@ -12,8 +12,10 @@ from matrix_log_viewer.config import (
     DEFAULT_BAUD,
     DEFAULT_DASH_HOST,
     DEFAULT_DASH_PORT,
+    DEFAULT_INPUT_QUEUE_MAX_CHUNKS,
     DEFAULT_MAX_POINTS_PER_CELL,
     DEFAULT_REPLAY_SPEED,
+    DEFAULT_SERIAL_READ_SIZE,
     MAX_INPUT_CHUNKS_PER_DASH_TICK,
     MAX_PARSE_RESULTS_PER_TICK,
 )
@@ -25,7 +27,13 @@ from matrix_log_viewer.protocol_parser import SensorArrayStreamParser
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SensorArray FastSpeed/MATV 8x8 matrix viewer")
     parser.add_argument("--port", help="Initial serial COM/device path, for example COM5 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Serial baud rate")
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=DEFAULT_BAUD,
+        help="Host serial API baud rate. ESP32-S3 USB Serial/JTAG and USB CDC are not limited like a physical UART.",
+    )
+    parser.add_argument("--read-size", type=int, default=DEFAULT_SERIAL_READ_SIZE, help="Serial/replay bytes read per chunk")
     parser.add_argument("--auto-reconnect", action="store_true", help="Retry serial connection after disconnect")
     parser.add_argument(
         "--input-mode",
@@ -48,6 +56,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--replay-speed must be greater than 0")
     if args.baud <= 0:
         parser.error("--baud must be greater than 0")
+    if args.read_size < 4096:
+        parser.error("--read-size must be at least 4096")
     return args
 
 
@@ -68,7 +78,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
-    input_queue: queue.Queue[bytes] = queue.Queue()
+    input_queue: queue.Queue[bytes] = queue.Queue(maxsize=DEFAULT_INPUT_QUEUE_MAX_CHUNKS)
     parser = SensorArrayStreamParser()
     data_store = MatrixDataStore(maxPointsPerCell=args.max_points)
     csv_writer = CsvFrameWriter(args.save_csv) if args.save_csv else None
@@ -77,10 +87,10 @@ def main() -> int:
     input_mode = _infer_input_mode(args)
     try:
         if input_mode == "serial" and args.port:
-            connection_manager.connectSerial(args.port, args.baud, args.auto_reconnect)
+            connection_manager.connectSerial(args.port, args.baud, args.auto_reconnect, args.read_size)
             logging.info("Initial serial connection requested on %s at %d baud", args.port, args.baud)
         elif input_mode == "replay" and args.replay_file:
-            connection_manager.startReplay(args.replay_file, args.replay_speed)
+            connection_manager.startReplay(args.replay_file, args.replay_speed, args.read_size)
             logging.info("Initial replay started from %s", args.replay_file)
         else:
             logging.info("Starting disconnected; choose a COM port in the web UI")

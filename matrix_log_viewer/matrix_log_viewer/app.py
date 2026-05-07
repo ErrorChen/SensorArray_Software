@@ -4,6 +4,8 @@ import logging
 import math
 import queue
 import threading
+import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from .config import (
     CELL_NAMES,
     DEFAULT_BAUD,
     DEFAULT_REFRESH_INTERVAL_MS,
+    DEFAULT_SERIAL_READ_SIZE,
     DETECTOR_LABELS,
     DISPLAY_DOWNSAMPLE_TARGET_POINTS,
     MATRIX_SIZE,
@@ -37,6 +40,16 @@ class RuntimeState:
         self._lock = threading.Lock()
         self.csvRowsWritten = 0
         self.lastCsvError = ""
+        self.totalParsedBytes = 0
+        self.totalParsedChunks = 0
+        self.totalParsedBinaryFrames = 0
+        self.totalParsedTextFrames = 0
+        self.totalDisplayedFrames = 0
+        self.latestSeq: int | None = None
+        self.seqGap = 0
+        self._lastSeqByType: dict[str, int] = {}
+        self._lastDisplayedKey: tuple[str, int] | None = None
+        self._rateSamples: deque[dict[str, float]] = deque()
 
     def recordCsvWrite(self) -> None:
         with self._lock:
@@ -46,9 +59,129 @@ class RuntimeState:
         with self._lock:
             self.lastCsvError = message
 
+    def recordParseBatch(self, byte_count: int, chunk_count: int, results: list) -> None:
+        now = time.monotonic()
+        binary_frames = 0
+        text_frames = 0
+        with self._lock:
+            self.totalParsedBytes += int(byte_count)
+            self.totalParsedChunks += int(chunk_count)
+            for result in results:
+                frame = getattr(result, "frame", None)
+                if frame is None:
+                    continue
+                if frame.frameType == "FAST_BINARY":
+                    binary_frames += 1
+                else:
+                    text_frames += 1
+                if frame.seq is not None:
+                    previous = self._lastSeqByType.get(frame.frameType)
+                    if previous is not None and int(frame.seq) > previous + 1:
+                        self.seqGap += int(frame.seq) - previous - 1
+                    self._lastSeqByType[frame.frameType] = int(frame.seq)
+                    if frame.frameType == "FAST_BINARY":
+                        self.latestSeq = int(frame.seq)
+            self.totalParsedBinaryFrames += binary_frames
+            self.totalParsedTextFrames += text_frames
+            self._rateSamples.append(
+                {
+                    "time": now,
+                    "bytes": float(byte_count),
+                    "binary": float(binary_frames),
+                    "text": float(text_frames),
+                    "display": 0.0,
+                }
+            )
+            self._prune_rate_samples_locked(now)
+
+    def recordDisplayFrame(self, meta: dict, paused: bool = False) -> None:
+        if paused or meta.get("seq") is None:
+            return
+        key = (str(meta.get("frameType") or ""), int(meta["seq"]))
+        now = time.monotonic()
+        with self._lock:
+            if key == self._lastDisplayedKey:
+                return
+            self._lastDisplayedKey = key
+            self.totalDisplayedFrames += 1
+            self._rateSamples.append({"time": now, "bytes": 0.0, "binary": 0.0, "text": 0.0, "display": 1.0})
+            self._prune_rate_samples_locked(now)
+
     def getStats(self) -> dict:
         with self._lock:
-            return {"csvRowsWritten": self.csvRowsWritten, "lastCsvError": self.lastCsvError}
+            now = time.monotonic()
+            self._prune_rate_samples_locked(now)
+            duration = max(1e-6, now - self._rateSamples[0]["time"]) if self._rateSamples else 1.0
+            bytes_in_window = sum(sample["bytes"] for sample in self._rateSamples)
+            binary_in_window = sum(sample["binary"] for sample in self._rateSamples)
+            text_in_window = sum(sample["text"] for sample in self._rateSamples)
+            display_in_window = sum(sample["display"] for sample in self._rateSamples)
+            return {
+                "csvRowsWritten": self.csvRowsWritten,
+                "lastCsvError": self.lastCsvError,
+                "totalParsedBytes": self.totalParsedBytes,
+                "totalParsedChunks": self.totalParsedChunks,
+                "totalParsedBinaryFrames": self.totalParsedBinaryFrames,
+                "totalParsedTextFrames": self.totalParsedTextFrames,
+                "totalDisplayedFrames": self.totalDisplayedFrames,
+                "bytesPerSec": bytes_in_window / duration,
+                "parsedBinaryFps": binary_in_window / duration,
+                "parsedTextFps": text_in_window / duration,
+                "guiDisplayedFps": display_in_window / duration,
+                "latestSeq": self.latestSeq,
+                "seqGap": self.seqGap,
+            }
+
+    def _prune_rate_samples_locked(self, now: float) -> None:
+        cutoff = now - 5.0
+        while self._rateSamples and self._rateSamples[0]["time"] < cutoff:
+            self._rateSamples.popleft()
+
+
+class InputProcessorThread(threading.Thread):
+    def __init__(
+        self,
+        input_queue: "queue.Queue[bytes]",
+        parser: SensorArrayStreamParser,
+        data_store: MatrixDataStore,
+        csv_writer: CsvFrameWriter | None,
+        runtime_state: RuntimeState,
+        max_chunks_per_batch: int,
+    ):
+        super().__init__(name="SensorArrayInputProcessor", daemon=True)
+        self.input_queue = input_queue
+        self.parser = parser
+        self.data_store = data_store
+        self.csv_writer = csv_writer
+        self.runtime_state = runtime_state
+        self.max_chunks_per_batch = max(1, int(max_chunks_per_batch))
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                first_chunk = self.input_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            chunks = [first_chunk]
+            byte_count = len(first_chunk)
+            while len(chunks) < self.max_chunks_per_batch:
+                try:
+                    chunk = self.input_queue.get_nowait()
+                except queue.Empty:
+                    break
+                chunks.append(chunk)
+                byte_count += len(chunk)
+
+            results = []
+            for chunk in chunks:
+                results.extend(self.parser.feedBytes(chunk))
+            _store_parse_results(results, self.data_store, self.csv_writer, self.runtime_state)
+            self.runtime_state.recordParseBatch(byte_count, len(chunks), results)
 
 
 def createDashApp(
@@ -64,6 +197,16 @@ def createDashApp(
     runtime_state = RuntimeState()
     manager = connectionManager or ConnectionManager(inputQueue)
     app = Dash(__name__, title="SensorArray Matrix Viewer")
+    input_processor = InputProcessorThread(
+        inputQueue,
+        parser,
+        dataStore,
+        csvWriter,
+        runtime_state,
+        maxChunksPerTick,
+    )
+    input_processor.start()
+    app._sensorarray_input_processor = input_processor
 
     app.layout = html.Div(
         [
@@ -99,6 +242,7 @@ def createDashApp(
                                     _control("COM Port", dcc.Dropdown(id="com-port-dropdown", options=[], placeholder="Refresh ports")),
                                     html.Button("Refresh Ports", id="refresh-ports-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
                                     _control("Baudrate", dcc.Input(id="baud-input", type="number", value=DEFAULT_BAUD, min=1, step=1, style=INPUT_STYLE)),
+                                    _control("Read size", dcc.Input(id="read-size-input", type="number", value=DEFAULT_SERIAL_READ_SIZE, min=4096, step=1024, style=INPUT_STYLE)),
                                     _control("Auto reconnect", dcc.Checklist(id="auto-reconnect", value=[], options=[{"label": "Enabled", "value": "enabled"}], style=CHECKLIST_STYLE)),
                                     html.Button("Connect", id="connect-button", n_clicks=0, style=BUTTON_STYLE),
                                     html.Button("Disconnect", id="disconnect-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
@@ -226,6 +370,7 @@ def createDashApp(
         State("input-mode", "value"),
         State("com-port-dropdown", "value"),
         State("baud-input", "value"),
+        State("read-size-input", "value"),
         State("auto-reconnect", "value"),
         State("replay-file-input", "value"),
         State("replay-speed-input", "value"),
@@ -239,6 +384,7 @@ def createDashApp(
         input_mode: str,
         port: str | None,
         baud: Any,
+        read_size: Any,
         auto_reconnect: list[str] | None,
         replay_file: str | None,
         replay_speed: Any,
@@ -252,12 +398,21 @@ def createDashApp(
                 manager.reconnect()
                 return "Reconnect requested."
             if triggered == "start-replay-button" or input_mode == "replay":
-                manager.startReplay(str(replay_file or ""), float(replay_speed or 1.0))
+                manager.startReplay(
+                    str(replay_file or ""),
+                    float(replay_speed or 1.0),
+                    int(read_size or DEFAULT_SERIAL_READ_SIZE),
+                )
                 return "Replay started."
             if input_mode == "disconnected":
                 manager.disconnect()
                 return "Disconnected."
-            manager.connectSerial(str(port or ""), int(baud or DEFAULT_BAUD), "enabled" in (auto_reconnect or []))
+            manager.connectSerial(
+                str(port or ""),
+                int(baud or DEFAULT_BAUD),
+                "enabled" in (auto_reconnect or []),
+                int(read_size or DEFAULT_SERIAL_READ_SIZE),
+            )
             return f"Connecting to {port}."
         except Exception as exc:
             return f"Connection error: {exc}"
@@ -326,19 +481,19 @@ def createDashApp(
         custom_max: Any,
         auto_follow_values: list[str] | None,
     ) -> tuple[go.Figure, go.Figure, list, list, list, str]:
-        if not paused:
-            _drain_queue(inputQueue, parser, dataStore, csvWriter, runtime_state, maxChunksPerTick, maxParseResultsPerTick)
-
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
         selected_type = frame_type or "FAST_BINARY"
+        display_type = dataStore.resolveFrameType(selected_type)
+        fallback_active = selected_type == "FAST_BINARY" and display_type != selected_type
         latest_matrix_raw = dataStore.getLatestMatrix(selected_type)
         latest_meta = dataStore.getLatestFrameMeta(selected_type)
+        runtime_state.recordDisplayFrame(latest_meta, bool(paused))
         parser_stats = parser.getStats()
         connection_status = manager.getStatus()
         runtime_stats = runtime_state.getStats()
         display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
 
-        heatmap = _build_heatmap_figure(display_matrix, latest_meta, selected_cell, color_mode, fixed_min, fixed_max, display_unit, selected_type)
+        heatmap = _build_heatmap_figure(display_matrix, latest_meta, selected_cell, color_mode, fixed_min, fixed_max, display_unit, display_type)
 
         history_raw = dataStore.getCellHistory(
             selected_type,
@@ -353,7 +508,7 @@ def createDashApp(
         auto_follow = "enabled" in (auto_follow_values or [])
         history = _build_history_figure(
             selected_cell,
-            selected_type,
+            display_type,
             history_raw,
             history_rendered,
             x_axis,
@@ -367,15 +522,18 @@ def createDashApp(
         status = _build_status_bar(latest_meta, parser_stats, connection_status, runtime_stats, paused, _safe_qsize(inputQueue), display_unit)
         connection_panel = _build_connection_panel(connection_status, _safe_qsize(inputQueue))
         device_panel = _build_device_panel(latest_meta, parser_stats, dataStore.getLatestDeviceStatus(), dataStore.getRecentDeviceEvents(50))
+        fallback_text = f" | fallback: {selected_type}->{display_type}" if fallback_active else ""
         history_stats = (
-            f"stream: {selected_type} | "
+            f"stream: {display_type} (requested {selected_type}){fallback_text} | "
             f"cell: {selected_cell} | "
             f"x: {x_axis} | "
             f"window: {history_window} | "
             f"visible raw points: {len(history_raw)} | "
             f"rendered points: {len(history_rendered)} | "
             f"downsampled: {'yes' if downsampled else 'no'} | "
-            f"auto follow: {'yes' if auto_follow else 'no'}"
+            f"auto follow: {'yes' if auto_follow else 'no'} | "
+            f"parsed binary fps: {runtime_stats.get('parsedBinaryFps', 0.0):.1f} | "
+            f"gui displayed fps: {runtime_stats.get('guiDisplayedFps', 0.0):.1f}"
         )
         return heatmap, history, status, connection_panel, device_panel, history_stats
 
@@ -393,28 +551,43 @@ def _drain_queue(
 ) -> None:
     chunks = 0
     parse_results = 0
+    byte_count = 0
+    results_batch = []
     while chunks < max_chunks and parse_results < max_parse_results:
         try:
             chunk = input_queue.get_nowait()
         except queue.Empty:
             break
         chunks += 1
+        byte_count += len(chunk)
         results = parser.feedBytes(chunk)
         parse_results += len(results)
-        for result in results:
-            if result.frame is not None:
-                data_store.addFrame(result.frame)
-                if csv_writer is not None:
-                    try:
-                        csv_writer.appendFrame(result.frame)
-                        runtime_state.recordCsvWrite()
-                    except Exception as exc:
-                        runtime_state.recordCsvError(str(exc))
-                        LOGGER.warning("CSV append failed: %s", exc)
-            if result.status is not None:
-                data_store.addDeviceStatus(result.status)
-            if result.event is not None:
-                data_store.addDeviceEvent(result.event)
+        results_batch.extend(results)
+    _store_parse_results(results_batch, data_store, csv_writer, runtime_state)
+    if chunks:
+        runtime_state.recordParseBatch(byte_count, chunks, results_batch)
+
+
+def _store_parse_results(
+    results: list,
+    data_store: MatrixDataStore,
+    csv_writer: CsvFrameWriter | None,
+    runtime_state: RuntimeState,
+) -> None:
+    for result in results:
+        if result.frame is not None:
+            data_store.addFrame(result.frame)
+            if csv_writer is not None:
+                try:
+                    csv_writer.appendFrame(result.frame)
+                    runtime_state.recordCsvWrite()
+                except Exception as exc:
+                    runtime_state.recordCsvError(str(exc))
+                    LOGGER.warning("CSV append failed: %s", exc)
+        if result.status is not None:
+            data_store.addDeviceStatus(result.status)
+        if result.event is not None:
+            data_store.addDeviceEvent(result.event)
 
 
 def _build_heatmap_figure(
@@ -616,24 +789,35 @@ def _resolve_follow_range(history, x_column: str, window_mode: str, last_n: int 
 def _build_status_bar(meta: dict, parser_stats: dict, connection_status: dict, runtime_stats: dict, paused: bool, queue_depth: int | str, display_unit: str) -> list:
     dropped = int(meta.get("droppedFrames") or 0)
     decimated = int(meta.get("outputDecimatedFrames") or 0)
+    host_drop_chunks = int(connection_status.get("droppedInputChunks") or 0)
     return [
         _status_item("Input", _connection_label(connection_status, paused)),
         _status_item("frame_type", meta.get("frameType") or "-"),
         _status_item("seq", _dash_if_none(meta.get("seq"))),
+        _status_item("latest_seq", _dash_if_none(runtime_stats.get("latestSeq"))),
+        _status_item("seq_gap", runtime_stats.get("seqGap", 0), warning=runtime_stats.get("seqGap", 0) > 0),
         _status_item("timestamp_us", _dash_if_none(meta.get("timestampUs"))),
         _status_item("duration_us", _dash_if_none(meta.get("durationUs"))),
         _status_item("unit", meta.get("unit") or "-"),
         _status_item("display_unit", display_unit or meta.get("unit") or "-"),
         _status_item("status_code", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=bool(meta.get("lastStatusCode"))),
-        _status_item("dropped", dropped, warning=dropped > 0),
-        _status_item("decimated", decimated, warning=decimated > 0),
+        _status_item("device_dropped", dropped, warning=dropped > 0),
+        _status_item("device_decimated", decimated, warning=decimated > 0),
+        _status_item("host_drop_chunks", host_drop_chunks, warning=host_drop_chunks > 0),
         _status_item("adsDr", _dash_if_none(meta.get("adsDr"))),
         _status_item("outputDiv", _dash_if_none(meta.get("outputDivider"))),
+        _status_item("bytes/sec", f"{runtime_stats.get('bytesPerSec', 0.0):.0f}"),
+        _status_item("binary_fps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
+        _status_item("text_fps", f"{runtime_stats.get('parsedTextFps', 0.0):.1f}"),
+        _status_item("gui_fps", f"{runtime_stats.get('guiDisplayedFps', 0.0):.1f}"),
         _status_item("bytes", connection_status.get("bytesReceived", 0)),
         _status_item("chunks", connection_status.get("chunksReceived", 0)),
         _status_item("queue_depth", queue_depth),
         _status_item("parsed_total", parser_stats.get("parsedFramesTotal", 0)),
+        _status_item("parsed_binary", parser_stats.get("parsedBinaryFrames", 0)),
+        _status_item("parsed_text", parser_stats.get("parsedTextFrames", 0)),
         _status_item("crc_errors", parser_stats.get("binaryCrcErrors", 0), warning=parser_stats.get("binaryCrcErrors", 0) > 0),
+        _status_item("resyncs", parser_stats.get("binaryMagicResyncs", 0), warning=parser_stats.get("binaryMagicResyncs", 0) > 0),
         _status_item("parse_errors", parser_stats.get("parseErrors", 0), warning=parser_stats.get("parseErrors", 0) > 0),
         _status_item("csv_rows", runtime_stats.get("csvRowsWritten", 0)),
         _status_item("last_error", _first_non_empty(runtime_stats.get("lastCsvError", ""), connection_status.get("lastError", ""), parser_stats.get("lastError", ""), "-"), warning=bool(_first_non_empty(runtime_stats.get("lastCsvError", ""), connection_status.get("lastError", ""), parser_stats.get("lastError", ""), ""))),
@@ -645,13 +829,18 @@ def _build_connection_panel(status: dict, queue_depth: int | str) -> list:
         _status_item("mode", status.get("mode", "disconnected")),
         _status_item("serial_port", status.get("serialPort") or status.get("port") or "-"),
         _status_item("baud", _dash_if_none(status.get("baud"))),
+        _status_item("read_size", _dash_if_none(status.get("readSize"))),
         _status_item("connected", "yes" if status.get("serialConnected") else "no", warning=status.get("mode") == "serial" and not status.get("serialConnected")),
         _status_item("bytes_received", status.get("bytesReceived", 0)),
         _status_item("chunks_received", status.get("chunksReceived", 0)),
+        _status_item("raw_lines", status.get("rawLinesReceived", 0)),
+        _status_item("dropped_chunks", status.get("droppedInputChunks", 0), warning=status.get("droppedInputChunks", 0) > 0),
+        _status_item("dropped_bytes", status.get("droppedInputBytes", 0), warning=status.get("droppedInputBytes", 0) > 0),
         _status_item("queue_depth", queue_depth),
         _status_item("last_data", _format_wall_time(status.get("lastDataTime"))),
         _status_item("reconnects", status.get("reconnectAttempts", 0)),
         _status_item("auto_reconnect", "on" if status.get("autoReconnect") else "off"),
+        _status_item("dependency", status.get("dependencyMissing") or "-"),
         _status_item("last_serial_error", status.get("lastError") or "-", warning=bool(status.get("lastError"))),
     ]
 
@@ -675,6 +864,22 @@ def _build_device_panel(meta: dict, parser_stats: dict, latest_status: dict, eve
 
     status_fields = latest_status.get("fields") or {}
     status_text = latest_status.get("rawLine") or ", ".join(f"{key}={value}" for key, value in status_fields.items()) or "-"
+    stat_keys = [
+        "fps",
+        "pps",
+        "scanAvgUs",
+        "scanMaxUs",
+        "drop",
+        "decimated",
+        "qFull",
+        "drdyTimeout",
+        "spiFail",
+        "adsDr",
+        "adsSps",
+        "outputDiv",
+        "status",
+        "code",
+    ]
     return [
         html.Div(
             [
@@ -685,6 +890,10 @@ def _build_device_panel(meta: dict, parser_stats: dict, latest_status: dict, eve
                 _status_item("last parser status", parser_stats.get("lastStatusCodeName") or "-"),
             ],
             style=STATUS_GRID_STYLE,
+        ),
+        html.Div(
+            [_status_item(key, status_fields.get(key, "-")) for key in stat_keys],
+            style={**STATUS_GRID_STYLE, "marginTop": "10px"},
         ),
         html.Div(status_text, style={**MESSAGE_STYLE, "marginTop": "10px", "whiteSpace": "pre-wrap"}),
         html.Table(

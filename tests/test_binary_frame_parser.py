@@ -3,22 +3,32 @@ from __future__ import annotations
 import binascii
 import struct
 
+import pytest
+
 from matrix_log_viewer.binary_frame_parser import (
     FMT,
     FRAME_TYPE_VOLTAGE_COMPACT,
     MAGIC,
     SIZE,
+    BinaryFrameParseError,
     SensorArrayBinaryFrameParser,
 )
+from matrix_log_viewer.data_store import MatrixDataStore
 from matrix_log_viewer.protocol_parser import SensorArrayStreamParser
 
 
-def build_binary_frame(seq: int = 7, valid_mask: int = (1 << 64) - 1, crc_delta: int = 0) -> bytes:
+def build_binary_frame(
+    seq: int = 7,
+    valid_mask: int = (1 << 64) - 1,
+    crc_delta: int = 0,
+    version: int = 1,
+    frame_type: int = FRAME_TYPE_VOLTAGE_COMPACT,
+) -> bytes:
     values = list(range(64))
     fields = [
         MAGIC,
-        1,
-        FRAME_TYPE_VOLTAGE_COMPACT,
+        version,
+        frame_type,
         seq,
         123456789,
         321,
@@ -26,7 +36,6 @@ def build_binary_frame(seq: int = 7, valid_mask: int = (1 << 64) - 1, crc_delta:
         0x3001,
         0x3002,
         3,
-        4,
         valid_mask,
         *values,
         15,
@@ -54,6 +63,17 @@ def test_parse_valid_fast_binary_frame():
     assert frame.unit == "uV"
     assert frame.adsDr == 15
     assert frame.outputDivider == 2
+    assert frame.outputDecimatedFrames == 0
+    assert frame.rawBytes == build_binary_frame()
+
+
+def test_struct_size_is_312():
+    assert SIZE == 312
+    assert struct.calcsize(FMT) == 312
+
+
+def test_format_matches_expected_layout():
+    assert FMT == "<IHHIQIIIIIQ64iBBHI"
 
 
 def test_crc_error_is_dropped_and_counted():
@@ -91,3 +111,37 @@ def test_two_frames_in_one_feed():
     results = parser.feedBytes(build_binary_frame(seq=1) + build_binary_frame(seq=2))
 
     assert [result.frame.seq for result in results] == [1, 2]
+
+
+def test_valid_mask_sets_nan_in_store():
+    store = MatrixDataStore()
+    frame = SensorArrayBinaryFrameParser().parseFrame(build_binary_frame(valid_mask=((1 << 64) - 1) ^ 0x1))
+    store.addFrame(frame)
+
+    matrix = store.getLatestMatrix("FAST_BINARY")
+    assert matrix[0, 0] != matrix[0, 0]
+    assert matrix[0, 1] == 1
+
+
+def test_bad_version_rejected():
+    with pytest.raises(BinaryFrameParseError) as excinfo:
+        SensorArrayBinaryFrameParser().parseFrame(build_binary_frame(version=2))
+
+    assert excinfo.value.kind == "version"
+
+
+def test_bad_frame_type_rejected():
+    with pytest.raises(BinaryFrameParseError) as excinfo:
+        SensorArrayBinaryFrameParser().parseFrame(build_binary_frame(frame_type=0x9999))
+
+    assert excinfo.value.kind == "frameType"
+
+
+def test_binary_with_text_before_and_after():
+    parser = SensorArrayStreamParser()
+    results = parser.feedBytes(
+        b"APPMODE,mode=fast\n" + build_binary_frame(seq=10) + b"STAT,fps=30.0,code=0x0000\n"
+    )
+
+    assert [result.frame.seq for result in results if result.frame] == [10]
+    assert [result.status.statusType for result in results if result.status] == ["APPMODE", "STAT"]

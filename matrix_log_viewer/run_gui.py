@@ -29,7 +29,8 @@ class ViewerLauncher(tk.Tk):
 
         self.input_mode = tk.StringVar(value="disconnected")
         self.port = tk.StringVar(value="")
-        self.baud = tk.StringVar(value="115200")
+        self.baud = tk.StringVar(value="921600")
+        self.read_size = tk.StringVar(value="8192")
         self.auto_reconnect = tk.BooleanVar(value=False)
         self.max_points = tk.StringVar(value="5000")
         self.save_csv = tk.StringVar(value="")
@@ -84,6 +85,9 @@ class ViewerLauncher(tk.Tk):
         ttk.Label(source_frame, text="Baud").grid(row=1, column=3, sticky="e", padx=(16, 6), pady=(10, 0))
         self.baud_entry = ttk.Entry(source_frame, textvariable=self.baud, width=10)
         self.baud_entry.grid(row=1, column=4, sticky="w", pady=(10, 0))
+        ttk.Label(source_frame, text="Read size").grid(row=3, column=3, sticky="e", padx=(16, 6), pady=(10, 0))
+        self.read_size_entry = ttk.Entry(source_frame, textvariable=self.read_size, width=10)
+        self.read_size_entry.grid(row=3, column=4, sticky="w", pady=(10, 0))
         ttk.Checkbutton(source_frame, text="Auto reconnect", variable=self.auto_reconnect).grid(
             row=1, column=5, sticky="w", pady=(10, 0)
         )
@@ -181,6 +185,7 @@ class ViewerLauncher(tk.Tk):
 
         self.port_combo.configure(state=serial_state)
         self.baud_entry.configure(state=serial_state)
+        self.read_size_entry.configure(state=serial_state)
         self.replay_entry.configure(state=replay_state)
         self.replay_speed_entry.configure(state=replay_state)
 
@@ -264,7 +269,9 @@ class ViewerLauncher(tk.Tk):
             if not port:
                 raise ValueError("Please enter or choose a serial COM port.")
             baud = self._positive_int(self.baud.get(), "--baud")
+            read_size = max(4096, self._positive_int(self.read_size.get(), "--read-size"))
             args.extend(["--port", port, "--baud", str(baud)])
+            args.extend(["--read-size", str(read_size)])
             if self.auto_reconnect.get():
                 args.append("--auto-reconnect")
 

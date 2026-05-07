@@ -6,14 +6,17 @@ import struct
 from .config import CELL_NAMES
 from .protocol_types import MatrixFrame
 
-# C-compatible packed layout for sensorarrayVoltageCompactFrame_t.
-FMT = "<IHHIQIIIIIIQ64iBBHI"
-SIZE = struct.calcsize(FMT)
 MAGIC = 0x31434153
 MAGIC_BYTES = b"SAC1"
 VERSION = 1
 FRAME_TYPE_VOLTAGE_COMPACT = 0x1261
 FRAME_TYPE_NAME = "FAST_BINARY"
+# FastSpeed compact voltage frame. Keep this string in sync with the firmware
+# protocol note in README; the GUI/parser use SIZE to resynchronise the stream.
+FMT = "<IHHIQIIIIIQ64iBBHI"
+SIZE = struct.calcsize(FMT)
+if SIZE != 312:  # pragma: no cover - import-time protocol guard.
+    raise RuntimeError(f"FastSpeed binary frame format size mismatch: {SIZE} != 312")
 
 
 class BinaryFrameParseError(ValueError):
@@ -57,11 +60,11 @@ class SensorArrayBinaryFrameParser:
         first_status_code = int(fields[7])
         last_status_code = int(fields[8])
         dropped_frames = int(fields[9])
-        output_decimated_frames = int(fields[10])
-        valid_mask = int(fields[11])
-        microvolts = fields[12:76]
-        ads_dr = int(fields[76])
-        output_divider = int(fields[77])
+        valid_mask = int(fields[10])
+        microvolts = fields[11:75]
+        ads_dr = int(fields[75])
+        output_divider = int(fields[76])
+        output_decimated_frames = 0
 
         values = {
             cell_name: float(value)

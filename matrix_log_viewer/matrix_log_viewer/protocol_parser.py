@@ -182,7 +182,36 @@ class SensorArrayStreamParser:
             if value in (9, 13) or 32 <= value <= 126:
                 continue
             return False
-        return True
+        text = bytes(buffer).decode("ascii", errors="ignore").strip()
+        if not text:
+            return True
+        token = text.split(",", maxsplit=1)[0].strip()
+        known_prefixes = (
+            "MATV",
+            "MATV_HEADER",
+            "MATV_RAW",
+            "MATV_RAW_HEADER",
+            "MATV_GAIN",
+            "MATV_GAIN_HEADER",
+            "MATV_ERR",
+            "MATV_ERR_HEADER",
+            "STAT",
+            "EVENT",
+            "RATE_EVENT",
+            "RATE_FATAL",
+            "APPMODE",
+            "VOLTSCAN",
+            "ADS_",
+            "ROUTE_",
+            "DBG",
+            "WARN",
+            "WARNING",
+            "ERROR",
+            "STREAM_INIT",
+        )
+        if any(prefix.startswith(token) or token.startswith(prefix) for prefix in known_prefixes):
+            return True
+        return "," in text and token == token.upper() and token.replace("_", "").isalnum()
 
     def _drop_non_text_line_prefix(self, raw_line: bytes) -> bytes:
         index = 0
