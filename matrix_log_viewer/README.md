@@ -119,11 +119,19 @@ Parser stats include parsed binary/text frames, statuses/events, CRC errors, sho
 - If no `FAST_BINARY` data exists but `MATV` exists, the matrix and history fall back to `MATV` and show a fallback note.
 - Heatmap shows the latest 8x8 values and invalid cells as `NaN`/invalid.
 - Clicking a cell updates the selected `SxDy`; the right history graph continues drawing that cell.
-- History uses Plotly `Scattergl`.
+- Normal View is the default operator view: compact connection controls, stream/cell/window/unit/color controls, 8x8 heatmap, and selected-cell history.
+- Replay controls, baud/read size, auto reconnect, custom x ranges, fixed color ranges, parser counters, connection internals, and device status are under **Advanced / Diagnostics**.
+- History uses Plotly `Scattergl` in line mode by default. Markers are available in Advanced because they are expensive at high point counts.
 - Auto follow on: x-axis follows the latest selected window.
 - Auto follow off: `uirevision` keeps manual zoom/pan stable across refreshes.
-- UI refresh defaults to `100 ms`. Receive/parse/store run in a background ingest thread, so Plotly refresh is not tied to every incoming frame.
+- Receive/parse/store run in a background ingest thread. Dash uses separate intervals for lightweight ingest revision publication, graph rendering, compact status, and diagnostics.
+- Graph rendering defaults to `50 ms` and is revision-gated: if no new frame or relevant control change arrived, graph callbacks return `no_update`.
+- Compact status updates at `500 ms`; Advanced diagnostics update at `1000 ms` and do not redraw while the details panel is closed.
 - Display downsampling applies only to the visible history window, not to raw in-memory storage or CSV export.
+
+## GUI Performance Acceptance
+
+Using `sample_fast_binary_mixed.bin` or a simulated 20 fps FastSpeed binary stream, Normal View should keep rendered GUI fps close to input fps, with a target of at least 15 fps on a typical lab laptop. The 30 s history window should scroll smoothly, switching cells should redraw history within one render tick, and expanding Advanced may reduce visual fps without slowing parsing/storage. The default first screen is intentionally dominated by the 8x8 heatmap and selected-cell history rather than parser/device debug fields.
 
 ## Status Panels
 

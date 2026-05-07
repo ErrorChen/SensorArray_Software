@@ -17,8 +17,11 @@ from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 from .config import (
     CELL_NAMES,
     DEFAULT_BAUD,
-    DEFAULT_REFRESH_INTERVAL_MS,
+    DEFAULT_DIAGNOSTICS_INTERVAL_MS,
+    DEFAULT_INGEST_INTERVAL_MS,
+    DEFAULT_RENDER_INTERVAL_MS,
     DEFAULT_SERIAL_READ_SIZE,
+    DEFAULT_STATUS_INTERVAL_MS,
     DETECTOR_LABELS,
     DISPLAY_DOWNSAMPLE_TARGET_POINTS,
     MATRIX_SIZE,
@@ -50,6 +53,7 @@ class RuntimeState:
         self._lastSeqByType: dict[str, int] = {}
         self._lastDisplayedKey: tuple[str, int] | None = None
         self._rateSamples: deque[dict[str, float]] = deque()
+        self._renderSamples: deque[dict[str, float]] = deque()
 
     def recordCsvWrite(self) -> None:
         with self._lock:
@@ -107,6 +111,12 @@ class RuntimeState:
             self._rateSamples.append({"time": now, "bytes": 0.0, "binary": 0.0, "text": 0.0, "display": 1.0})
             self._prune_rate_samples_locked(now)
 
+    def recordRenderCompletion(self, rendered_frame: bool) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._renderSamples.append({"time": now, "tick": 1.0, "render": 1.0 if rendered_frame else 0.0})
+            self._prune_render_samples_locked(now)
+
     def getStats(self) -> dict:
         with self._lock:
             now = time.monotonic()
@@ -116,6 +126,10 @@ class RuntimeState:
             binary_in_window = sum(sample["binary"] for sample in self._rateSamples)
             text_in_window = sum(sample["text"] for sample in self._rateSamples)
             display_in_window = sum(sample["display"] for sample in self._rateSamples)
+            render_duration = max(1e-6, now - self._renderSamples[0]["time"]) if self._renderSamples else 1.0
+            render_ticks = sum(sample["tick"] for sample in self._renderSamples)
+            rendered_frames = sum(sample["render"] for sample in self._renderSamples)
+            rendered_frame_fps = rendered_frames / render_duration
             return {
                 "csvRowsWritten": self.csvRowsWritten,
                 "lastCsvError": self.lastCsvError,
@@ -127,7 +141,10 @@ class RuntimeState:
                 "bytesPerSec": bytes_in_window / duration,
                 "parsedBinaryFps": binary_in_window / duration,
                 "parsedTextFps": text_in_window / duration,
-                "guiDisplayedFps": display_in_window / duration,
+                "guiDisplayedFps": rendered_frame_fps,
+                "renderTickFps": render_ticks / render_duration,
+                "renderedFrameFps": rendered_frame_fps,
+                "legacyDisplayFps": display_in_window / duration,
                 "latestSeq": self.latestSeq,
                 "seqGap": self.seqGap,
             }
@@ -136,6 +153,11 @@ class RuntimeState:
         cutoff = now - 5.0
         while self._rateSamples and self._rateSamples[0]["time"] < cutoff:
             self._rateSamples.popleft()
+
+    def _prune_render_samples_locked(self, now: float) -> None:
+        cutoff = now - 2.0
+        while self._renderSamples and self._renderSamples[0]["time"] < cutoff:
+            self._renderSamples.popleft()
 
 
 class InputProcessorThread(threading.Thread):
@@ -208,119 +230,14 @@ def createDashApp(
     input_processor.start()
     app._sensorarray_input_processor = input_processor
 
-    app.layout = html.Div(
-        [
-            dcc.Store(id="selected-cell-store", data=DEFAULT_SELECTED_CELL),
-            dcc.Store(id="paused-store", data=False),
-            dcc.Interval(id="refresh-interval", interval=DEFAULT_REFRESH_INTERVAL_MS, n_intervals=0),
-            html.Div(
-                [
-                    html.Div([html.H1("SensorArray Matrix Viewer", style=TITLE_STYLE), html.Div(id="status-bar", style=STATUS_GRID_STYLE)]),
-                    html.Div(
-                        [
-                            html.Button("Pause", id="pause-button", n_clicks=0, style=BUTTON_STYLE),
-                            html.Button("Clear History", id="clear-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
-                            html.Button("Save Snapshot CSV", id="save-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
-                        ],
-                        style=BUTTON_ROW_STYLE,
-                    ),
-                ],
-                style=TOP_GRID_STYLE,
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H2("Connection", style=SECTION_TITLE_STYLE),
-                            html.Div(
-                                [
-                                    _control("Input Mode", dcc.Dropdown(id="input-mode", value="serial", clearable=False, options=[
-                                        {"label": "Serial", "value": "serial"},
-                                        {"label": "Replay File", "value": "replay"},
-                                        {"label": "Disconnected", "value": "disconnected"},
-                                    ])),
-                                    _control("COM Port", dcc.Dropdown(id="com-port-dropdown", options=[], placeholder="Refresh ports")),
-                                    html.Button("Refresh Ports", id="refresh-ports-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
-                                    _control("Baudrate", dcc.Input(id="baud-input", type="number", value=DEFAULT_BAUD, min=1, step=1, style=INPUT_STYLE)),
-                                    _control("Read size", dcc.Input(id="read-size-input", type="number", value=DEFAULT_SERIAL_READ_SIZE, min=4096, step=1024, style=INPUT_STYLE)),
-                                    _control("Auto reconnect", dcc.Checklist(id="auto-reconnect", value=[], options=[{"label": "Enabled", "value": "enabled"}], style=CHECKLIST_STYLE)),
-                                    html.Button("Connect", id="connect-button", n_clicks=0, style=BUTTON_STYLE),
-                                    html.Button("Disconnect", id="disconnect-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
-                                    html.Button("Reconnect", id="reconnect-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
-                                    _control("Replay file", dcc.Input(id="replay-file-input", type="text", debounce=True, style=INPUT_STYLE)),
-                                    _control("Replay speed", dcc.Input(id="replay-speed-input", type="number", value=1.0, min=0.01, step=0.5, style=INPUT_STYLE)),
-                                    html.Button("Start Replay", id="start-replay-button", n_clicks=0, style=SECONDARY_BUTTON_STYLE),
-                                ],
-                                style=CONNECTION_GRID_STYLE,
-                            ),
-                            html.Div(id="port-refresh-status", style=MESSAGE_STYLE),
-                            html.Div(id="connection-action-status", style=MESSAGE_STYLE),
-                            html.Div(id="connection-status-panel", style=STATUS_GRID_STYLE),
-                        ],
-                        style=PANEL_STYLE,
-                    ),
-                ],
-                style={"marginTop": "16px"},
-            ),
-            html.Div(
-                [
-                    _control("Data stream", dcc.Dropdown(id="frame-type-dropdown", value="FAST_BINARY", clearable=False, options=_frame_type_options(DEFAULT_FRAME_TYPES))),
-                    _control("Cell", dcc.Dropdown(id="cell-dropdown", value=DEFAULT_SELECTED_CELL, clearable=False, options=[{"label": cell, "value": cell} for cell in CELL_NAMES])),
-                    _control("X axis", dcc.Dropdown(id="x-axis", value="timeSeconds", clearable=False, options=[
-                        {"label": "timeSeconds", "value": "timeSeconds"},
-                        {"label": "timestampUs", "value": "timestampUs"},
-                        {"label": "seq", "value": "seq"},
-                    ])),
-                    _control("History window", dcc.Dropdown(id="history-window", value="last_30s", clearable=False, options=[
-                        {"label": "All", "value": "all"},
-                        {"label": "Last 10 s", "value": "last_10s"},
-                        {"label": "Last 30 s", "value": "last_30s"},
-                        {"label": "Last 60 s", "value": "last_60s"},
-                        {"label": "Last 5 min", "value": "last_5min"},
-                        {"label": "Last N points", "value": "last_n"},
-                        {"label": "Custom range", "value": "custom"},
-                    ])),
-                    _control("Last N points", dcc.Input(id="last-n-points", type="number", value=1000, min=1, step=100, style=INPUT_STYLE)),
-                    _control("Custom x min", dcc.Input(id="custom-x-min", type="number", debounce=True, style=INPUT_STYLE)),
-                    _control("Custom x max", dcc.Input(id="custom-x-max", type="number", debounce=True, style=INPUT_STYLE)),
-                    _control("Auto follow latest", dcc.Checklist(id="auto-follow", value=["enabled"], options=[{"label": "Enabled", "value": "enabled"}], style=CHECKLIST_STYLE)),
-                    _control("Color scale", dcc.Dropdown(id="color-mode", value="auto", clearable=False, options=[
-                        {"label": "Auto", "value": "auto"},
-                        {"label": "Symmetric around zero", "value": "symmetric"},
-                        {"label": "Fixed range", "value": "fixed"},
-                    ])),
-                    _control("Fixed min", dcc.Input(id="fixed-min", type="number", debounce=True, style=INPUT_STYLE)),
-                    _control("Fixed max", dcc.Input(id="fixed-max", type="number", debounce=True, style=INPUT_STYLE)),
-                    _control("Display unit", dcc.Dropdown(id="unit-mode", value="auto", clearable=False, options=[
-                        {"label": "Auto uV/mV/V", "value": "auto"},
-                        {"label": "Source unit", "value": "source"},
-                        {"label": "uV", "value": "uV"},
-                        {"label": "mV", "value": "mV"},
-                        {"label": "V", "value": "V"},
-                    ])),
-                    _control("Refresh ms", dcc.Input(id="interval-ms", type="number", value=DEFAULT_REFRESH_INTERVAL_MS, min=100, step=100, debounce=True, style=INPUT_STYLE)),
-                ],
-                style=CONTROL_GRID_STYLE,
-            ),
-            html.Div([html.Div(id="save-status", style=MESSAGE_STYLE), html.Div(id="clear-status", style=MESSAGE_STYLE), html.Div(id="history-stats", style=MESSAGE_STYLE)], style=MESSAGE_ROW_STYLE),
-            html.Div(
-                [
-                    html.Div(dcc.Graph(id="heatmap", config={"displayModeBar": True, "responsive": True}, style={"height": "620px"}), style=PANEL_STYLE),
-                    html.Div(dcc.Graph(id="history-graph", config={"displayModeBar": True, "scrollZoom": True, "responsive": True}, style={"height": "620px"}), style=PANEL_STYLE),
-                ],
-                style=MAIN_GRID_STYLE,
-            ),
-            html.Div([html.H2("Device Status", style=SECTION_TITLE_STYLE), html.Div(id="device-status-panel")], style={**PANEL_STYLE, "marginTop": "16px"}),
-        ],
-        style=PAGE_STYLE,
-    )
+    app.layout = _build_layout()
 
-    @app.callback(Output("refresh-interval", "interval"), Input("interval-ms", "value"))
-    def update_interval(interval_ms: Any) -> int:
+    @app.callback(Output("render-interval", "interval"), Input("interval-ms", "value"))
+    def update_render_interval(interval_ms: Any) -> int:
         try:
-            return max(100, min(10_000, int(interval_ms)))
+            return max(25, min(10_000, int(interval_ms)))
         except (TypeError, ValueError):
-            return DEFAULT_REFRESH_INTERVAL_MS
+            return DEFAULT_RENDER_INTERVAL_MS
 
     @app.callback(
         Output("paused-store", "data"),
@@ -397,16 +314,13 @@ def createDashApp(
             if triggered == "reconnect-button":
                 manager.reconnect()
                 return "Reconnect requested."
-            if triggered == "start-replay-button" or input_mode == "replay":
+            if triggered == "start-replay-button":
                 manager.startReplay(
                     str(replay_file or ""),
                     float(replay_speed or 1.0),
                     int(read_size or DEFAULT_SERIAL_READ_SIZE),
                 )
                 return "Replay started."
-            if input_mode == "disconnected":
-                manager.disconnect()
-                return "Disconnected."
             manager.connectSerial(
                 str(port or ""),
                 int(baud or DEFAULT_BAUD),
@@ -439,18 +353,68 @@ def createDashApp(
         snapshot.to_csv(output_path, index=False)
         return f"Saved {len(snapshot)} rows to {output_path}"
 
-    @app.callback(Output("frame-type-dropdown", "options"), Input("refresh-interval", "n_intervals"))
+    @app.callback(
+        Output("history-window", "options"),
+        Output("history-window", "value"),
+        Output("color-mode", "options"),
+        Output("color-mode", "value"),
+        Input("advanced-details", "open"),
+        State("history-window", "value"),
+        State("color-mode", "value"),
+    )
+    def update_operator_options(advanced_open: bool, history_value: str | None, color_value: str | None) -> tuple[list[dict], str, list[dict], str]:
+        history_options = _history_window_options(include_advanced=bool(advanced_open))
+        color_options = _color_mode_options(include_fixed=bool(advanced_open))
+        valid_history = {option["value"] for option in history_options}
+        valid_color = {option["value"] for option in color_options}
+        next_history = history_value if history_value in valid_history else "last_30s"
+        next_color = color_value if color_value in valid_color else "auto"
+        return history_options, next_history, color_options, next_color
+
+    @app.callback(Output("frame-type-dropdown", "options"), Input("status-interval", "n_intervals"))
     def update_frame_type_options(_n_intervals: int) -> list[dict]:
         return _frame_type_options(dataStore.getAvailableFrameTypes())
 
     @app.callback(
+        Output("ingest-stats-store", "data"),
+        Input("ingest-interval", "n_intervals"),
+        State("ingest-stats-store", "data"),
+    )
+    def publish_ingest_revision(_n_intervals: int, previous: dict | None) -> dict:
+        available = dataStore.getAvailableFrameTypes()
+        payload = {
+            "availableFrameTypes": available,
+            "revisions": {frame_type: dataStore.getLatestRevision(frame_type) for frame_type in available},
+            "latestSeq": {frame_type: dataStore.getLatestSeq(frame_type) for frame_type in available},
+            "framesTotal": dataStore.getStats().get("framesTotal", 0),
+        }
+        if previous == payload:
+            return no_update
+        return payload
+
+    @app.callback(
+        Output("history-follow-store", "data"),
+        Input("history-graph", "relayoutData"),
+        Input("follow-latest-button", "n_clicks"),
+        Input("auto-follow", "value"),
+        State("history-follow-store", "data"),
+        prevent_initial_call=True,
+    )
+    def update_history_follow(relayout_data: dict | None, _follow_clicks: int | None, auto_follow_values: list[str] | None, current: bool) -> bool:
+        triggered = ctx.triggered_id
+        if triggered == "follow-latest-button":
+            return True
+        if triggered == "auto-follow":
+            return "enabled" in (auto_follow_values or [])
+        if triggered == "history-graph" and _relayout_has_manual_x_range(relayout_data):
+            return False
+        return bool(current)
+
+    @app.callback(
         Output("heatmap", "figure"),
-        Output("history-graph", "figure"),
-        Output("status-bar", "children"),
-        Output("connection-status-panel", "children"),
-        Output("device-status-panel", "children"),
-        Output("history-stats", "children"),
-        Input("refresh-interval", "n_intervals"),
+        Output("heatmap-render-state", "data"),
+        Input("render-interval", "n_intervals"),
+        Input("ingest-stats-store", "data"),
         Input("paused-store", "data"),
         Input("selected-cell-store", "data"),
         Input("color-mode", "value"),
@@ -458,15 +422,11 @@ def createDashApp(
         Input("fixed-max", "value"),
         Input("unit-mode", "value"),
         Input("frame-type-dropdown", "value"),
-        Input("x-axis", "value"),
-        Input("history-window", "value"),
-        Input("last-n-points", "value"),
-        Input("custom-x-min", "value"),
-        Input("custom-x-max", "value"),
-        Input("auto-follow", "value"),
+        State("heatmap-render-state", "data"),
     )
-    def refresh_view(
+    def render_heatmap(
         _n_intervals: int,
+        _ingest_stats: dict | None,
         paused: bool,
         selected_cell: str | None,
         color_mode: str,
@@ -474,28 +434,77 @@ def createDashApp(
         fixed_max: Any,
         unit_mode: str,
         frame_type: str | None,
+        previous_state: dict | None,
+    ) -> tuple[Any, Any]:
+        selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
+        selected_type = frame_type or "FAST_BINARY"
+        display_type = dataStore.resolveFrameType(selected_type)
+        latest_matrix_raw, latest_meta, revision = dataStore.getLatestMatrixAndMeta(selected_type)
+        display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
+        render_state = {
+            "revision": revision,
+            "selectedCell": selected_cell,
+            "frameType": selected_type,
+            "displayType": display_type,
+            "colorMode": color_mode,
+            "fixedMin": _safe_float(fixed_min),
+            "fixedMax": _safe_float(fixed_max),
+            "unitMode": unit_mode,
+            "displayUnit": display_unit,
+        }
+        data_trigger = ctx.triggered_id in ("render-interval", "ingest-stats-store")
+        if data_trigger and bool(paused):
+            runtime_state.recordRenderCompletion(False)
+            return no_update, no_update
+        if data_trigger and previous_state == render_state:
+            runtime_state.recordRenderCompletion(False)
+            return no_update, no_update
+
+        heatmap = _build_heatmap_figure(display_matrix, latest_meta, selected_cell, color_mode, fixed_min, fixed_max, display_unit, display_type)
+        runtime_state.recordDisplayFrame(latest_meta, bool(paused))
+        runtime_state.recordRenderCompletion(True)
+        return heatmap, render_state
+
+    @app.callback(
+        Output("history-graph", "figure"),
+        Output("history-graph", "extendData"),
+        Output("history-render-state", "data"),
+        Output("history-stats", "children"),
+        Input("render-interval", "n_intervals"),
+        Input("ingest-stats-store", "data"),
+        Input("paused-store", "data"),
+        Input("selected-cell-store", "data"),
+        Input("unit-mode", "value"),
+        Input("frame-type-dropdown", "value"),
+        Input("x-axis", "value"),
+        Input("history-window", "value"),
+        Input("last-n-points", "value"),
+        Input("custom-x-min", "value"),
+        Input("custom-x-max", "value"),
+        Input("history-follow-store", "data"),
+        Input("show-markers", "value"),
+        State("history-render-state", "data"),
+    )
+    def render_history(
+        _n_intervals: int,
+        _ingest_stats: dict | None,
+        paused: bool,
+        selected_cell: str | None,
+        unit_mode: str,
+        frame_type: str | None,
         x_axis: str,
         history_window: str,
         last_n: Any,
         custom_min: Any,
         custom_max: Any,
-        auto_follow_values: list[str] | None,
-    ) -> tuple[go.Figure, go.Figure, list, list, list, str]:
+        auto_follow: bool,
+        show_markers: list[str] | None,
+        previous_state: dict | None,
+    ) -> tuple[Any, Any, Any, Any]:
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
         selected_type = frame_type or "FAST_BINARY"
         display_type = dataStore.resolveFrameType(selected_type)
-        fallback_active = selected_type == "FAST_BINARY" and display_type != selected_type
-        latest_matrix_raw = dataStore.getLatestMatrix(selected_type)
-        latest_meta = dataStore.getLatestFrameMeta(selected_type)
-        runtime_state.recordDisplayFrame(latest_meta, bool(paused))
-        parser_stats = parser.getStats()
-        connection_status = manager.getStatus()
-        runtime_stats = runtime_state.getStats()
-        display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
-
-        heatmap = _build_heatmap_figure(display_matrix, latest_meta, selected_cell, color_mode, fixed_min, fixed_max, display_unit, display_type)
-
-        history_raw = dataStore.getCellHistory(
+        x_values, raw_values, history_meta = dataStore.getCellHistoryArrays(
             selected_type,
             selected_cell,
             xAxis=x_axis,
@@ -504,40 +513,320 @@ def createDashApp(
             customMin=_safe_float(custom_min),
             customMax=_safe_float(custom_max),
         )
-        history_rendered, downsampled = MatrixDataStore.downsampleHistoryFrame(history_raw, x_axis, DISPLAY_DOWNSAMPLE_TARGET_POINTS)
-        auto_follow = "enabled" in (auto_follow_values or [])
-        history = _build_history_figure(
-            selected_cell,
-            display_type,
-            history_raw,
-            history_rendered,
-            x_axis,
-            unit_mode,
-            auto_follow,
-            history_window,
-            _safe_int(last_n),
-            _safe_float(custom_min),
-            _safe_float(custom_max),
+        marker_enabled = "enabled" in (show_markers or [])
+        rendered_indices, downsampled = MatrixDataStore.downsampleHistoryArrays(x_values, raw_values, DISPLAY_DOWNSAMPLE_TARGET_POINTS)
+        x_rendered = x_values[rendered_indices]
+        raw_rendered = raw_values[rendered_indices]
+        rendered_units = history_meta["unit"][rendered_indices] if rendered_indices.size else np.array([], dtype=object)
+        y_rendered, unit_label, mixed_units, converted = _convert_history_arrays_for_display(raw_rendered, rendered_units, unit_mode)
+        revision = int(history_meta.get("revision") or 0)
+        last_seq = _last_finite(history_meta.get("seq"))
+        control_state = {
+            "selectedCell": selected_cell,
+            "frameType": selected_type,
+            "displayType": display_type,
+            "xAxis": history_meta.get("xColumn") or x_axis,
+            "unitMode": unit_mode,
+            "unitLabel": unit_label,
+            "historyWindow": history_window,
+            "lastN": _safe_int(last_n),
+            "customMin": _safe_float(custom_min),
+            "customMax": _safe_float(custom_max),
+            "autoFollow": bool(auto_follow),
+            "markers": marker_enabled,
+        }
+        render_state = {
+            **control_state,
+            "revision": revision,
+            "lastSeqRendered": last_seq,
+            "visibleRawPoints": int(history_meta.get("visiblePointCount") or 0),
+            "renderedPoints": int(len(x_rendered)),
+            "downsampled": bool(downsampled),
+        }
+        data_trigger = ctx.triggered_id in ("render-interval", "ingest-stats-store")
+        if data_trigger and bool(paused):
+            return no_update, no_update, no_update, no_update
+        if data_trigger and previous_state == render_state:
+            return no_update, no_update, no_update, no_update
+
+        previous_controls = {key: previous_state.get(key) for key in control_state} if isinstance(previous_state, dict) else {}
+        can_extend = (
+            data_trigger
+            and isinstance(previous_state, dict)
+            and previous_controls == control_state
+            and history_window in {"last_10s", "last_30s", "last_60s", "last_5min"}
+            and not marker_enabled
+            and previous_state.get("revision", 0) < revision
+            and previous_state.get("lastSeqRendered") is not None
+            and last_seq is not None
+            and unit_label == previous_state.get("unitLabel")
+            and not downsampled
         )
-        status = _build_status_bar(latest_meta, parser_stats, connection_status, runtime_stats, paused, _safe_qsize(inputQueue), display_unit)
-        connection_panel = _build_connection_panel(connection_status, _safe_qsize(inputQueue))
-        device_panel = _build_device_panel(latest_meta, parser_stats, dataStore.getLatestDeviceStatus(), dataStore.getRecentDeviceEvents(50))
-        fallback_text = f" | fallback: {selected_type}->{display_type}" if fallback_active else ""
-        history_stats = (
-            f"stream: {display_type} (requested {selected_type}){fallback_text} | "
-            f"cell: {selected_cell} | "
-            f"x: {x_axis} | "
-            f"window: {history_window} | "
-            f"visible raw points: {len(history_raw)} | "
-            f"rendered points: {len(history_rendered)} | "
-            f"downsampled: {'yes' if downsampled else 'no'} | "
-            f"auto follow: {'yes' if auto_follow else 'no'} | "
-            f"parsed binary fps: {runtime_stats.get('parsedBinaryFps', 0.0):.1f} | "
-            f"gui displayed fps: {runtime_stats.get('guiDisplayedFps', 0.0):.1f}"
+        if can_extend:
+            seq_values = history_meta.get("seq")
+            new_mask = np.isfinite(seq_values) & (seq_values > float(previous_state["lastSeqRendered"]))
+            if np.any(new_mask):
+                new_x = x_values[new_mask]
+                new_raw = raw_values[new_mask]
+                new_units = history_meta["unit"][new_mask]
+                new_y, new_unit_label, _mixed, _converted = _convert_history_arrays_for_display(new_raw, new_units, unit_mode)
+                if new_unit_label == unit_label:
+                    extend_data = (
+                        {"x": [new_x.tolist()], "y": [new_y.tolist()], "customdata": [_history_customdata(history_meta, new_mask)]},
+                        [0],
+                        _history_max_points(history_window, runtime_state.getStats(), display_type),
+                    )
+                    history_stats = _history_stats_text(display_type, selected_type, selected_cell, history_meta, len(x_values), len(x_values), False, bool(auto_follow), runtime_state.getStats())
+                    return no_update, extend_data, render_state, history_stats
+
+        history = _build_history_arrays_figure(
+            cell_name=selected_cell,
+            frame_type=display_type,
+            x_values=x_rendered,
+            y_values=y_rendered,
+            raw_values=raw_rendered,
+            unit_values=rendered_units,
+            seq_values=history_meta["seq"][rendered_indices] if rendered_indices.size else np.array([], dtype=float),
+            timestamp_values=history_meta["timestampUs"][rendered_indices] if rendered_indices.size else np.array([], dtype=float),
+            x_column=history_meta.get("xColumn") or x_axis,
+            unit_label=unit_label,
+            mixed_units=mixed_units,
+            converted=converted,
+            auto_follow=bool(auto_follow),
+            window_mode=history_window,
+            last_n=_safe_int(last_n),
+            custom_min=_safe_float(custom_min),
+            custom_max=_safe_float(custom_max),
+            show_markers=marker_enabled,
+            raw_x_values=x_values,
         )
-        return heatmap, history, status, connection_panel, device_panel, history_stats
+        history_stats = _history_stats_text(display_type, selected_type, selected_cell, history_meta, len(x_values), len(x_rendered), downsampled, bool(auto_follow), runtime_state.getStats())
+        return history, no_update, render_state, history_stats
+
+    @app.callback(
+        Output("status-bar", "children"),
+        Output("warning-state-store", "data"),
+        Input("status-interval", "n_intervals"),
+        Input("paused-store", "data"),
+        Input("selected-cell-store", "data"),
+        Input("unit-mode", "value"),
+        Input("frame-type-dropdown", "value"),
+        State("warning-state-store", "data"),
+    )
+    def update_compact_status(
+        _n_intervals: int,
+        paused: bool,
+        selected_cell: str | None,
+        unit_mode: str,
+        frame_type: str | None,
+        previous_warning_state: dict | None,
+    ) -> tuple[list, dict]:
+        selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
+        selected_type = frame_type or "FAST_BINARY"
+        display_type = dataStore.resolveFrameType(selected_type)
+        latest_matrix_raw, latest_meta, _revision = dataStore.getLatestMatrixAndMeta(selected_type)
+        display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
+        parser_stats = parser.getStats()
+        connection_status = manager.getStatus()
+        runtime_stats = runtime_state.getStats()
+        warning_badge, next_warning_state = _warning_badge(parser_stats, connection_status, runtime_stats, latest_meta, previous_warning_state or {})
+        status = _build_compact_status_bar(
+            meta=latest_meta,
+            matrix=display_matrix,
+            selected_cell=selected_cell,
+            parser_stats=parser_stats,
+            connection_status=connection_status,
+            runtime_stats=runtime_stats,
+            paused=bool(paused),
+            display_unit=display_unit,
+            display_type=display_type,
+            warning_badge=warning_badge,
+        )
+        return status, next_warning_state
+
+    @app.callback(
+        Output("diagnostics-panel", "children"),
+        Output("connection-status-panel", "children"),
+        Output("device-status-panel", "children"),
+        Input("diagnostics-interval", "n_intervals"),
+        Input("advanced-details", "open"),
+        State("frame-type-dropdown", "value"),
+    )
+    def update_diagnostics(_n_intervals: int, advanced_open: bool, frame_type: str | None) -> tuple[Any, Any, Any]:
+        if not advanced_open:
+            return no_update, no_update, no_update
+        selected_type = frame_type or "FAST_BINARY"
+        latest_meta = dataStore.getLatestFrameMeta(selected_type)
+        parser_stats = parser.getStats()
+        connection_status = manager.getStatus()
+        runtime_stats = runtime_state.getStats()
+        queue_depth = _safe_qsize(inputQueue)
+        return (
+            _build_parser_diagnostics(parser_stats, runtime_stats, queue_depth),
+            _build_connection_panel(connection_status, queue_depth),
+            _build_device_panel(latest_meta, parser_stats, dataStore.getLatestDeviceStatus(), dataStore.getRecentDeviceEvents(50)),
+        )
 
     return app
+
+
+def _build_layout() -> html.Div:
+    return html.Div(
+        [
+            dcc.Store(id="selected-cell-store", data=DEFAULT_SELECTED_CELL),
+            dcc.Store(id="paused-store", data=False),
+            dcc.Store(id="ingest-stats-store", data={}),
+            dcc.Store(id="heatmap-render-state", data={}),
+            dcc.Store(id="history-render-state", data={}),
+            dcc.Store(id="history-follow-store", data=True),
+            dcc.Store(id="warning-state-store", data={}),
+            dcc.Interval(id="ingest-interval", interval=DEFAULT_INGEST_INTERVAL_MS, n_intervals=0),
+            dcc.Interval(id="render-interval", interval=DEFAULT_RENDER_INTERVAL_MS, n_intervals=0),
+            dcc.Interval(id="status-interval", interval=DEFAULT_STATUS_INTERVAL_MS, n_intervals=0),
+            dcc.Interval(id="diagnostics-interval", interval=DEFAULT_DIAGNOSTICS_INTERVAL_MS, n_intervals=0),
+            html.Header(
+                [
+                    html.H1("SensorArray Matrix Viewer", className="app-title"),
+                    html.Div(id="status-bar", className="top-status"),
+                ],
+                className="top-bar",
+            ),
+            html.Section(
+                [
+                    html.Div(
+                        [
+                            _control("COM Port", dcc.Dropdown(id="com-port-dropdown", options=[], placeholder="Refresh ports")),
+                            html.Button("Refresh Ports", id="refresh-ports-button", n_clicks=0, className="button secondary"),
+                            html.Button("Connect", id="connect-button", n_clicks=0, className="button primary"),
+                            html.Button("Disconnect", id="disconnect-button", n_clicks=0, className="button secondary"),
+                            html.Button("Reconnect", id="reconnect-button", n_clicks=0, className="button quiet"),
+                            html.Button("Pause", id="pause-button", n_clicks=0, className="button secondary"),
+                            html.Button("Clear", id="clear-button", n_clicks=0, className="button secondary"),
+                            html.Button("Save Snapshot CSV", id="save-button", n_clicks=0, className="button secondary"),
+                        ],
+                        className="toolbar connection-toolbar",
+                    ),
+                    html.Div(
+                        [
+                            _control("Data stream", dcc.Dropdown(id="frame-type-dropdown", value="FAST_BINARY", clearable=False, options=_frame_type_options(DEFAULT_FRAME_TYPES))),
+                            _control("Cell", dcc.Dropdown(id="cell-dropdown", value=DEFAULT_SELECTED_CELL, clearable=False, options=[{"label": cell, "value": cell} for cell in CELL_NAMES])),
+                            _control("History window", dcc.Dropdown(id="history-window", value="last_30s", clearable=False, options=_history_window_options(False))),
+                            _control("Display unit", dcc.Dropdown(id="unit-mode", value="auto", clearable=False, options=[
+                                {"label": "Auto", "value": "auto"},
+                                {"label": "uV", "value": "uV"},
+                                {"label": "mV", "value": "mV"},
+                                {"label": "V", "value": "V"},
+                            ])),
+                            _control("Color scale", dcc.Dropdown(id="color-mode", value="auto", clearable=False, options=_color_mode_options(False))),
+                            html.Button("Follow Latest", id="follow-latest-button", n_clicks=0, className="button secondary"),
+                        ],
+                        className="toolbar display-toolbar",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(id="port-refresh-status", className="message"),
+                            html.Div(id="connection-action-status", className="message"),
+                            html.Div(id="save-status", className="message"),
+                            html.Div(id="clear-status", className="message"),
+                            html.Div(id="history-stats", className="message"),
+                        ],
+                        className="message-row",
+                    ),
+                ],
+                className="operator-panel",
+            ),
+            html.Main(
+                [
+                    html.Section(
+                        dcc.Graph(
+                            id="heatmap",
+                            config={"displayModeBar": False, "responsive": True, "doubleClick": "reset"},
+                            className="graph graph-matrix",
+                        ),
+                        className="panel matrix-panel",
+                    ),
+                    html.Section(
+                        dcc.Graph(
+                            id="history-graph",
+                            config={
+                                "displayModeBar": True,
+                                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                                "scrollZoom": True,
+                                "responsive": True,
+                                "doubleClick": "reset",
+                            },
+                            className="graph graph-history",
+                        ),
+                        className="panel history-panel",
+                    ),
+                ],
+                className="main-grid",
+            ),
+            html.Details(
+                [
+                    html.Summary("Advanced / Diagnostics", className="advanced-summary"),
+                    html.Div(
+                        [
+                            html.Section(
+                                [
+                                    html.H2("Connection", className="section-title"),
+                                    html.Div(
+                                        [
+                                            _control("Input Mode", dcc.Dropdown(id="input-mode", value="serial", clearable=False, options=[
+                                                {"label": "Serial", "value": "serial"},
+                                                {"label": "Replay File", "value": "replay"},
+                                                {"label": "Disconnected", "value": "disconnected"},
+                                            ])),
+                                            _control("Baudrate", dcc.Input(id="baud-input", type="number", value=DEFAULT_BAUD, min=1, step=1, className="input")),
+                                            _control("Read size", dcc.Input(id="read-size-input", type="number", value=DEFAULT_SERIAL_READ_SIZE, min=4096, step=1024, className="input")),
+                                            _control("Auto reconnect", dcc.Checklist(id="auto-reconnect", value=[], options=[{"label": "Enabled", "value": "enabled"}], className="checklist")),
+                                            _control("Replay file", dcc.Input(id="replay-file-input", type="text", debounce=True, className="input")),
+                                            _control("Replay speed", dcc.Input(id="replay-speed-input", type="number", value=1.0, min=0.01, step=0.5, className="input")),
+                                            html.Button("Start Replay", id="start-replay-button", n_clicks=0, className="button secondary"),
+                                        ],
+                                        className="advanced-grid",
+                                    ),
+                                ],
+                                className="advanced-section",
+                            ),
+                            html.Section(
+                                [
+                                    html.H2("Display", className="section-title"),
+                                    html.Div(
+                                        [
+                                            _control("X axis", dcc.Dropdown(id="x-axis", value="timeSeconds", clearable=False, options=[
+                                                {"label": "timeSeconds", "value": "timeSeconds"},
+                                                {"label": "timestampUs", "value": "timestampUs"},
+                                                {"label": "seq", "value": "seq"},
+                                            ])),
+                                            _control("Last N points", dcc.Input(id="last-n-points", type="number", value=1000, min=1, step=100, className="input")),
+                                            _control("Custom x min", dcc.Input(id="custom-x-min", type="number", debounce=True, className="input")),
+                                            _control("Custom x max", dcc.Input(id="custom-x-max", type="number", debounce=True, className="input")),
+                                            _control("Fixed min", dcc.Input(id="fixed-min", type="number", debounce=True, className="input")),
+                                            _control("Fixed max", dcc.Input(id="fixed-max", type="number", debounce=True, className="input")),
+                                            _control("Refresh ms", dcc.Input(id="interval-ms", type="number", value=DEFAULT_RENDER_INTERVAL_MS, min=25, step=25, debounce=True, className="input")),
+                                            _control("Auto follow latest", dcc.Checklist(id="auto-follow", value=["enabled"], options=[{"label": "Enabled", "value": "enabled"}], className="checklist")),
+                                            _control("History markers", dcc.Checklist(id="show-markers", value=[], options=[{"label": "Show markers", "value": "enabled"}], className="checklist")),
+                                        ],
+                                        className="advanced-grid",
+                                    ),
+                                ],
+                                className="advanced-section",
+                            ),
+                            html.Section([html.H2("Parser Stats", className="section-title"), html.Div(id="diagnostics-panel")], className="advanced-section"),
+                            html.Section([html.H2("Connection Internals", className="section-title"), html.Div(id="connection-status-panel")], className="advanced-section"),
+                            html.Section([html.H2("Device Status", className="section-title"), html.Div(id="device-status-panel")], className="advanced-section"),
+                        ],
+                        className="advanced-content",
+                    ),
+                ],
+                id="advanced-details",
+                open=False,
+                className="advanced-panel",
+            ),
+        ],
+        className="page",
+    )
 
 
 def _drain_queue(
@@ -626,11 +915,10 @@ def _build_heatmap_figure(
                 texttemplate="%{text}",
                 hovertemplate=(
                     "cell=%{customdata[0]}<br>"
-                    "state=%{customdata[1]}<br>"
-                    "value=%{z:,.6g}<br>"
+                    "value=%{z:,.3g}<br>"
                     f"unit={unit or '-'}<br>"
                     f"seq={_dash_if_none(meta.get('seq'))}<br>"
-                    f"statusFlags={_format_hex(meta.get('statusFlags'), 8)}<extra></extra>"
+                    f"status={_format_hex(meta.get('lastStatusCode'), 4)}<extra></extra>"
                 ),
                 colorscale="RdYlBu_r",
                 colorbar={"title": unit or "value"},
@@ -654,7 +942,7 @@ def _build_heatmap_figure(
             )
         )
 
-    fig.update_layout(**_base_figure_layout("8x8 Matrix"), clickmode="event+select")
+    fig.update_layout(**_base_figure_layout("8x8 Matrix"), clickmode="event+select", uirevision=f"heatmap:{requested_frame_type}")
     fig.update_xaxes(side="top", constrain="domain")
     fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1)
     return fig
@@ -704,7 +992,7 @@ def _build_history_figure(
         go.Scattergl(
             x=history_rendered[x_column],
             y=display_values,
-            mode="lines+markers",
+            mode="lines",
             name=f"{cell_name} / {frame_type}",
             line={"color": "#0f766e", "width": 2},
             marker={"size": 4},
@@ -738,6 +1026,98 @@ def _build_history_figure(
     return fig
 
 
+def _build_history_arrays_figure(
+    cell_name: str,
+    frame_type: str,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    raw_values: np.ndarray,
+    unit_values: np.ndarray,
+    seq_values: np.ndarray,
+    timestamp_values: np.ndarray,
+    x_column: str,
+    unit_label: str,
+    mixed_units: bool,
+    converted: bool,
+    auto_follow: bool,
+    window_mode: str,
+    last_n: int | None,
+    custom_min: float | None,
+    custom_max: float | None,
+    show_markers: bool,
+    raw_x_values: np.ndarray | None = None,
+) -> go.Figure:
+    if len(x_values) == 0:
+        return _empty_figure(
+            f"No visible points for selected window. stream={frame_type}, cell={cell_name}, window={window_mode}",
+            f"History of {cell_name} / {frame_type}",
+        )
+
+    mode = "lines+markers" if show_markers else "lines"
+    fig = go.Figure()
+    custom_data = np.column_stack([seq_values, timestamp_values, unit_values, raw_values]).tolist()
+    value_hover = (
+        f"value=%{{y:,.6g}} {unit_label}<br>source=%{{customdata[3]:,.6g}} %{{customdata[2]}}<br>"
+        if converted
+        else "value=%{y:,.6g}<br>unit=%{customdata[2]}<br>"
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=x_values,
+            y=y_values,
+            mode=mode,
+            name=f"{cell_name} / {frame_type}",
+            line={"color": "#0f766e", "width": 2},
+            marker={"size": 4},
+            customdata=custom_data,
+            hovertemplate=(
+                f"cell={cell_name}<br>"
+                f"stream={frame_type}<br>"
+                f"{x_column}=%{{x}}<br>"
+                f"{value_hover}"
+                "seq=%{customdata[0]}<br>"
+                "timestamp_us=%{customdata[1]}<extra></extra>"
+            ),
+        )
+    )
+    revision = _history_view_revision(
+        frame_type=frame_type,
+        cell_name=cell_name,
+        x_axis=x_column,
+        unit_mode=unit_label,
+        unit_label=unit_label,
+        auto_follow=auto_follow,
+        window_mode=window_mode,
+        last_n=last_n,
+        custom_min=custom_min,
+        custom_max=custom_max,
+    )
+    title = f"History of {cell_name} / {frame_type}" + (" (Mixed units)" if mixed_units else "")
+    fig.update_layout(
+        **_base_figure_layout(title),
+        xaxis_title=x_column,
+        yaxis_title=f"value ({unit_label})" if unit_label != "value" else "value",
+        uirevision=revision["layout"],
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb", uirevision=revision["x"])
+    fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb", autorange=True, uirevision=revision["y"])
+
+    if auto_follow:
+        range_value = _resolve_follow_range_arrays(
+            raw_x_values if raw_x_values is not None else x_values,
+            x_column,
+            window_mode,
+            last_n,
+            custom_min,
+            custom_max,
+        )
+        if range_value is None:
+            fig.update_xaxes(autorange=True)
+        else:
+            fig.update_xaxes(range=range_value)
+    return fig
+
+
 def _history_view_revision(
     frame_type: str,
     cell_name: str,
@@ -750,7 +1130,6 @@ def _history_view_revision(
     custom_min: float | None,
     custom_max: float | None,
 ) -> dict[str, str]:
-    interaction_mode = "follow" if auto_follow else "manual"
     x_window_key = window_mode or "all"
     if window_mode == "last_n":
         x_window_key = f"last_n:{last_n or 1000}"
@@ -758,8 +1137,8 @@ def _history_view_revision(
         x_window_key = f"custom:{custom_min}:{custom_max}"
 
     return {
-        "layout": f"history:{interaction_mode}",
-        "x": f"history:x:{frame_type}:{x_axis}:{x_window_key}:{interaction_mode}",
+        "layout": "history",
+        "x": f"history:x:{frame_type}:{x_axis}:{x_window_key}",
         "y": f"history:y:{frame_type}:{cell_name}:{unit_mode}:{unit_label}",
     }
 
@@ -784,6 +1163,197 @@ def _resolve_follow_range(history, x_column: str, window_mode: str, last_n: int 
         latest = float(history[x_column].iloc[-1])
         return [latest - seconds, latest]
     return [float(history[x_column].iloc[0]), float(history[x_column].iloc[-1])]
+
+
+def _resolve_follow_range_arrays(x_values: np.ndarray, x_column: str, window_mode: str, last_n: int | None, custom_min: float | None, custom_max: float | None) -> list[float] | None:
+    finite_x = x_values[np.isfinite(x_values)]
+    if not finite_x.size:
+        return None
+    if window_mode == "all":
+        return None
+    if window_mode == "custom":
+        if custom_min is not None and custom_max is not None and custom_min < custom_max:
+            return [float(custom_min), float(custom_max)]
+        return None
+    if window_mode == "last_n":
+        count = max(1, int(last_n or 1000))
+        subset = finite_x[-count:]
+        return [float(subset[0]), float(subset[-1])] if subset.size else None
+
+    seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(window_mode)
+    if seconds is None:
+        return None
+    if x_column == "timeSeconds":
+        latest = float(finite_x[-1])
+        return [latest - seconds, latest]
+    return [float(finite_x[0]), float(finite_x[-1])]
+
+
+def _convert_history_arrays_for_display(values: np.ndarray, units: np.ndarray, unit_mode: str) -> tuple[np.ndarray, str, bool, bool]:
+    raw_values = np.asarray(values, dtype=float)
+    unit_list = [str(unit) for unit in np.unique(units.astype(str)) if str(unit) != ""]
+    unit_keys = [_normalize_unit(unit) for unit in unit_list]
+    all_voltage = bool(unit_keys) and all(unit_key in VOLTAGE_FACTORS_TO_UV for unit_key in unit_keys)
+    if not all_voltage:
+        mixed_units = len(unit_list) > 1
+        return raw_values, "mixed units" if mixed_units else (unit_list[0] if unit_list else "value"), mixed_units, False
+    if unit_mode == "source" and len(set(unit_keys)) > 1:
+        return raw_values, "mixed units", True, False
+    source_unit_keys = np.array([_normalize_unit(unit) for unit in units], dtype=object)
+    values_uv = np.array([value * VOLTAGE_FACTORS_TO_UV.get(unit_key, np.nan) for value, unit_key in zip(raw_values, source_unit_keys)], dtype=float)
+    source_key = unit_keys[0]
+    target_key = _resolve_target_voltage_unit(values_uv, unit_mode, source_key)
+    return values_uv / VOLTAGE_FACTORS_TO_UV[target_key], CANONICAL_VOLTAGE_UNITS[target_key], False, True
+
+
+def _history_customdata(history_meta: dict, mask: np.ndarray) -> list:
+    return np.column_stack(
+        [
+            history_meta["seq"][mask],
+            history_meta["timestampUs"][mask],
+            history_meta["unit"][mask],
+            history_meta["rawValue"][mask],
+        ]
+    ).tolist()
+
+
+def _history_max_points(window_mode: str, runtime_stats: dict, frame_type: str) -> int:
+    seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(window_mode, 30.0)
+    if frame_type == "FAST_BINARY":
+        fps = float(runtime_stats.get("parsedBinaryFps") or 20.0)
+    else:
+        fps = max(float(runtime_stats.get("parsedTextFps") or 0.0), 20.0)
+    return min(2000, max(200, int(seconds * fps * 1.5)))
+
+
+def _history_stats_text(
+    display_type: str,
+    requested_type: str,
+    selected_cell: str,
+    history_meta: dict,
+    visible_points: int,
+    rendered_points: int,
+    downsampled: bool,
+    auto_follow: bool,
+    runtime_stats: dict,
+) -> str:
+    fallback_text = f" | fallback: {requested_type}->{display_type}" if requested_type == "FAST_BINARY" and display_type != requested_type else ""
+    return (
+        f"stream: {display_type} (requested {requested_type}){fallback_text} | "
+        f"cell: {selected_cell} | "
+        f"x: {history_meta.get('xColumn') or 'timeSeconds'} | "
+        f"visible points: {visible_points} | "
+        f"rendered points: {rendered_points} | "
+        f"downsampled: {'yes' if downsampled else 'no'} | "
+        f"follow latest: {'yes' if auto_follow else 'no'} | "
+        f"input fps: {runtime_stats.get('parsedBinaryFps', 0.0):.1f} | "
+        f"gui fps: {runtime_stats.get('renderedFrameFps', 0.0):.1f}"
+    )
+
+
+def _last_finite(values: Any) -> float | None:
+    if values is None:
+        return None
+    array = np.asarray(values, dtype=float)
+    finite = array[np.isfinite(array)]
+    return float(finite[-1]) if finite.size else None
+
+
+def _relayout_has_manual_x_range(relayout_data: dict | None) -> bool:
+    if not relayout_data:
+        return False
+    keys = set(relayout_data)
+    return bool({"xaxis.range[0]", "xaxis.range[1]", "xaxis.range"} & keys)
+
+
+def _build_compact_status_bar(
+    meta: dict,
+    matrix: np.ndarray,
+    selected_cell: str,
+    parser_stats: dict,
+    connection_status: dict,
+    runtime_stats: dict,
+    paused: bool,
+    display_unit: str,
+    display_type: str,
+    warning_badge: html.Div,
+) -> list:
+    port = connection_status.get("serialPort") or connection_status.get("port") or "-"
+    selected_value = _selected_cell_value(matrix, selected_cell, display_unit)
+    status_code = f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}"
+    if status_code.startswith("-"):
+        status_code = "OK"
+    return [
+        _status_chip("connection", f"{_connection_label(connection_status, paused)} {port}".strip(), "ok" if connection_status.get("serialConnected") or connection_status.get("mode") == "replay" else ""),
+        _status_chip("stream", display_type or "-"),
+        _status_chip("selected", f"{selected_cell} {selected_value}".strip()),
+        _status_chip("seq", _dash_if_none(meta.get("seq"))),
+        _status_chip("input fps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
+        _status_chip("gui fps", f"{runtime_stats.get('renderedFrameFps', 0.0):.1f}"),
+        _status_chip("status", status_code, "warn" if bool(meta.get("lastStatusCode")) else "ok"),
+        warning_badge,
+    ]
+
+
+def _warning_badge(parser_stats: dict, connection_status: dict, runtime_stats: dict, meta: dict, previous: dict) -> tuple[html.Div, dict]:
+    current = {
+        "crc": int(parser_stats.get("binaryCrcErrors") or 0),
+        "resync": int(parser_stats.get("binaryMagicResyncs") or 0),
+        "parse": int(parser_stats.get("parseErrors") or 0),
+        "seq_gap": int(runtime_stats.get("seqGap") or 0),
+        "device_drop": int(meta.get("droppedFrames") or 0),
+        "host_drop": int(connection_status.get("droppedInputChunks") or 0),
+    }
+    deltas = {key: max(0, current[key] - int(previous.get(key, current[key]) or 0)) for key in current}
+    labels = []
+    if deltas["crc"]:
+        labels.append(f"CRC +{deltas['crc']}")
+    if deltas["resync"]:
+        labels.append(f"RESYNC +{deltas['resync']}")
+    if deltas["parse"]:
+        labels.append(f"PARSE +{deltas['parse']}")
+    drop_delta = deltas["seq_gap"] + deltas["device_drop"] + deltas["host_drop"]
+    if drop_delta:
+        labels.append(f"DROP +{drop_delta}")
+    if labels:
+        return _status_chip("warning", " / ".join(labels), "error" if deltas["crc"] or deltas["parse"] else "warn"), current
+    has_existing_warning = any(current.values())
+    return _status_chip("warning", "OK", "warn" if has_existing_warning else "ok"), current
+
+
+def _selected_cell_value(matrix: np.ndarray, selected_cell: str, display_unit: str) -> str:
+    source, detector = _split_cell_name(selected_cell)
+    if source is None or detector is None:
+        return ""
+    try:
+        value = float(matrix[source - 1, detector - 1])
+    except Exception:
+        return ""
+    return _format_value(value, display_unit) if np.isfinite(value) else "invalid"
+
+
+def _status_chip(label: str, value: Any, tone: str = "") -> html.Div:
+    class_name = "status-chip"
+    if tone:
+        class_name = f"{class_name} {tone}"
+    return html.Div([html.Span(label, className="status-label"), html.Strong(str(value), className="status-value")], className=class_name)
+
+
+def _build_parser_diagnostics(parser_stats: dict, runtime_stats: dict, queue_depth: int | str) -> list:
+    items = [
+        ("parsed_total", parser_stats.get("parsedFramesTotal", 0)),
+        ("parsed_binary", parser_stats.get("parsedBinaryFrames", 0)),
+        ("parsed_text", parser_stats.get("parsedTextFrames", 0)),
+        ("crc_errors", parser_stats.get("binaryCrcErrors", 0)),
+        ("resyncs", parser_stats.get("binaryMagicResyncs", 0)),
+        ("parse_errors", parser_stats.get("parseErrors", 0)),
+        ("bytes/sec", f"{runtime_stats.get('bytesPerSec', 0.0):.0f}"),
+        ("queue_depth", queue_depth),
+        ("render_tick_fps", f"{runtime_stats.get('renderTickFps', 0.0):.1f}"),
+        ("rendered_frame_fps", f"{runtime_stats.get('renderedFrameFps', 0.0):.1f}"),
+        ("last_error", _first_non_empty(runtime_stats.get("lastCsvError", ""), parser_stats.get("lastError", ""), "-")),
+    ]
+    return [_status_item(label, value, warning=label in {"crc_errors", "resyncs", "parse_errors"} and bool(value)) for label, value in items]
 
 
 def _build_status_bar(meta: dict, parser_stats: dict, connection_status: dict, runtime_stats: dict, paused: bool, queue_depth: int | str, display_unit: str) -> list:
@@ -1021,11 +1591,39 @@ def _base_figure_layout(title: str) -> dict:
 
 
 def _control(label: str, child: Any) -> html.Div:
-    return html.Div([html.Label(label, style=LABEL_STYLE), child], style=CONTROL_ITEM_STYLE)
+    return html.Div([html.Label(label, className="control-label"), child], className="compact-control")
 
 
 def _frame_type_options(frame_types: list[str]) -> list[dict]:
     return [{"label": frame_type, "value": frame_type} for frame_type in list(dict.fromkeys([*DEFAULT_FRAME_TYPES, *frame_types]))]
+
+
+def _history_window_options(include_advanced: bool = False) -> list[dict]:
+    options = [
+        {"label": "10 s", "value": "last_10s"},
+        {"label": "30 s", "value": "last_30s"},
+        {"label": "60 s", "value": "last_60s"},
+        {"label": "5 min", "value": "last_5min"},
+    ]
+    if include_advanced:
+        options.extend(
+            [
+                {"label": "Last N points", "value": "last_n"},
+                {"label": "Custom range", "value": "custom"},
+                {"label": "All", "value": "all"},
+            ]
+        )
+    return options
+
+
+def _color_mode_options(include_fixed: bool = False) -> list[dict]:
+    options = [
+        {"label": "Auto", "value": "auto"},
+        {"label": "Symmetric", "value": "symmetric"},
+    ]
+    if include_fixed:
+        options.append({"label": "Fixed", "value": "fixed"})
+    return options
 
 
 def _cell_name_from_click_data(click_data: dict | None) -> str | None:

@@ -101,3 +101,40 @@ def test_dropped_frames_increase_generates_device_event():
     events = store.getRecentDeviceEvents()
 
     assert any(event["eventType"] == "DROPPED_FRAMES_INCREASED" for event in events)
+
+
+def test_data_store_revision_increments_on_add_frame():
+    store = MatrixDataStore(maxPointsPerCell=10)
+
+    assert store.getLatestRevision("FAST_BINARY") == 0
+    store.addFrame(make_frame("FAST_BINARY", 1, 1_000_000))
+    store.addFrame(make_frame("FAST_BINARY", 2, 2_000_000))
+
+    assert store.getLatestRevision("FAST_BINARY") == 2
+    assert store.getLatestSeq("FAST_BINARY") == 2
+
+
+def test_cell_history_arrays_returns_selected_cell():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    store.addFrame(make_frame("FAST_BINARY", 10, 10_000_000))
+    store.addFrame(make_frame("FAST_BINARY", 11, 11_000_000))
+
+    x_values, values, meta = store.getCellHistoryArrays("FAST_BINARY", "S1D2", "seq", "last_n", 2, None, None)
+
+    assert x_values.tolist() == [10.0, 11.0]
+    assert values.tolist() == [11.0, 12.0]
+    assert meta["cellName"] == "S1D2"
+    assert meta["xColumn"] == "seq"
+    assert meta["revision"] == 2
+
+
+def test_clear_history_resets_revision_or_updates_revision_safely():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    store.addFrame(make_frame("FAST_BINARY", 1, 1_000_000))
+    before_clear = store.getLatestRevision("FAST_BINARY")
+
+    store.clear()
+
+    assert store.getLatestRevision("FAST_BINARY") > before_clear
+    assert store.getLatestSeq("FAST_BINARY") is None
+    assert store.getCellHistory("FAST_BINARY", "S1D1").empty

@@ -27,6 +27,8 @@ class MatrixDataStore:
         self._cellHistory: dict[str, dict[str, deque]] = {}
         self._latestMatrixByType: dict[str, np.ndarray] = {}
         self._latestMetaByType: dict[str, dict] = {}
+        self._latestRevisionByType: dict[str, int] = defaultdict(int)
+        self._latestSeqByType: dict[str, int | None] = {}
         self._wideRowsByType: dict[str, deque] = {}
         self._receivedByType: dict[str, int] = defaultdict(int)
         self._deviceStatus: DeviceStatus | None = None
@@ -73,6 +75,8 @@ class MatrixDataStore:
             self._receivedByType[frame_type] += 1
             self._stats["framesTotal"] += 1
             self._latestMetaByType[frame_type] = self._meta_from_frame(frame, time_seconds, frame_type)
+            self._latestSeqByType[frame_type] = int(frame.seq) if frame.seq is not None else None
+            self._latestRevisionByType[frame_type] += 1
             self._record_frame_events(frame)
 
     def addDeviceStatus(self, status: DeviceStatus) -> None:
@@ -98,6 +102,28 @@ class MatrixDataStore:
             if resolved and resolved in self._latestMetaByType:
                 return dict(self._latestMetaByType[resolved])
         return self._empty_meta(frameType)
+
+    def getLatestRevision(self, frameType: str = DEFAULT_FRAME_TYPE) -> int:
+        with self._lock:
+            resolved = self._resolve_frame_type(frameType)
+            return int(self._latestRevisionByType.get(resolved or frameType, 0))
+
+    def getLatestSeq(self, frameType: str = DEFAULT_FRAME_TYPE) -> int | None:
+        with self._lock:
+            resolved = self._resolve_frame_type(frameType)
+            return self._latestSeqByType.get(resolved or frameType)
+
+    def getLatestMatrixAndMeta(self, frameType: str = DEFAULT_FRAME_TYPE) -> tuple[np.ndarray, dict, int]:
+        with self._lock:
+            resolved = self._resolve_frame_type(frameType)
+            key = resolved or frameType
+            if resolved and resolved in self._latestMatrixByType:
+                matrix = self._latestMatrixByType[resolved].copy()
+                meta = dict(self._latestMetaByType.get(resolved, self._empty_meta(resolved)))
+                revision = int(self._latestRevisionByType.get(resolved, 0))
+                return matrix, meta, revision
+            revision = int(self._latestRevisionByType.get(key, 0))
+        return np.full((MATRIX_SIZE, MATRIX_SIZE), np.nan, dtype=float), self._empty_meta(frameType), revision
 
     def resolveFrameType(self, frameType: str | None = DEFAULT_FRAME_TYPE) -> str:
         with self._lock:
@@ -127,6 +153,75 @@ class MatrixDataStore:
         history = pd.DataFrame(rows, columns=HISTORY_COLUMNS)
         return self._filter_history(history, xAxis, windowMode, lastN, customMin, customMax)
 
+    def getCellHistoryArrays(
+        self,
+        frameType: str,
+        cellName: str,
+        xAxis: str = "timeSeconds",
+        windowMode: str = "all",
+        lastN: int | None = None,
+        customMin: float | None = None,
+        customMax: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
+        with self._lock:
+            resolved = self._resolve_frame_type(frameType)
+            key = resolved or frameType
+            rows = list(self._cellHistory.get(key, {}).get(cellName, []))
+            revision = int(self._latestRevisionByType.get(key, 0))
+
+        x_column = xAxis if xAxis in ("seq", "timestampUs", "timeSeconds") else "timeSeconds"
+        empty_meta = {
+            "frameType": key,
+            "cellName": cellName,
+            "xColumn": x_column,
+            "revision": revision,
+            "rawPointCount": 0,
+            "visiblePointCount": 0,
+            "seq": np.array([], dtype=float),
+            "timestampUs": np.array([], dtype=float),
+            "timeSeconds": np.array([], dtype=float),
+            "unit": np.array([], dtype=object),
+            "rawValue": np.array([], dtype=float),
+        }
+        if not rows:
+            return np.array([], dtype=float), np.array([], dtype=float), empty_meta
+
+        seq_values = np.array([np.nan if row.get("seq") is None else float(row.get("seq")) for row in rows], dtype=float)
+        timestamp_values = np.array([np.nan if row.get("timestampUs") is None else float(row.get("timestampUs")) for row in rows], dtype=float)
+        time_values = np.array([np.nan if row.get("timeSeconds") is None else float(row.get("timeSeconds")) for row in rows], dtype=float)
+        value_values = np.array([float(row.get("value", math.nan)) for row in rows], dtype=float)
+        unit_values = np.array([row.get("unit") or "" for row in rows], dtype=object)
+
+        x_values_by_column = {
+            "seq": seq_values,
+            "timestampUs": timestamp_values,
+            "timeSeconds": time_values,
+        }
+        x_values = x_values_by_column.get(x_column, time_values)
+        indices = self._history_window_indices(
+            x_values=x_values,
+            time_values=time_values,
+            window_mode=windowMode,
+            last_n=lastN,
+            custom_min=customMin,
+            custom_max=customMax,
+        )
+
+        meta = {
+            "frameType": key,
+            "cellName": cellName,
+            "xColumn": x_column,
+            "revision": revision,
+            "rawPointCount": len(rows),
+            "visiblePointCount": int(indices.size),
+            "seq": seq_values[indices],
+            "timestampUs": timestamp_values[indices],
+            "timeSeconds": time_values[indices],
+            "unit": unit_values[indices],
+            "rawValue": value_values[indices],
+        }
+        return x_values[indices], value_values[indices], meta
+
     def getAvailableFrameTypes(self) -> list[str]:
         with self._lock:
             dynamic = sorted(frame_type for frame_type, count in self._receivedByType.items() if count > 0)
@@ -147,18 +242,27 @@ class MatrixDataStore:
     def clear(self, frameType: str | None = None) -> None:
         with self._lock:
             if frameType is None:
+                known_frame_types = set(self._latestRevisionByType)
+                known_frame_types.update(self._cellHistory)
+                known_frame_types.update(self._latestMatrixByType)
+                known_frame_types.update(self._receivedByType)
+                for known_frame_type in known_frame_types:
+                    self._latestRevisionByType[known_frame_type] += 1
                 self._cellHistory.clear()
                 self._latestMatrixByType.clear()
                 self._latestMetaByType.clear()
+                self._latestSeqByType.clear()
                 self._wideRowsByType.clear()
                 self._receivedByType.clear()
                 self._lastCountersByType.clear()
                 self._stats["framesTotal"] = 0
                 return
 
+            self._latestRevisionByType[frameType] += 1
             self._cellHistory.pop(frameType, None)
             self._latestMatrixByType.pop(frameType, None)
             self._latestMetaByType.pop(frameType, None)
+            self._latestSeqByType.pop(frameType, None)
             self._wideRowsByType.pop(frameType, None)
             self._receivedByType.pop(frameType, None)
             self._lastCountersByType.pop(frameType, None)
@@ -222,6 +326,40 @@ class MatrixDataStore:
             selected = selected[::stride][:maxPoints]
         return history.iloc[selected].sort_values(by=xAxis if xAxis in history.columns else "timeSeconds"), True
 
+    @staticmethod
+    def downsampleHistoryArrays(
+        xValues: np.ndarray,
+        yValues: np.ndarray,
+        maxPoints: int = 5000,
+    ) -> tuple[np.ndarray, bool]:
+        if len(yValues) <= maxPoints:
+            return np.arange(len(yValues)), False
+        if maxPoints < 4:
+            return np.arange(max(0, len(yValues) - maxPoints), len(yValues)), True
+
+        bucket_count = max(1, maxPoints // 2)
+        bucket_size = int(math.ceil(len(yValues) / bucket_count))
+        selected_indices: set[int] = {0, len(yValues) - 1}
+
+        for start in range(0, len(yValues), bucket_size):
+            end = min(len(yValues), start + bucket_size)
+            bucket = yValues[start:end]
+            finite = np.where(np.isfinite(bucket))[0]
+            if finite.size == 0:
+                selected_indices.add(start)
+                continue
+            finite_values = bucket[finite]
+            selected_indices.add(start + int(finite[np.argmin(finite_values)]))
+            selected_indices.add(start + int(finite[np.argmax(finite_values)]))
+
+        selected = np.array(sorted(selected_indices), dtype=int)
+        if selected.size > maxPoints:
+            stride = int(math.ceil(selected.size / maxPoints))
+            selected = selected[::stride][:maxPoints]
+        if xValues.size == yValues.size and selected.size:
+            selected = selected[np.argsort(xValues[selected], kind="stable")]
+        return selected, True
+
     def _ensure_frame_type(self, frame_type: str) -> None:
         if frame_type not in self._cellHistory:
             self._cellHistory[frame_type] = {
@@ -233,6 +371,7 @@ class MatrixDataStore:
             self._latestMatrixByType[frame_type] = np.full((MATRIX_SIZE, MATRIX_SIZE), np.nan, dtype=float)
         if frame_type not in self._latestMetaByType:
             self._latestMetaByType[frame_type] = self._empty_meta(frame_type)
+        self._latestRevisionByType.setdefault(frame_type, 0)
 
     def _resolve_frame_type(self, frame_type: str | None) -> str | None:
         if not frame_type:
@@ -367,6 +506,44 @@ class MatrixDataStore:
             latest_time = float(history["timeSeconds"].iloc[-1])
             return history[history["timeSeconds"] >= latest_time - seconds_by_window[window]]
         return history
+
+    @staticmethod
+    def _history_window_indices(
+        x_values: np.ndarray,
+        time_values: np.ndarray,
+        window_mode: str,
+        last_n: int | None,
+        custom_min: float | None,
+        custom_max: float | None,
+    ) -> np.ndarray:
+        if not x_values.size:
+            return np.array([], dtype=int)
+        window = window_mode or "all"
+        if window == "last_n":
+            count = max(1, int(last_n or 1000))
+            start = max(0, len(x_values) - count)
+            return np.arange(start, len(x_values), dtype=int)
+        if window == "custom":
+            mask = np.ones(len(x_values), dtype=bool)
+            if custom_min is not None:
+                mask &= x_values >= float(custom_min)
+            if custom_max is not None:
+                mask &= x_values <= float(custom_max)
+            return np.flatnonzero(mask)
+
+        seconds_by_window = {
+            "last_10s": 10.0,
+            "last_30s": 30.0,
+            "last_60s": 60.0,
+            "last_5min": 300.0,
+        }
+        if window in seconds_by_window:
+            finite_times = time_values[np.isfinite(time_values)]
+            if not finite_times.size:
+                return np.arange(len(x_values), dtype=int)
+            latest_time = float(finite_times[-1])
+            return np.flatnonzero(time_values >= latest_time - seconds_by_window[window])
+        return np.arange(len(x_values), dtype=int)
 
     @staticmethod
     def _cell_indices(cell_name: str) -> tuple[int, int]:
