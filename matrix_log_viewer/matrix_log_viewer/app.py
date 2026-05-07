@@ -367,7 +367,16 @@ def createDashApp(
         status = _build_status_bar(latest_meta, parser_stats, connection_status, runtime_stats, paused, _safe_qsize(inputQueue), display_unit)
         connection_panel = _build_connection_panel(connection_status, _safe_qsize(inputQueue))
         device_panel = _build_device_panel(latest_meta, parser_stats, dataStore.getLatestDeviceStatus(), dataStore.getRecentDeviceEvents(50))
-        history_stats = f"window raw points: {len(history_raw)} | rendered points: {len(history_rendered)} | downsampled: {'yes' if downsampled else 'no'}"
+        history_stats = (
+            f"stream: {selected_type} | "
+            f"cell: {selected_cell} | "
+            f"x: {x_axis} | "
+            f"window: {history_window} | "
+            f"visible raw points: {len(history_raw)} | "
+            f"rendered points: {len(history_rendered)} | "
+            f"downsampled: {'yes' if downsampled else 'no'} | "
+            f"auto follow: {'yes' if auto_follow else 'no'}"
+        )
         return heatmap, history, status, connection_panel, device_panel, history_stats
 
     return app
@@ -492,10 +501,25 @@ def _build_history_figure(
     custom_max: float | None,
 ) -> go.Figure:
     if history_raw.empty:
-        return _empty_figure(f"No data for selected stream: {frame_type}", f"History of {cell_name}")
+        return _empty_figure(
+            f"No visible points for selected window. stream={frame_type}, cell={cell_name}, window={window_mode}",
+            f"History of {cell_name} / {frame_type}",
+        )
 
     x_column = x_axis if x_axis in history_rendered.columns else "timeSeconds"
     display_values, unit_label, mixed_units, converted = _convert_history_for_display(history_rendered, unit_mode)
+    revision = _history_view_revision(
+        frame_type=frame_type,
+        cell_name=cell_name,
+        x_axis=x_column,
+        unit_mode=unit_mode,
+        unit_label=unit_label,
+        auto_follow=auto_follow,
+        window_mode=window_mode,
+        last_n=last_n,
+        custom_min=custom_min,
+        custom_max=custom_max,
+    )
     fig = go.Figure()
     custom_data = history_rendered[["seq", "timestampUs", "unit", "value"]].to_numpy()
     value_hover = (
@@ -508,17 +532,29 @@ def _build_history_figure(
             x=history_rendered[x_column],
             y=display_values,
             mode="lines+markers",
+            name=f"{cell_name} / {frame_type}",
             line={"color": "#0f766e", "width": 2},
             marker={"size": 4},
             customdata=custom_data,
-            hovertemplate=f"{x_column}=%{{x}}<br>{value_hover}seq=%{{customdata[0]}}<br>timestamp_us=%{{customdata[1]}}<extra></extra>",
+            hovertemplate=(
+                f"cell={cell_name}<br>"
+                f"stream={frame_type}<br>"
+                f"{x_column}=%{{x}}<br>"
+                f"{value_hover}"
+                "seq=%{customdata[0]}<br>"
+                "timestamp_us=%{customdata[1]}<extra></extra>"
+            ),
         )
     )
     title = f"History of {cell_name} / {frame_type}" + (" (Mixed units)" if mixed_units else "")
-    fig.update_layout(**_base_figure_layout(title), xaxis_title=x_column, yaxis_title=f"value ({unit_label})" if unit_label != "value" else "value")
-    fig.update_layout(uirevision="history-auto-follow" if auto_follow else "history-manual")
-    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb")
-    fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb")
+    fig.update_layout(
+        **_base_figure_layout(title),
+        xaxis_title=x_column,
+        yaxis_title=f"value ({unit_label})" if unit_label != "value" else "value",
+        uirevision=revision["layout"],
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb", uirevision=revision["x"])
+    fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb", autorange=True, uirevision=revision["y"])
 
     if auto_follow:
         range_value = _resolve_follow_range(history_raw, x_column, window_mode, last_n, custom_min, custom_max)
@@ -527,6 +563,32 @@ def _build_history_figure(
         else:
             fig.update_xaxes(range=range_value)
     return fig
+
+
+def _history_view_revision(
+    frame_type: str,
+    cell_name: str,
+    x_axis: str,
+    unit_mode: str,
+    unit_label: str,
+    auto_follow: bool,
+    window_mode: str,
+    last_n: int | None,
+    custom_min: float | None,
+    custom_max: float | None,
+) -> dict[str, str]:
+    interaction_mode = "follow" if auto_follow else "manual"
+    x_window_key = window_mode or "all"
+    if window_mode == "last_n":
+        x_window_key = f"last_n:{last_n or 1000}"
+    elif window_mode == "custom":
+        x_window_key = f"custom:{custom_min}:{custom_max}"
+
+    return {
+        "layout": f"history:{interaction_mode}",
+        "x": f"history:x:{frame_type}:{x_axis}:{x_window_key}:{interaction_mode}",
+        "y": f"history:y:{frame_type}:{cell_name}:{unit_mode}:{unit_label}",
+    }
 
 
 def _resolve_follow_range(history, x_column: str, window_mode: str, last_n: int | None, custom_min: float | None, custom_max: float | None) -> list[float] | None:
