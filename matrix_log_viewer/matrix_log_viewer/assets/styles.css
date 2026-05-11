@@ -214,6 +214,11 @@
   color: #b45309;
 }
 
+.metric-row.warn {
+  border-radius: 4px;
+  background: #fff7ed;
+}
+
 .metric-label {
   min-width: 0;
   color: #52606d;
@@ -249,8 +254,8 @@
 
 .graph {
   width: 100%;
-  height: calc(100vh - 220px);
-  min-height: 520px;
+  height: calc(100vh - 270px);
+  min-height: 460px;
 }
 
 .advanced-panel {

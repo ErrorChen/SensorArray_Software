@@ -86,7 +86,14 @@ class HeatmapRenderCacheThread(threading.Thread):
 
     def getStats(self) -> dict:
         with self._lock:
-            return {"targetFps": self.targetFps, "actualFps": _sample_fps(self._fpsSamples), "renderSkipped": self.renderSkipped}
+            latest = self.latestHeatmapSnapshot or {}
+            return {
+                "targetFps": self.targetFps,
+                "actualFps": _sample_fps(self._fpsSamples),
+                "renderSkipped": self.renderSkipped,
+                "displayUnit": latest.get("displayUnit"),
+                "selectedCell": latest.get("selectedCell") or self.selectedCell,
+            }
 
     def reset(self) -> None:
         with self._lock:
@@ -116,6 +123,7 @@ class HeatmapRenderCacheThread(threading.Thread):
         self._lastDataRevision = data_revision
         self._cacheRevision += 1
         matrix_uv = np.asarray(snapshot.get("matrixUv"), dtype=float)
+        has_frame = snapshot.get("seq") is not None or bool(np.isfinite(matrix_uv).any())
         display_unit = _resolve_display_unit(matrix_uv, self.unitMode)
         matrix_display = _convert_uv(matrix_uv, display_unit)
         zmin, zmax = _resolve_color_range(matrix_display, self.colorMode, self.fixedMin, self.fixedMax)
@@ -126,9 +134,15 @@ class HeatmapRenderCacheThread(threading.Thread):
             matrix_display=matrix_display,
             display_unit=display_unit,
             seq=snapshot.get("seq"),
-            status_code=snapshot.get("lastStatusCode"),
-            status_name=snapshot.get("lastStatusCodeName"),
+            timestamp_us=snapshot.get("timestampUs"),
+            duration_us=snapshot.get("durationUs"),
+            status_flags=snapshot.get("statusFlags"),
+            first_status_code=snapshot.get("firstStatusCode"),
+            first_status_name=snapshot.get("firstStatusCodeName"),
+            last_status_code=snapshot.get("lastStatusCode"),
+            last_status_name=snapshot.get("lastStatusCodeName"),
         )
+        json_matrix = _json_matrix(matrix_display)
         return {
             "kind": "heatmap",
             "cacheRevision": self._cacheRevision,
@@ -138,10 +152,14 @@ class HeatmapRenderCacheThread(threading.Thread):
             "timestampUs": snapshot.get("timestampUs"),
             "timeSeconds": snapshot.get("timeSeconds"),
             "durationUs": snapshot.get("durationUs"),
+            "empty": not has_frame,
+            "message": None if has_frame else f"No data for selected stream: {snapshot.get('stream') or self.stream}",
+            "matrix": json_matrix,
             "matrixUv": _json_matrix(matrix_uv),
-            "matrixDisplay": _json_matrix(matrix_display),
+            "matrixDisplay": json_matrix,
             "displayUnit": display_unit,
             "text": text,
+            "customData": customdata,
             "customdata": customdata,
             "colorbarTitle": display_unit,
             "colorbarTickFormat": _colorbar_tick_format(display_unit),
@@ -183,6 +201,10 @@ class HistoryRenderCacheThread(threading.Thread):
         self._cacheRevision = 0
         self.renderSkipped = 0
         self._fpsSamples: list[float] = []
+        self._visiblePointCount = 0
+        self._renderedPointCount = 0
+        self._downsampled = False
+        self._resolvedUnit = "uV"
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -207,7 +229,16 @@ class HistoryRenderCacheThread(threading.Thread):
 
     def getStats(self) -> dict:
         with self._lock:
-            return {"targetFps": self.targetFps, "actualFps": _sample_fps(self._fpsSamples), "renderSkipped": self.renderSkipped}
+            return {
+                "targetFps": self.targetFps,
+                "actualFps": _sample_fps(self._fpsSamples),
+                "renderSkipped": self.renderSkipped,
+                "visiblePointCount": self._visiblePointCount,
+                "renderedPointCount": self._renderedPointCount,
+                "downsampled": self._downsampled,
+                "unit": self._resolvedUnit,
+                "selectedCell": self.selectedCell,
+            }
 
     def reset(self) -> None:
         with self._lock:
@@ -276,10 +307,15 @@ class HistoryRenderCacheThread(threading.Thread):
                 int(self.maxPoints),
                 bool(self.showMarkers),
             )
-            selected, _downsampled = MatrixDataStore.downsampleHistoryArrays(x_full, y_full, self.maxPoints)
+            selected, downsampled = MatrixDataStore.downsampleHistoryArrays(x_full, y_full, self.maxPoints)
             self._currentKey = key
             self._lastSeq = _last_seq(meta_full.get("seq"))
+            self._visiblePointCount = int(len(x_full))
+            self._renderedPointCount = int(len(selected))
+            self._downsampled = bool(downsampled)
+            self._resolvedUnit = resolved_unit
             self._cacheRevision += 1
+            y_selected_uv = y_full[selected]
             return {
                 "kind": "history",
                 "reset": True,
@@ -291,12 +327,17 @@ class HistoryRenderCacheThread(threading.Thread):
                 "xAxis": key.xAxis,
                 "unit": resolved_unit,
                 "x": _json_array(x_full[selected]),
-                "y": _json_array(_convert_uv(y_full[selected], resolved_unit)),
+                "y": _json_array(_convert_uv(y_selected_uv, resolved_unit)),
+                "customData": _build_history_customdata(meta_full, selected, self.selectedCell, self.stream, y_selected_uv),
                 "lastSeq": self._lastSeq,
                 "maxPoints": self.maxPoints,
                 "showMarkers": bool(self.showMarkers),
                 "revision": int(meta_full.get("revision") or 0),
                 "followLatest": bool(self.followLatest),
+                "xRange": _history_x_range(x_full, key.xAxis, self.historyWindow, self.lastN, self.customXMin, self.customXMax),
+                "visiblePointCount": self._visiblePointCount,
+                "renderedPointCount": self._renderedPointCount,
+                "downsampled": self._downsampled,
             }
 
         if len(x) == 0:
@@ -306,7 +347,13 @@ class HistoryRenderCacheThread(threading.Thread):
             x = x[-self.appendLimit :]
             y_uv = y_uv[-self.appendLimit :]
             meta["seq"] = meta["seq"][-self.appendLimit :]
+            meta["timestampUs"] = meta["timestampUs"][-self.appendLimit :]
+            meta["unit"] = meta["unit"][-self.appendLimit :]
+            meta["rawValue"] = meta["rawValue"][-self.appendLimit :]
         self._lastSeq = _last_seq(meta.get("seq")) or self._lastSeq
+        self._renderedPointCount = min(int(self.maxPoints), int(self._renderedPointCount + len(x)))
+        self._visiblePointCount = max(int(self._visiblePointCount), int(self._renderedPointCount))
+        self._resolvedUnit = key.resolvedUnit
         self._cacheRevision += 1
         return {
             "kind": "history",
@@ -317,11 +364,16 @@ class HistoryRenderCacheThread(threading.Thread):
             "selectedCell": self.selectedCell,
             "x": _json_array(x),
             "y": _json_array(_convert_uv(y_uv, key.resolvedUnit)),
+            "customData": _build_history_customdata(meta, np.arange(len(x), dtype=int), self.selectedCell, self.stream, y_uv),
             "lastSeq": self._lastSeq,
             "maxPoints": self.maxPoints,
             "showMarkers": bool(self.showMarkers),
             "revision": int(meta.get("revision") or 0),
             "followLatest": bool(self.followLatest),
+            "xRange": _history_x_range(x, key.xAxis, self.historyWindow, self.lastN, self.customXMin, self.customXMax),
+            "visiblePointCount": self._visiblePointCount,
+            "renderedPointCount": self._renderedPointCount,
+            "downsampled": self._downsampled,
         }
 
 
@@ -353,12 +405,11 @@ def _build_heatmap_text(matrix_display: np.ndarray, unit: str) -> list[list[str]
     for source_index in range(MATRIX_SIZE):
         row: list[str] = []
         for detector_index in range(MATRIX_SIZE):
-            cell = f"S{source_index + 1}D{detector_index + 1}"
             value = matrix[source_index, detector_index]
             if math.isfinite(float(value)):
-                row.append(f"{cell}<br>{_format_display_value(float(value), unit)}")
+                row.append(_format_display_value(float(value), unit))
             else:
-                row.append(f"{cell}<br>invalid")
+                row.append("--")
         text.append(row)
     return text
 
@@ -368,12 +419,20 @@ def _build_heatmap_customdata(
     matrix_display: np.ndarray,
     display_unit: str,
     seq: Any,
-    status_code: Any,
-    status_name: Any,
+    timestamp_us: Any,
+    duration_us: Any,
+    status_flags: Any,
+    first_status_code: Any,
+    first_status_name: Any,
+    last_status_code: Any,
+    last_status_name: Any,
 ) -> list[list[list[Any]]]:
     matrix_uv = np.asarray(matrix_uv, dtype=float)
     matrix_display = np.asarray(matrix_display, dtype=float)
-    status_text = _format_hex(status_code, 4)
+    status_text = _status_text(status_flags, first_status_code, first_status_name, last_status_code, last_status_name)
+    status_flags_text = _format_hex(status_flags, 8)
+    first_status_text = _format_status_code(first_status_code, first_status_name)
+    last_status_text = _format_status_code(last_status_code, last_status_name)
     customdata: list[list[list[Any]]] = []
     for source_index in range(MATRIX_SIZE):
         row: list[list[Any]] = []
@@ -385,17 +444,46 @@ def _build_heatmap_customdata(
             row.append(
                 [
                     cell,
-                    "valid" if valid else "invalid",
-                    _format_display_number(display_value, display_unit) if valid else "invalid",
+                    bool(valid),
                     display_unit,
-                    seq if seq is not None else "-",
+                    "uV",
                     raw_uv if valid else None,
+                    seq if seq is not None else "-",
                     status_text,
-                    status_name or "-",
+                    timestamp_us if timestamp_us is not None else "-",
+                    duration_us if duration_us is not None else "-",
+                    status_flags_text,
+                    first_status_text,
+                    last_status_text,
+                    _format_display_number(display_value, display_unit) if valid else "--",
+                    _format_display_value(display_value, display_unit) if valid else "--",
                 ]
             )
         customdata.append(row)
     return customdata
+
+
+def _build_history_customdata(meta: dict, selected: np.ndarray, cell: str, stream: str, y_uv: np.ndarray) -> list[list[Any]]:
+    seq = np.asarray(meta.get("seq", []), dtype=object)
+    timestamp_us = np.asarray(meta.get("timestampUs", []), dtype=object)
+    units = np.asarray(meta.get("unit", []), dtype=object)
+    selected = np.asarray(selected, dtype=int)
+    y_uv = np.asarray(y_uv, dtype=float)
+    rows: list[list[Any]] = []
+    for output_index, source_index in enumerate(selected):
+        raw_uv = float(y_uv[output_index]) if output_index < len(y_uv) and math.isfinite(float(y_uv[output_index])) else None
+        rows.append(
+            [
+                cell,
+                stream,
+                _array_value(seq, source_index),
+                _array_value(timestamp_us, source_index),
+                "uV",
+                raw_uv,
+                _array_value(units, source_index) or "uV",
+            ]
+        )
+    return rows
 
 
 def _resolve_color_range(matrix_display: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
@@ -415,33 +503,23 @@ def _resolve_color_range(matrix_display: np.ndarray, color_mode: str, fixed_min:
 
 def _format_display_value(value: float, unit: str) -> str:
     if not math.isfinite(float(value)):
-        return "invalid"
+        return "--"
     return f"{_format_display_number(float(value), unit)} {unit}".strip()
 
 
 def _format_display_number(value: float, unit: str) -> str:
     if not math.isfinite(float(value)):
-        return "invalid"
+        return "--"
     abs_value = abs(float(value))
-    if unit == "uV":
-        if abs_value < 10:
-            return _strip_trailing_zeros(f"{float(value):,.2f}")
-        if abs_value < 1_000:
-            return _strip_trailing_zeros(f"{float(value):,.1f}")
-        if math.isclose(float(value), round(float(value)), rel_tol=0.0, abs_tol=1e-9):
-            return f"{int(round(float(value))):,}"
-        return _strip_trailing_zeros(f"{float(value):,.1f}")
-    if unit == "mV":
-        if abs_value >= 100:
-            return _strip_trailing_zeros(f"{float(value):,.1f}")
-        if abs_value >= 10:
-            return _strip_trailing_zeros(f"{float(value):,.2f}")
-        return _strip_trailing_zeros(f"{float(value):,.3f}")
-    if unit == "V":
-        if abs_value >= 10:
-            return _strip_trailing_zeros(f"{float(value):,.4f}")
-        return _strip_trailing_zeros(f"{float(value):,.6f}")
-    return _strip_trailing_zeros(f"{float(value):,.6f}")
+    if abs_value == 0:
+        return "0"
+    if abs_value >= 10_000:
+        return str(int(round(float(value))))
+    if abs_value >= 1:
+        return _strip_trailing_zeros(f"{float(value):.4g}")
+    if abs_value >= 0.001:
+        return _strip_trailing_zeros(f"{float(value):.3g}")
+    return f"{float(value):.2e}"
 
 
 def _strip_trailing_zeros(value: str) -> str:
@@ -451,13 +529,73 @@ def _strip_trailing_zeros(value: str) -> str:
 
 
 def _colorbar_tick_format(unit: str) -> str:
-    if unit == "uV":
-        return ",.1f"
-    if unit == "mV":
-        return ",.3f"
-    if unit == "V":
-        return ",.6f"
-    return ",.3f"
+    return ".3~g"
+
+
+def _status_text(status_flags: Any, first_code: Any, first_name: Any, last_code: Any, last_name: Any) -> str:
+    flags_nonzero = _numeric_nonzero(status_flags)
+    first_nonzero = _numeric_nonzero(first_code)
+    last_nonzero = _numeric_nonzero(last_code)
+    if not flags_nonzero and not first_nonzero and not last_nonzero:
+        return "OK"
+    return f"flags={_format_hex(status_flags, 8)} first={_format_status_code(first_code, first_name)} last={_format_status_code(last_code, last_name)}"
+
+
+def _format_status_code(code: Any, name: Any = None) -> str:
+    if code is None or code == "":
+        return "-"
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        return str(code)
+    if code_int == 0:
+        return "OK"
+    return f"{_format_hex(code_int, 4)} {name or '-'}"
+
+
+def _numeric_nonzero(value: Any) -> bool:
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return bool(value and value != "-")
+
+
+def _array_value(values: np.ndarray, index: int) -> Any:
+    if index < 0 or index >= len(values):
+        return "-"
+    value = values[index]
+    if isinstance(value, (np.integer, np.int64, np.int32)):
+        return int(value)
+    if isinstance(value, (np.floating, np.float64, np.float32)):
+        return float(value) if math.isfinite(float(value)) else "-"
+    return value.item() if hasattr(value, "item") else value
+
+
+def _history_x_range(
+    x_values: np.ndarray,
+    x_axis: str,
+    history_window: str,
+    last_n: int | None,
+    custom_min: float | None,
+    custom_max: float | None,
+) -> list[float] | None:
+    x = np.asarray(x_values, dtype=float)
+    finite_x = x[np.isfinite(x)]
+    if not finite_x.size:
+        return None
+    if history_window == "custom" and custom_min is not None and custom_max is not None and custom_min < custom_max:
+        return [float(custom_min), float(custom_max)]
+    if history_window == "last_n":
+        count = max(1, int(last_n or 1000))
+        subset = finite_x[-count:]
+        return [float(subset[0]), float(subset[-1])] if subset.size > 1 else None
+    seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(history_window)
+    if seconds is None:
+        return None
+    latest = float(finite_x[-1])
+    if x_axis == "timeSeconds":
+        return [latest - seconds, latest]
+    return [float(finite_x[0]), latest] if finite_x.size > 1 else None
 
 
 def _finite_or_none(value: Any) -> float | None:

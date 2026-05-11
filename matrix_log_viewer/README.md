@@ -4,26 +4,27 @@ Dash-based SensorArray 8x8 matrix viewer for the Python host software.
 
 ## Firmware Baseline
 
-This version targets:
+This version targets the ErrorChen/SensorArray FAST/BINARY compact protocol:
 
 ```text
-ErrorChen/SensorArray @ 4afe843e0648bfa6e482572593236b0bb84f09b9
-short hash: 4afe843
-title: UpperSpeed
+magic bytes = SAC1
+version = 1
+frameType = 0x1261 / FAST_BINARY
+frameSize = 312 bytes
 ```
 
-`FAST_BINARY` is the default path. Legacy `MATV` CSV remains available for SAFE/CSV/debug firmware, but UpperSpeed FAST/BINARY should switch to pure binary after startup.
+`FAST_BINARY` is the default path. Legacy `MATV` CSV remains available for SAFE/CSV/debug firmware, but FAST/BINARY should switch to pure binary after startup. The GUI does not require periodic ASCII diagnostics during the pure binary phase.
 
 ## Host GUI Fix Baseline
 
 This GUI fix was applied in the local `SensorArray_Software` worktree on branch `main`.
 
-No local or remote `UpperSpeed` branch was present during the fix, so the worktree was left on the current debugging branch instead of being forced back to another branch.
+No local `debug` branch was present during the fix, so the worktree was left on the currently checked-out branch.
 
 Baseline HEAD before these edits:
 
 ```text
-6992248 UpperSpeed
+de1859265d920ff5291dcd03c7677a52496bedf1 debug
 ```
 
 ## Install And Run
@@ -40,14 +41,14 @@ Default URL:
 http://127.0.0.1:8050
 ```
 
-Replay UpperSpeed samples:
+Replay FAST/BINARY samples:
 
 ```powershell
 python matrix_log_viewer/generate_sample_fast_binary.py
-python matrix_log_viewer/run_viewer.py --replay-file matrix_log_viewer/sample_logs/sample_upper_speed_startup_then_binary.bin --replay-speed 10
+python matrix_log_viewer/run_viewer.py --replay-file matrix_log_viewer/sample_logs/sample_fast_binary_mixed.bin --replay-speed 10
 ```
 
-## UpperSpeed FAST/BINARY Startup
+## FAST/BINARY Startup
 
 Startup may contain short ASCII diagnostics, including `RESET_REASON`, `APPMODE`, `BUILD_CONFIG`, `VOLTSCAN_CONFIG`, `STREAM_MEM`, `FAST_BINARY_DIAG`, `DBGROUTEPOLICY`, `DBGADSREFPOLICY`, `DBGTMUXPOLICY`, `ROUTE_POLICY`, and `ADS_POLICY`.
 
@@ -63,7 +64,7 @@ After this line stdout is pure binary. Do not use a text monitor or `readline()`
 
 ## Pure Binary Frame
 
-UpperSpeed compact frame:
+FAST/BINARY compact frame:
 
 ```text
 FMT = <IHHIQIIIIHHQ64iBBHI
@@ -76,7 +77,7 @@ frameTypeName = FAST_BINARY
 CRC32 = binascii.crc32(rawFrame[:308]) & 0xffffffff
 ```
 
-Values are `int32 microvolts[64]` ordered `S1D1..S1D8,S2D1..S8D8`. `validMask` bit index is `sourceZeroBased * 8 + detectorZeroBased`; when a bit is `0`, the cell is stored/rendered as `NaN` and old values are not reused.
+Values are `int32 microvolts[64]` ordered `S1D1..S1D8,S2D1..S8D8`. `validMask` bit index is `sourceZeroBased * 8 + detectorZeroBased`; when a bit is `0`, the cell is stored/rendered as `NaN`/`None`, the heatmap text shows `--`, and old values are not reused.
 
 The compact frame carries saturated 16-bit `droppedFrames` and `outputDecimatedFrames`. Full cumulative writer/drop counters are taken from `FAST_BINARY_DIAG`/startup status.
 
@@ -92,7 +93,7 @@ The stream parser accepts `feed(data: bytes)` chunks from `serial.read(8192)`:
 
 ## Metrics
 
-The UI deliberately separates these sources:
+The normal operator view includes a compact key metrics panel below the toolbar. It deliberately separates these sources:
 
 - `scanFps`: device scan rate.
 - `outFps`: device output rate.
@@ -108,6 +109,8 @@ The UI deliberately separates these sources:
 - `HOST_RESYNC`: host magic resyncs/skipped binary bytes.
 - `HOST_QUEUE_DROP`: Python input queue drops.
 - `RENDER_SKIPPED`: GUI skipped intermediate display frames; this is not data loss.
+- `frontendRenderSkipped`: browser-side requestAnimationFrame coalescing skipped an older visual snapshot.
+- `lastClientError`: last Plotly client-side render error, if any.
 
 If `partialAfterFirstByte > 0`, the GUI/CLI reports:
 
@@ -129,7 +132,9 @@ Recommended high-rate settings:
 
 The GUI render target is fixed at 60 FPS by default; there is no user-facing target-FPS selector. `GUI render interval ms` affects display refresh only. It does not change device sampling, parser throughput, or dataStore/CSV retention.
 
-Display unit selection applies consistently to heatmap cell text, hover labels, colorbar title/ticks, and fixed color ranges. In Auto mode, values such as `400000 uV` display as `400 mV` rather than Plotly SI labels like `400k`.
+Display unit selection applies consistently to heatmap cell text, hover labels, colorbar title/ticks, and fixed color ranges. In Auto mode, heatmap units are selected from the current 8x8 `matrixUv` maximum absolute value: below `1000 uV` stays `uV`, `1000 uV` through below `1000000 uV` displays as `mV`, and `1000000 uV` or higher displays as `V`. History auto-units use the visible history values. Colorbar ticks use compact formatting and should not show long labels such as `700,000.000`.
+
+Heatmap snapshots sent to the browser contain `matrix`, `matrixUv`, `text`, and `customData`. Valid cells show compact value+unit text inside the cell; invalid cells show `--`. Hover includes cell name, valid flag, display value, raw uV, seq, timestamp, duration, status flags, and first/last status codes.
 
 ## Binary Debug CLI
 

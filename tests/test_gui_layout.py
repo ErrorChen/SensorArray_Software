@@ -71,6 +71,22 @@ def test_gui_layout_contains_compact_controls():
         stop_app(app)
 
 
+def test_layout_has_no_gui_target_fps_control():
+    app = make_app()
+    try:
+        assert find_component(app.layout, "gui-target-fps") is None
+    finally:
+        stop_app(app)
+
+
+def test_key_metrics_panel_exists():
+    app = make_app()
+    try:
+        assert find_component(app.layout, "key-metrics-panel") is not None
+    finally:
+        stop_app(app)
+
+
 def test_advanced_diagnostics_hidden_by_default():
     app = make_app()
     try:
@@ -150,8 +166,8 @@ def test_key_metrics_panel_shows_error_runtime_and_device_counters():
     assert "binary CRC errors" in text
     assert "resync count / magic resyncs" in text
     assert "parsed binary fps" in text
-    assert "device droppedFrames" in text
-    assert "device outputDecimatedFrames" in text
+    assert "drop / DEVICE_DROP" in text
+    assert "decimated / DEVICE_DECIMATED" in text
     assert "host dropped input chunks" in text
     assert "last client error" in text
     assert "plot failed" in text

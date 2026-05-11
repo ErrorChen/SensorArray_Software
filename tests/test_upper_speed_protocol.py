@@ -188,34 +188,91 @@ def test_render_cache_decouples_input_and_gui():
     assert cache.getStats()["renderSkipped"] > 0
 
 
-def test_heatmap_snapshot_carries_display_unit_text_and_customdata():
+def test_heatmap_snapshot_contains_display_text_and_customdata():
     store = MatrixDataStore(maxPointsPerCell=10)
     values = {cell: 0.0 for cell in CELL_NAMES}
-    values["S1D1"] = -158.0
-    values["S1D2"] = 400_000.0
-    values["S8D5"] = 123.0
-    s8d5_bit = (8 - 1) * 8 + (5 - 1)
-    store.addFrame(MatrixFrame(**{**_frame(1).__dict__, "values": values, "validMask": ALL_VALID & ~(1 << s8d5_bit)}))
+    values["S1D1"] = 123.0
+    values["S1D2"] = 1_234.0
+    values["S1D3"] = 700_000.0
+    values["S1D4"] = 456.0
+    s1d4_bit = 3
+    store.addFrame(
+        MatrixFrame(
+            **{
+                **_frame(7).__dict__,
+                "values": values,
+                "validMask": ALL_VALID & ~(1 << s1d4_bit),
+                "statusFlags": 0,
+                "firstStatusCode": 0,
+                "lastStatusCode": 0,
+            }
+        )
+    )
 
     cache = HeatmapRenderCacheThread(store)
-    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D2", unitMode="auto")
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D3", unitMode="auto")
     auto_snapshot = cache.getLatest()
 
     assert auto_snapshot["displayUnit"] == "mV"
-    assert auto_snapshot["matrixDisplay"][0][1] == 400.0
-    assert "S1D2<br>400 mV" in auto_snapshot["text"][0][1]
-    assert auto_snapshot["text"][7][4] == "S8D5<br>invalid"
-    assert auto_snapshot["customdata"][0][1][0] == "S1D2"
-    assert auto_snapshot["customdata"][0][1][1] == "valid"
-    assert auto_snapshot["customdata"][0][1][3] == "mV"
-    assert auto_snapshot["customdata"][0][1][5] == 400_000.0
+    assert auto_snapshot["matrix"][0][0] == 0.123
+    assert auto_snapshot["matrix"][0][1] == 1.234
+    assert auto_snapshot["matrix"][0][2] == 700.0
+    assert auto_snapshot["matrix"][0][3] is None
+    assert auto_snapshot["text"][0][0].endswith("mV")
+    assert auto_snapshot["text"][0][1] == "1.234 mV"
+    assert auto_snapshot["text"][0][2] == "700 mV"
+    assert auto_snapshot["text"][0][3] == "--"
+    custom = auto_snapshot["customData"][0][2]
+    assert custom[0] == "S1D3"
+    assert custom[1] is True
+    assert custom[2] == "mV"
+    assert custom[3] == "uV"
+    assert custom[4] == 700_000.0
+    assert custom[5] == 7
+    assert custom[6] == "OK"
+    assert custom[7] == 7_000_000
+    assert custom[8] == 100
+    assert custom[9] == "0x00000000"
+    assert custom[10] == "OK"
+    assert custom[11] == "OK"
 
-    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D2", unitMode="uV")
+
+def test_heatmap_manual_unit():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    values = {cell: 0.0 for cell in CELL_NAMES}
+    values["S1D1"] = 700_000.0
+    store.addFrame(MatrixFrame(**{**_frame(1).__dict__, "values": values}))
+
+    cache = HeatmapRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", unitMode="uV")
     uv_snapshot = cache.getLatest()
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", unitMode="mV")
+    mv_snapshot = cache.getLatest()
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", unitMode="V")
+    v_snapshot = cache.getLatest()
 
     assert uv_snapshot["displayUnit"] == "uV"
-    assert "400,000 uV" in uv_snapshot["text"][0][1]
-    assert "400k" not in uv_snapshot["text"][0][1].lower()
+    assert uv_snapshot["matrix"][0][0] == 700_000.0
+    assert mv_snapshot["displayUnit"] == "mV"
+    assert mv_snapshot["matrix"][0][0] == 700.0
+    assert v_snapshot["displayUnit"] == "V"
+    assert v_snapshot["matrix"][0][0] == 0.7
+
+
+def test_valid_mask_invalid_cell_is_none_or_nan():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    values = {cell: 100.0 for cell in CELL_NAMES}
+    s1d1_bit = 0
+    store.addFrame(MatrixFrame(**{**_frame(1).__dict__, "values": values, "validMask": ALL_VALID & ~(1 << s1d1_bit)}))
+
+    cache = HeatmapRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", unitMode="auto")
+    snapshot = cache.getLatest()
+
+    assert snapshot["matrix"][0][0] is None
+    assert snapshot["matrixUv"][0][0] is None
+    assert snapshot["text"][0][0] == "--"
+    assert snapshot["customData"][0][0][1] is False
 
 
 def test_no_pandas_in_live_render_cache_path():

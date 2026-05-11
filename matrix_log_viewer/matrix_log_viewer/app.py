@@ -18,9 +18,9 @@ from .config import (
     CELL_NAMES,
     DEFAULT_BAUD,
     DEFAULT_DIAGNOSTICS_INTERVAL_MS,
+    DEFAULT_GUI_TARGET_FPS,
     DEFAULT_INGEST_INTERVAL_MS,
     DEFAULT_RENDER_INTERVAL_MS,
-    DEFAULT_RENDER_TARGET_FPS,
     DEFAULT_SERIAL_READ_SIZE,
     DEFAULT_STATUS_INTERVAL_MS,
     DETECTOR_LABELS,
@@ -231,8 +231,8 @@ def createDashApp(
     )
     input_processor.start()
     app._sensorarray_input_processor = input_processor
-    heatmap_cache = HeatmapRenderCacheThread(dataStore, targetFps=DEFAULT_RENDER_TARGET_FPS)
-    history_cache = HistoryRenderCacheThread(dataStore, targetFps=DEFAULT_RENDER_TARGET_FPS)
+    heatmap_cache = HeatmapRenderCacheThread(dataStore, targetFps=DEFAULT_GUI_TARGET_FPS)
+    history_cache = HistoryRenderCacheThread(dataStore, targetFps=DEFAULT_GUI_TARGET_FPS)
     heatmap_cache.start()
     history_cache.start()
     app._sensorarray_heatmap_cache = heatmap_cache
@@ -665,7 +665,7 @@ def _build_layout() -> html.Div:
         [
             dcc.Store(id="paused-store", data=False),
             dcc.Store(id="ingest-stats-store", data={}),
-            dcc.Store(id="render-control-store", data={"targetFps": DEFAULT_RENDER_TARGET_FPS}),
+            dcc.Store(id="render-control-store", data={"targetFps": DEFAULT_GUI_TARGET_FPS}),
             dcc.Store(id="heatmap-snapshot-store", data={}),
             dcc.Store(id="history-snapshot-store", data={}),
             dcc.Store(id="frontend-fps-store", data={}),
@@ -901,7 +901,7 @@ def _build_heatmap_figure(
     cell_names = np.array([[f"S{row + 1}D{col + 1}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
     validity = np.where(np.isfinite(matrix), "valid", "invalid")
     custom_data = np.dstack([cell_names, validity])
-    text = np.array([[f"{cell_names[row, col]}<br>{_format_value(matrix[row, col], unit) if np.isfinite(matrix[row, col]) else 'invalid'}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
+    text = np.array([[_format_value(matrix[row, col], unit) if np.isfinite(matrix[row, col]) else "--" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
 
     heatmap_kwargs: dict[str, Any] = {}
     zmin, zmax = _resolve_color_range(matrix, color_mode, fixed_min, fixed_max)
@@ -1294,8 +1294,8 @@ def _build_compact_status_bar(
     if status_code.startswith("-"):
         status_code = "OK"
     device = runtime_stats.get("deviceSummary") or {}
-    device_drop = _first_non_empty(device.get("latestDrop"), meta.get("droppedFrames"), 0)
-    device_decimated = _first_non_empty(device.get("latestDecimated"), meta.get("outputDecimatedFrames"), 0)
+    device_drop = _first_number(device.get("latestDrop"), meta.get("droppedFrames"), 0)
+    device_decimated = _first_number(device.get("latestDecimated"), meta.get("outputDecimatedFrames"), 0)
     output_div = _first_non_empty(device.get("latestOutputDiv"), meta.get("outputDivider"), "-")
     partial = int(device.get("partialAfterFirstByte") or 0)
     pollution = int(parser_stats.get("protocolPollutionCount") or 0)
@@ -1383,9 +1383,16 @@ def _build_key_metrics_panel(
     host_drop_chunks = int(connection_status.get("droppedInputChunks") or parser_stats.get("hostQueueDropChunks") or 0)
     host_drop_bytes = int(connection_status.get("droppedInputBytes") or parser_stats.get("hostQueueDropBytes") or 0)
     last_parser_issue = _first_non_empty(parser_stats.get("lastError", ""), parser_stats.get("lastWarning", ""), "-")
+    protocol_pollution = int(parser_stats.get("protocolPollutionCount") or device_summary.get("protocolPollutionCount") or 0)
+    partial_after_first = int(device_summary.get("partialAfterFirstByte") or 0)
+    short_write = int(device_summary.get("latestShortWrite") or 0)
+    write_fail = int(device_summary.get("latestWriteFail") or device_summary.get("fullFrameWriteFailCount") or 0)
+    q_full = int(device_summary.get("latestQFull") or 0)
+    device_drop = _first_number(device_summary.get("latestDrop"), latest_meta.get("droppedFrames"), 0)
+    device_decimated = _first_number(device_summary.get("latestDecimated"), latest_meta.get("outputDecimatedFrames"), 0)
     return [
         _metric_card(
-            "Throughput",
+            "Input / Throughput",
             [
                 ("stream", selected_type or "-"),
                 ("selected cell", selected_cell or "-"),
@@ -1394,17 +1401,23 @@ def _build_key_metrics_panel(
                 ("parsed binary fps", runtime_stats.get("parsedBinaryFps", 0.0)),
                 ("parsed text fps", runtime_stats.get("parsedTextFps", 0.0)),
                 ("bytes/sec", runtime_stats.get("bytesPerSec", 0.0)),
+                ("GUI heatmap fps", runtime_stats.get("guiHeatmapFps", 0.0)),
+                ("GUI history fps", runtime_stats.get("guiHistoryFps", 0.0)),
+                ("rendered frame fps", runtime_stats.get("renderedFrameFps", runtime_stats.get("guiDisplayedFps", 0.0))),
                 ("input queue depth", queue_depth, _metric_is_nonzero(queue_depth)),
             ],
         ),
         _metric_card(
-            "Errors",
+            "Host Parser Errors",
             [
+                ("HOST_CRC / binaryCrcErrors", parser_stats.get("binaryCrcErrors", 0), _metric_is_nonzero(parser_stats.get("binaryCrcErrors", 0))),
+                ("HOST_RESYNC / binaryMagicResyncs", parser_stats.get("binaryMagicResyncs", 0), _metric_is_nonzero(parser_stats.get("binaryMagicResyncs", 0))),
                 ("binary CRC errors", parser_stats.get("binaryCrcErrors", 0), _metric_is_nonzero(parser_stats.get("binaryCrcErrors", 0))),
                 ("resync count / magic resyncs", parser_stats.get("binaryMagicResyncs", 0), _metric_is_nonzero(parser_stats.get("binaryMagicResyncs", 0))),
                 ("parse errors", parser_stats.get("parseErrors", 0), _metric_is_nonzero(parser_stats.get("parseErrors", 0))),
                 ("skipped bytes", parser_stats.get("skippedBytes", 0), _metric_is_nonzero(parser_stats.get("skippedBytes", 0))),
                 ("skipped lines", parser_stats.get("skippedLines", 0), _metric_is_nonzero(parser_stats.get("skippedLines", 0))),
+                ("protocol pollution / ASCII_AFTER_FAST_BINARY_START", protocol_pollution, _metric_is_nonzero(protocol_pollution)),
                 ("buffered bytes", parser_stats.get("bufferedBytes", parser_stats.get("bufferBytes", 0)), _metric_is_nonzero(parser_stats.get("bufferedBytes", parser_stats.get("bufferBytes", 0)))),
                 ("host dropped input chunks", host_drop_chunks, _metric_is_nonzero(host_drop_chunks)),
                 ("host dropped input bytes", host_drop_bytes, _metric_is_nonzero(host_drop_bytes)),
@@ -1412,26 +1425,40 @@ def _build_key_metrics_panel(
             ],
         ),
         _metric_card(
-            "Device",
+            "Device / Firmware",
             [
-                ("device droppedFrames", _first_number(latest_meta.get("droppedFrames"), device_summary.get("latestDrop"), 0), _metric_is_nonzero(_first_number(latest_meta.get("droppedFrames"), device_summary.get("latestDrop"), 0))),
-                ("device outputDecimatedFrames", _first_number(latest_meta.get("outputDecimatedFrames"), device_summary.get("latestDecimated"), 0), _metric_is_nonzero(_first_number(latest_meta.get("outputDecimatedFrames"), device_summary.get("latestDecimated"), 0))),
+                ("scanFps", device_summary.get("latestScanFps")),
+                ("outFps", device_summary.get("latestOutFps")),
+                ("qUsed", device_summary.get("latestQUsed")),
+                ("qFull", q_full, _metric_is_nonzero(q_full)),
+                ("drop / DEVICE_DROP", device_drop, _metric_is_nonzero(device_drop)),
+                ("decimated / DEVICE_DECIMATED", device_decimated, _metric_is_nonzero(device_decimated)),
+                ("outputDiv", _first_non_empty(device_summary.get("latestOutputDiv"), latest_meta.get("outputDivider"), "-"), _metric_is_nonzero(_first_non_empty(device_summary.get("latestOutputDiv"), latest_meta.get("outputDivider"), 0))),
+                ("droppedBeforeFirstByte", device_summary.get("droppedBeforeFirstByte", 0), _metric_is_nonzero(device_summary.get("droppedBeforeFirstByte", 0))),
+                ("partialAfterFirstByte / PROTOCOL_RISK", partial_after_first, _metric_is_nonzero(partial_after_first)),
+                ("shortWrite", short_write, _metric_is_nonzero(short_write)),
+                ("writeFail", write_fail, _metric_is_nonzero(write_fail)),
                 ("latest statusFlags", _format_hex(latest_meta.get("statusFlags"), 8), _metric_is_nonzero(latest_meta.get("statusFlags"))),
                 ("firstStatusCode", _format_status_code(latest_meta.get("firstStatusCode"), latest_meta.get("firstStatusCodeName")), _metric_is_nonzero(latest_meta.get("firstStatusCode"))),
                 ("lastStatusCode", _format_status_code(latest_meta.get("lastStatusCode"), latest_meta.get("lastStatusCodeName")), _metric_is_nonzero(latest_meta.get("lastStatusCode"))),
                 ("adsDr", _dash_if_none(latest_meta.get("adsDr"))),
-                ("outputDivider", _dash_if_none(latest_meta.get("outputDivider"))),
             ],
         ),
         _metric_card(
-            "Render",
+            "Display",
             [
-                ("GUI displayed/rendered fps", runtime_stats.get("guiDisplayedFps", 0.0)),
-                ("frontend heatmap fps", runtime_stats.get("guiHeatmapFps", 0.0)),
-                ("frontend history fps", runtime_stats.get("guiHistoryFps", 0.0)),
+                ("active stream", selected_type or "-"),
+                ("selected cell", selected_cell or "-"),
+                ("display unit", runtime_stats.get("heatmapDisplayUnit") or "-"),
+                ("history unit", runtime_stats.get("historyDisplayUnit") or "-"),
+                ("visible history points", runtime_stats.get("visibleHistoryPoints", 0)),
+                ("rendered history points", runtime_stats.get("renderedHistoryPoints", 0)),
+                ("downsampled", "yes" if runtime_stats.get("historyDownsampled") else "no"),
                 ("render tick fps", runtime_stats.get("renderTickFps", 0.0)),
                 ("frontend render skipped", runtime_stats.get("frontendRenderSkipped", 0), _metric_is_nonzero(runtime_stats.get("frontendRenderSkipped", 0))),
                 ("render skipped", runtime_stats.get("renderSkipped", 0), _metric_is_nonzero(runtime_stats.get("renderSkipped", 0))),
+                ("heatmap cache skipped", runtime_stats.get("heatmapRenderSkipped", 0), _metric_is_nonzero(runtime_stats.get("heatmapRenderSkipped", 0))),
+                ("history cache skipped", runtime_stats.get("historyRenderSkipped", 0), _metric_is_nonzero(runtime_stats.get("historyRenderSkipped", 0))),
                 ("last client error", runtime_stats.get("lastClientError") or "-", bool(runtime_stats.get("lastClientError"))),
             ],
         ),
@@ -1808,13 +1835,7 @@ def _format_value(value: float, unit: str = "") -> str:
 
 
 def _colorbar_tick_format(unit: str) -> str:
-    if unit == "uV":
-        return ",.1f"
-    if unit == "mV":
-        return ",.3f"
-    if unit == "V":
-        return ",.6f"
-    return ",.3f"
+    return ".3~g"
 
 
 def _empty_figure(message: str, title: str) -> go.Figure:
@@ -1919,7 +1940,7 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _target_fps(_render_mode: str | None = None) -> int:
-    return DEFAULT_RENDER_TARGET_FPS
+    return DEFAULT_GUI_TARGET_FPS
 
 
 def _history_points_limit(value: Any, render_mode: str | None) -> int:
@@ -1935,7 +1956,9 @@ def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache
     heatmap_fps = float(frontend_stats.get("heatmapActualFps") or heatmap_stats.get("actualFps") or 0.0)
     history_fps = float(frontend_stats.get("historyActualFps") or history_stats.get("actualFps") or 0.0)
     frontend_skipped = int(frontend_stats.get("frontendRenderSkipped") or 0)
-    render_skipped = frontend_skipped + int(heatmap_stats.get("renderSkipped") or 0) + int(history_stats.get("renderSkipped") or 0)
+    heatmap_skipped = int(heatmap_stats.get("renderSkipped") or 0)
+    history_skipped = int(history_stats.get("renderSkipped") or 0)
+    render_skipped = frontend_skipped + heatmap_skipped + history_skipped
     return {
         "guiHeatmapFps": heatmap_fps,
         "guiHistoryFps": history_fps,
@@ -1943,6 +1966,13 @@ def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache
         "historyTargetFps": history_stats.get("targetFps"),
         "frontendRenderSkipped": frontend_skipped,
         "renderSkipped": render_skipped,
+        "heatmapRenderSkipped": heatmap_skipped,
+        "historyRenderSkipped": history_skipped,
+        "heatmapDisplayUnit": heatmap_stats.get("displayUnit"),
+        "historyDisplayUnit": history_stats.get("unit"),
+        "visibleHistoryPoints": history_stats.get("visiblePointCount", 0),
+        "renderedHistoryPoints": history_stats.get("renderedPointCount", 0),
+        "historyDownsampled": history_stats.get("downsampled", False),
         "lastClientError": frontend_stats.get("lastClientError") or "",
     }
 
