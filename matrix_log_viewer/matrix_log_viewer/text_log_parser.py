@@ -29,6 +29,13 @@ EVENT_PREFIXES = {
 STATUS_PREFIXES = {
     "STAT",
     "APPMODE",
+    "APP_VERSION",
+    "RESET_REASON",
+    "BUILD_CONFIG",
+    "FAST_BINARY_START",
+    "FAST_BINARY_DIAG",
+    "STREAM_INIT",
+    "STREAM_MEM",
     "VOLTSCAN_INIT",
     "VOLTSCAN_GAIN",
     "ADS_FAST_CONFIG",
@@ -46,8 +53,49 @@ STATUS_PREFIXES = {
 }
 
 
+def _typed_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _typed_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _typed_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        text = str(value).strip().lower()
+        if text in {"true", "yes", "on"}:
+            return True
+        if text in {"false", "no", "off"}:
+            return False
+    return None
+
+
+def _first_present(fields: dict, *keys: str) -> Any:
+    for key in keys:
+        if key in fields:
+            return fields[key]
+    return None
+
+
 class TextLogParser:
-    """Parse legacy MATV CSV rows and FastSpeed text status/event lines."""
+    """Parse legacy MATV CSV rows and UpperSpeed startup/status text lines."""
 
     def __init__(self):
         self._lock = threading.RLock()
@@ -219,7 +267,34 @@ class TextLogParser:
         )
 
     def _parse_status(self, prefix: str, fields: list[str], raw_line: str) -> DeviceStatus:
-        return DeviceStatus(statusType=prefix, fields=self._parse_key_values(fields[1:]), rawLine=raw_line)
+        parsed_fields = self._parse_key_values(fields[1:])
+        typed = self._typed_key_values(parsed_fields)
+        fast_start_meta = typed if prefix == "FAST_BINARY_START" else None
+        fast_diag = typed if prefix == "FAST_BINARY_DIAG" else None
+        return DeviceStatus(
+            statusType=prefix,
+            fields=parsed_fields,
+            rawLine=raw_line,
+            fastBinaryStartSeen=prefix == "FAST_BINARY_START",
+            fastBinaryStartMeta=fast_start_meta,
+            fastBinaryDiagLatest=fast_diag,
+            pureBinaryMode=bool(typed.get("pure")) if prefix == "FAST_BINARY_START" else False,
+            startupDiagWindowSeen=prefix in {"FAST_BINARY_DIAG", "FAST_BINARY_START", "BUILD_CONFIG", "VOLTSCAN_CONFIG", "STREAM_MEM"},
+            droppedBeforeFirstByte=_typed_int(typed.get("droppedBeforeFirstByte")),
+            partialAfterFirstByte=_typed_int(typed.get("partialAfterFirstByte")),
+            fullFrameWriteCount=_typed_int(typed.get("fullFrameWriteCount")),
+            fullFrameWriteFailCount=_typed_int(typed.get("fullFrameWriteFailCount")),
+            dropPolicy=str(typed.get("dropPolicy")) if typed.get("dropPolicy") is not None else None,
+            usbExactBinaryWrite=_typed_bool(typed.get("usbExactBinaryWrite")),
+            fastBinaryStartupDiagMs=_typed_int(typed.get("fastBinaryStartupDiagMs")),
+            latestScanFps=_typed_float(typed.get("scanFps")),
+            latestOutFps=_typed_float(typed.get("outFps")),
+            latestOutputDiv=_typed_int(_first_present(typed, "outputDiv", "outputDivider")),
+            latestQUsed=_typed_int(typed.get("qUsed")),
+            latestQFull=_typed_int(typed.get("qFull")),
+            latestDrop=_typed_int(_first_present(typed, "drop", "droppedFrames")),
+            latestDecimated=_typed_int(_first_present(typed, "decimated", "outputDecimatedFrames")),
+        )
 
     def _parse_event(self, prefix: str, fields: list[str], raw_line: str) -> DeviceEvent:
         parsed_fields = self._parse_key_values(fields[1:])
@@ -255,6 +330,34 @@ class TextLogParser:
                 parsed[f"arg{positional_index}"] = item
                 positional_index += 1
         return parsed
+
+    @staticmethod
+    def _typed_key_values(fields: dict[str, str]) -> dict[str, int | float | str | bool]:
+        typed: dict[str, int | float | str | bool] = {}
+        for key, value in fields.items():
+            text = str(value).strip()
+            if text == "":
+                typed[key] = ""
+                continue
+            lowered = text.lower()
+            if lowered in {"true", "yes", "on"}:
+                typed[key] = True
+                continue
+            if lowered in {"false", "no", "off"}:
+                typed[key] = False
+                continue
+            try:
+                typed[key] = int(text, 0)
+                continue
+            except ValueError:
+                pass
+            try:
+                typed[key] = float(text)
+                continue
+            except ValueError:
+                pass
+            typed[key] = text
+        return typed
 
     @staticmethod
     def _split_csv(line: str) -> list[str]:

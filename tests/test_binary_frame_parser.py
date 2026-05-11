@@ -36,6 +36,7 @@ def build_binary_frame(
         0x3001,
         0x3002,
         3,
+        4,
         valid_mask,
         *values,
         15,
@@ -63,7 +64,10 @@ def test_parse_valid_fast_binary_frame():
     assert frame.unit == "uV"
     assert frame.adsDr == 15
     assert frame.outputDivider == 2
-    assert frame.outputDecimatedFrames == 0
+    assert frame.outputDecimatedFrames == 4
+    assert frame.droppedFramesSaturated == 3
+    assert frame.outputDecimatedFramesSaturated == 4
+    assert frame.parserFrameSize == 312
     assert frame.rawBytes == build_binary_frame()
 
 
@@ -73,7 +77,7 @@ def test_struct_size_is_312():
 
 
 def test_format_matches_expected_layout():
-    assert FMT == "<IHHIQIIIIIQ64iBBHI"
+    assert FMT == "<IHHIQIIIIHHQ64iBBHI"
 
 
 def test_crc_error_is_dropped_and_counted():

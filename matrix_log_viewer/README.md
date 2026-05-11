@@ -2,53 +2,24 @@
 
 Dash-based SensorArray 8x8 matrix viewer for the Python host software.
 
-The host supports both input formats:
+## Firmware Baseline
 
-- FastSpeed binary `SAC1`, shown as stream `FAST_BINARY` and preferred by default.
-- Legacy `MATV` CSV, kept for older firmware and debug configurations.
+This version targets:
 
-If `FAST_BINARY` frames have not arrived but `MATV` data has, the default view automatically falls back to `MATV`. The two streams remain stored independently and can be selected from the stream dropdown.
-
-## Install
-
-```powershell
-cd matrix_log_viewer
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+```text
+ErrorChen/SensorArray @ 4afe843e0648bfa6e482572593236b0bb84f09b9
+short hash: 4afe843
+title: UpperSpeed
 ```
 
-For tests from the repository root:
+`FAST_BINARY` is the default path. Legacy `MATV` CSV remains available for SAFE/CSV/debug firmware, but UpperSpeed FAST/BINARY should switch to pure binary after startup.
+
+## Install And Run
 
 ```powershell
 pip install -r requirements-dev.txt
 python -m pytest
-```
-
-## Run
-
-Recommended GUI entry point:
-
-```powershell
 python main.py
-```
-
-Initial serial connection from CLI:
-
-```powershell
-python matrix_log_viewer/run_viewer.py --port COM5 --baud 921600 --auto-reconnect
-```
-
-Replay legacy MATV:
-
-```powershell
-python matrix_log_viewer/run_viewer.py --replay-file matrix_log_viewer/sample_logs/sample_matv.log --replay-speed 10
-```
-
-Replay FastSpeed mixed binary/text:
-
-```powershell
-python matrix_log_viewer/run_viewer.py --replay-file matrix_log_viewer/sample_logs/sample_fast_binary_mixed.bin --replay-speed 10
 ```
 
 Default URL:
@@ -57,97 +28,119 @@ Default URL:
 http://127.0.0.1:8050
 ```
 
-`--baud` defaults to `921600`. For ESP32-S3 USB Serial/JTAG or USB CDC this value is mainly a host API parameter; do not treat it as the physical UART throughput limit.
+Replay UpperSpeed samples:
+
+```powershell
+python matrix_log_viewer/generate_sample_fast_binary.py
+python matrix_log_viewer/run_viewer.py --replay-file matrix_log_viewer/sample_logs/sample_upper_speed_startup_then_binary.bin --replay-speed 10
+```
+
+## UpperSpeed FAST/BINARY Startup
+
+Startup may contain short ASCII diagnostics, including `RESET_REASON`, `APPMODE`, `BUILD_CONFIG`, `VOLTSCAN_CONFIG`, `STREAM_MEM`, `FAST_BINARY_DIAG`, `DBGROUTEPOLICY`, `DBGADSREFPOLICY`, `DBGTMUXPOLICY`, `ROUTE_POLICY`, and `ADS_POLICY`.
+
+`FAST_BINARY_DIAG` reports bottleneck and writer counters such as `scanFps`, `outFps`, `qUsed`, `qFull`, `drop`, `shortWrite`, `writeFail`, `outputDiv`, `droppedBeforeFirstByte`, `partialAfterFirstByte`, `fullFrameWriteCount`, and `fullFrameWriteFailCount`.
+
+The transition marker is:
+
+```text
+FAST_BINARY_START,magic=0x31434153,magicBytes=SAC1,version=1,frameType=0x1261,frameSize=312,pure=1
+```
+
+After this line stdout is pure binary. Do not use a text monitor or `readline()` to interpret the main stream after `FAST_BINARY_START`; the host must scan bytes for `SAC1` and validate CRC32.
+
+## Pure Binary Frame
+
+UpperSpeed compact frame:
+
+```text
+FMT = <IHHIQIIIIHHQ64iBBHI
+SIZE = 312
+magic bytes = SAC1
+magic uint32 = 0x31434153
+version = 1
+frameType = 0x1261
+frameTypeName = FAST_BINARY
+CRC32 = binascii.crc32(rawFrame[:308]) & 0xffffffff
+```
+
+Values are `int32 microvolts[64]` ordered `S1D1..S1D8,S2D1..S8D8`. `validMask` bit index is `sourceZeroBased * 8 + detectorZeroBased`; when a bit is `0`, the cell is stored/rendered as `NaN` and old values are not reused.
+
+The compact frame carries saturated 16-bit `droppedFrames` and `outputDecimatedFrames`. Full cumulative writer/drop counters are taken from `FAST_BINARY_DIAG`/startup status.
+
+## Parser Behavior
+
+The stream parser accepts `feed(data: bytes)` chunks from `serial.read(8192)`:
+
+- Startup state parses complete ASCII diagnostics with replacement decoding while also looking for `SAC1`.
+- `FAST_BINARY_START` validates `magicBytes=SAC1`, `version=1`, `frameType=0x1261`, and `frameSize=312`, then enters pure binary mode.
+- Pure binary mode only scans for `SAC1`, requires 312 bytes, checks CRC32 over the first 308 bytes, decodes little-endian fields, and resyncs after CRC/magic errors.
+- If ASCII such as `STAT`, `RATE_EVENT`, `MATV`, or CSV headers appears after `FAST_BINARY_START`, it is counted as `ASCII_AFTER_FAST_BINARY_START` protocol pollution, not as normal data.
+- Non-UTF-8 bytes cannot crash the parser.
+
+## Metrics
+
+The UI deliberately separates these sources:
+
+- `scanFps`: device scan rate.
+- `outFps`: device output rate.
+- `parsedFps`: host parser frame rate.
+- `storedFps`: host store/CSV frame rate.
+- `guiFps`: browser render rate.
+- `DEVICE_DROP`: device-side passive drop.
+- `DEVICE_DECIMATED`: active firmware output decimation.
+- `OUTPUT_DIV`: active output divisor.
+- `DROPPED_BEFORE_FIRST_BYTE`: whole compact frame dropped before writing any byte.
+- `PARTIAL_AFTER_FIRST_BYTE`: serious protocol risk; must stay zero.
+- `HOST_CRC`: host CRC failures.
+- `HOST_RESYNC`: host magic resyncs/skipped binary bytes.
+- `HOST_QUEUE_DROP`: Python input queue drops.
+- `RENDER_SKIPPED`: GUI skipped intermediate display frames; this is not data loss.
+
+If `partialAfterFirstByte > 0`, the GUI/CLI reports:
+
+```text
+PROTOCOL_RISK: firmware reported partialAfterFirstByte > 0
+```
+
+## GUI Performance
+
+Receive/parse/store runs independently from browser rendering. `MatrixDataStore` uses numpy ring buffers and live history callbacks do not build pandas DataFrames. Python publishes lightweight snapshots; `assets/plotly_live_update.js` updates Plotly with `restyle`, `extendTraces`, `relayout`, and requestAnimationFrame coalescing.
+
+Recommended high-rate settings:
+
+- Stream: `FAST_BINARY`
+- Render mode: `Performance`
+- GUI target fps: `60` or `30`
+- Markers: off
+- Advanced diagnostics: collapsed
+- Heatmap text: off or 10 Hz
+- History max points: 1000-1200
+
+`GUI render interval ms` affects display refresh only. It does not change device sampling, parser throughput, or dataStore/CSV retention.
 
 ## Binary Debug CLI
 
-Use this first when separating firmware/serial/parser problems from GUI rendering problems:
+Use this before blaming the GUI:
 
 ```powershell
 python matrix_log_viewer/read_matrix_binary.py --port COM5 --baud 921600 --print-matrix
 ```
 
-Useful options:
+Replay a capture/sample:
 
 ```powershell
-python matrix_log_viewer/read_matrix_binary.py --port COM5 --baud 921600 --duration 10 --save-csv output.csv --raw-dump output.bin
+python matrix_log_viewer/read_matrix_binary.py --input-file matrix_log_viewer/sample_logs/sample_upper_speed_crc_resync.bin
 ```
 
-The tool uses `serial.read()` on bytes, feeds the same `SensorArrayStreamParser` as the GUI, and reports binary fps, text fps, latest seq, seq gap, scan duration, device dropped counters, CRC errors, resync count, and buffered bytes.
-
-## FastSpeed Binary Protocol
-
-Current Python format:
-
-```text
-FMT = <IHHIQIIIIIQ64iBBHI
-SIZE = 312
-magic bytes = SAC1
-version = 1
-frameType = 0x1261
-frameTypeName = FAST_BINARY
-```
-
-CRC is IEEE CRC32 over `rawFrame[:SIZE-4]`. Values are signed int32 microvolts in `S1D1..S1D8,S2D1..S8D8` order. `validMask` bit `0` points are stored and rendered as `NaN`. The raw 312-byte frame is retained on each parsed `MatrixFrame` for debug/export paths.
-
-Text rows such as `STAT`, `EVENT`, `RATE_EVENT`, `RATE_FATAL`, `DBG`, `APPMODE`, `VOLTSCAN_INIT`, `VOLTSCAN_GAIN`, and `VOLTSCAN_FATAL` update status/event panels only. They do not create matrix frames unless they are legacy `MATV` rows.
-
-## Serial And Replay Read Strategy
-
-- Serial and replay readers read bytes chunks, not lines.
-- Default `readSize` is `8192` bytes and is configurable by CLI/GUI.
-- Serial timeout is short, about `0.05 s`, so disconnect/reconnect remains responsive.
-- Input queues are finite. If full, the reader drops the oldest chunk and records `droppedInputChunks` / `droppedInputBytes` instead of blocking the read thread.
-- Replay files are opened in `rb` mode and parsed by the same mixed stream parser as live serial input.
-
-## Mixed Stream Resync Strategy
-
-The stream parser searches for `b"SAC1"` before treating bytes as text:
-
-- If the buffer starts with `SAC1` and has at least `312` bytes, parse a binary frame first.
-- If the buffer starts with `SAC1` but is short, wait for more bytes.
-- If a complete text line appears before the next magic, parse it as text with replacement decoding.
-- If garbage appears before magic, skip to magic and count resync/skipped bytes.
-- On CRC failure, discard that candidate frame, count `binaryCrcErrors`, and resume scanning.
-- Non-UTF-8 text bytes cannot crash the parser.
-
-Parser stats include parsed binary/text frames, statuses/events, CRC errors, short frames, magic resyncs, skipped bytes/lines, parse errors, buffered bytes, last error/warning, and decoded status code name.
-
-## GUI Behavior
-
-- Stream dropdown defaults to `FAST_BINARY`.
-- If no `FAST_BINARY` data exists but `MATV` exists, the matrix and history fall back to `MATV` and show a fallback note.
-- Heatmap shows the latest 8x8 values and invalid cells as `NaN`/invalid.
-- Clicking a cell updates the selected `SxDy`; the right history graph continues drawing that cell.
-- Normal View is the default operator view: compact connection controls, stream/cell/window/unit/color controls, 8x8 heatmap, and selected-cell history.
-- Replay controls, baud/read size, auto reconnect, custom x ranges, fixed color ranges, parser counters, connection internals, and device status are under **Advanced / Diagnostics**.
-- History uses Plotly `Scattergl` in line mode by default. Markers are available in Advanced because they are expensive at high point counts.
-- Auto follow on: x-axis follows the latest selected window.
-- Auto follow off: `uirevision` keeps manual zoom/pan stable across refreshes.
-- Receive/parse/store run in a background ingest thread. Dash uses separate intervals for lightweight ingest revision publication, graph rendering, compact status, and diagnostics.
-- Graph rendering defaults to `50 ms` and is revision-gated: if no new frame or relevant control change arrived, graph callbacks return `no_update`.
-- Compact status updates at `500 ms`; Advanced diagnostics update at `1000 ms` and do not redraw while the details panel is closed.
-- Display downsampling applies only to the visible history window, not to raw in-memory storage or CSV export.
-
-## GUI Performance Acceptance
-
-Using `sample_fast_binary_mixed.bin` or a simulated 20 fps FastSpeed binary stream, Normal View should keep rendered GUI fps close to input fps, with a target of at least 15 fps on a typical lab laptop. The 30 s history window should scroll smoothly, switching cells should redraw history within one render tick, and expanding Advanced may reduce visual fps without slowing parsing/storage. The default first screen is intentionally dominated by the 8x8 heatmap and selected-cell history rather than parser/device debug fields.
-
-## Status Panels
-
-The UI separates:
-
-- Device side: `droppedFrames`, `outputDecimatedFrames` / `STAT decimated`, `statusFlags`, decoded status codes.
-- Host side: input queue drops, CRC errors, parser resyncs, parse errors.
-- Throughput: bytes/sec, parsed binary fps, parsed text fps, GUI displayed fps, latest seq, seq gap.
-- Display: rendered points and whether GUI history downsampling was applied.
+The CLI uses the same `SensorArrayStreamParser`, byte reads, optional raw dump, and optional wide CSV export. If the CLI is stable but the GUI is slow, the problem is rendering. If the CLI shows increasing `HOST_CRC`/`HOST_RESYNC`, investigate firmware config, flashing, USB path, captured bytes, or parser/frame format.
 
 ## Troubleshooting
 
-- Only `MATV` appears: firmware is still outputting legacy CSV.
-- `STREAM_INIT` appears but no `FAST_BINARY`: check that binary frames are emitted and CRC/size match `312`.
-- `binaryCrcErrors` increases: check struct format, frame size, mixed stream boundaries, and CRC calculation.
-- `read_matrix_binary.py` reaches 25-31 fps but GUI looks slower: Plotly/Dash rendering or history window is the bottleneck.
-- `read_matrix_binary.py` is also slow: firmware output rate, USB serial path, or parser resync/CRC errors are upstream bottlenecks.
-- Device `droppedFrames` increases: device-side output queue/stdout cannot keep up.
-- Host `droppedInputChunks` increases: Python host reading/parsing/storage cannot keep up with the incoming stream.
+- CLI fast, GUI slow: browser/Plotly/history rendering bottleneck.
+- CLI CRC/resync spikes: protocol, firmware image, host read, or parser mismatch.
+- `FAST_BINARY_START` followed by `STAT`/`MATV`: firmware config abnormal or stdout protocol pollution.
+- `partialAfterFirstByte > 0`: serious protocol risk; a compact frame was partially written.
+- `qFull`/`drop` increasing: firmware output queue cannot keep up.
+- `decimated`/`outputDiv` increasing: auto rate control is protecting output.
+- `RENDER_SKIPPED` increasing alone: GUI is dropping display refreshes, not stored data.

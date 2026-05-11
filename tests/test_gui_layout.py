@@ -40,6 +40,9 @@ def make_app():
 def stop_app(app) -> None:
     app._sensorarray_input_processor.stop()
     app._sensorarray_input_processor.join(timeout=1.0)
+    for cache in getattr(app, "_sensorarray_render_caches", ()):
+        cache.stop()
+        cache.join(timeout=1.0)
 
 
 def test_gui_layout_contains_compact_controls():

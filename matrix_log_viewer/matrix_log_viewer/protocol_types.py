@@ -18,8 +18,14 @@ class MatrixFrame:
     lastStatusCode: int | None = None
     droppedFrames: int | None = None
     outputDecimatedFrames: int | None = None
+    droppedFramesSaturated: int | None = None
+    outputDecimatedFramesSaturated: int | None = None
     adsDr: int | None = None
     outputDivider: int | None = None
+    frameTypeName: str | None = None
+    crc32Frame: int | None = None
+    crc32Computed: int | None = None
+    parserFrameSize: int | None = None
     rawLine: str | None = None
     rawBytes: bytes | None = None
 
@@ -29,6 +35,27 @@ class DeviceStatus:
     statusType: str
     fields: dict[str, str]
     rawLine: str
+    fastBinaryStartSeen: bool = False
+    fastBinaryStartMeta: dict[str, int | str | bool] | None = None
+    fastBinaryDiagLatest: dict[str, int | str | bool] | None = None
+    pureBinaryMode: bool = False
+    startupDiagWindowSeen: bool = False
+    asciiAfterFastBinaryStart: bool = False
+    protocolPollutionCount: int = 0
+    droppedBeforeFirstByte: int | None = None
+    partialAfterFirstByte: int | None = None
+    fullFrameWriteCount: int | None = None
+    fullFrameWriteFailCount: int | None = None
+    dropPolicy: str | None = None
+    usbExactBinaryWrite: bool | None = None
+    fastBinaryStartupDiagMs: int | None = None
+    latestScanFps: float | None = None
+    latestOutFps: float | None = None
+    latestOutputDiv: int | None = None
+    latestQUsed: int | None = None
+    latestQFull: int | None = None
+    latestDrop: int | None = None
+    latestDecimated: int | None = None
 
 
 @dataclass(frozen=True)

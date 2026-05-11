@@ -23,6 +23,7 @@ class ConnectionManager:
         self.inputQueue = inputQueue
         self.reader: SerialReaderThread | ReplayReaderThread | None = None
         self._lastSerialConfig: dict[str, Any] = {}
+        self._generation = 0
         self._status = {
             "mode": "disconnected",
             "serialPort": "",
@@ -39,6 +40,7 @@ class ConnectionManager:
             "reconnectAttempts": 0,
             "autoReconnect": False,
             "dependencyMissing": "",
+            "generation": 0,
         }
 
     def init(self, inputQueue: "queue.Queue[bytes]") -> None:
@@ -87,6 +89,7 @@ class ConnectionManager:
 
         with self._lock:
             self._stop_reader_locked()
+            self._generation += 1
             self._lastSerialConfig = {
                 "port": port,
                 "baud": baud,
@@ -109,6 +112,7 @@ class ConnectionManager:
                     "autoReconnect": bool(autoReconnect),
                     "readSize": read_size,
                     "lastError": "",
+                    "generation": self._generation,
                 }
             )
 
@@ -153,6 +157,7 @@ class ConnectionManager:
 
         with self._lock:
             self._stop_reader_locked()
+            self._generation += 1
             self.reader = ReplayReaderThread(replay_path, speed, self.inputQueue, chunkSize=read_size)
             self.reader.start()
             self._status.update(
@@ -165,6 +170,7 @@ class ConnectionManager:
                     "replaySpeed": speed,
                     "readSize": read_size,
                     "lastError": "",
+                    "generation": self._generation,
                 }
             )
 

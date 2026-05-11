@@ -53,6 +53,11 @@
   background: #fff7ed;
 }
 
+.status-chip.info {
+  border-color: #64748b;
+  background: #f8fafc;
+}
+
 .status-chip.error {
   border-color: #dc2626;
   background: #fef2f2;
@@ -96,7 +101,7 @@
 }
 
 .display-toolbar {
-  grid-template-columns: minmax(150px, 1fr) minmax(130px, 1fr) minmax(130px, 0.9fr) minmax(130px, 0.9fr) minmax(130px, 0.9fr) max-content;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   margin-top: 8px;
 }
 

@@ -30,6 +30,7 @@ from .config import (
 from .connection_manager import ConnectionManager
 from .data_store import CsvFrameWriter, MatrixDataStore
 from .protocol_parser import SensorArrayStreamParser
+from .render_cache import HeatmapRenderCacheThread, HistoryRenderCacheThread
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SELECTED_CELL = "S1D1"
@@ -229,13 +230,33 @@ def createDashApp(
     )
     input_processor.start()
     app._sensorarray_input_processor = input_processor
+    heatmap_cache = HeatmapRenderCacheThread(dataStore, targetFps=30)
+    history_cache = HistoryRenderCacheThread(dataStore, targetFps=30)
+    heatmap_cache.start()
+    history_cache.start()
+    app._sensorarray_heatmap_cache = heatmap_cache
+    app._sensorarray_history_cache = history_cache
+    app._sensorarray_render_caches = (heatmap_cache, history_cache)
 
     app.layout = _build_layout()
+
+    app.clientside_callback(
+        "function(heatmapSnapshot, historySnapshot, current) {"
+        " if (!window.SensorArrayLive || !window.SensorArrayLive.applySnapshots) {"
+        "   return current || {};"
+        " }"
+        " return window.SensorArrayLive.applySnapshots(heatmapSnapshot, historySnapshot, current || {});"
+        "}",
+        Output("frontend-fps-store", "data"),
+        Input("heatmap-snapshot-store", "data"),
+        Input("history-snapshot-store", "data"),
+        State("frontend-fps-store", "data"),
+    )
 
     @app.callback(Output("render-interval", "interval"), Input("interval-ms", "value"))
     def update_render_interval(interval_ms: Any) -> int:
         try:
-            return max(25, min(10_000, int(interval_ms)))
+            return max(16, min(10_000, int(interval_ms)))
         except (TypeError, ValueError):
             return DEFAULT_RENDER_INTERVAL_MS
 
@@ -257,10 +278,6 @@ def createDashApp(
         if not click_data:
             return current_cell or DEFAULT_SELECTED_CELL
         cell_name = _cell_name_from_click_data(click_data)
-        return cell_name if cell_name in CELL_NAMES else (current_cell or DEFAULT_SELECTED_CELL)
-
-    @app.callback(Output("selected-cell-store", "data"), Input("cell-dropdown", "value"), State("selected-cell-store", "data"))
-    def select_cell_from_dropdown(cell_name: str | None, current_cell: str | None) -> str:
         return cell_name if cell_name in CELL_NAMES else (current_cell or DEFAULT_SELECTED_CELL)
 
     @app.callback(
@@ -312,15 +329,21 @@ def createDashApp(
                 manager.disconnect()
                 return "Disconnected."
             if triggered == "reconnect-button":
+                parser.reset()
+                _clear_input_queue(inputQueue)
                 manager.reconnect()
                 return "Reconnect requested."
             if triggered == "start-replay-button":
+                parser.reset()
+                _clear_input_queue(inputQueue)
                 manager.startReplay(
                     str(replay_file or ""),
                     float(replay_speed or 1.0),
                     int(read_size or DEFAULT_SERIAL_READ_SIZE),
                 )
                 return "Replay started."
+            parser.reset()
+            _clear_input_queue(inputQueue)
             manager.connectSerial(
                 str(port or ""),
                 int(baud or DEFAULT_BAUD),
@@ -336,6 +359,8 @@ def createDashApp(
         if not n_clicks:
             return no_update
         dataStore.clear()
+        heatmap_cache.reset()
+        history_cache.reset()
         return f"History cleared at {_clock_text()}."
 
     @app.callback(Output("save-status", "children"), Input("save-button", "n_clicks"), State("frame-type-dropdown", "value"), prevent_initial_call=True)
@@ -411,206 +436,117 @@ def createDashApp(
         return bool(current)
 
     @app.callback(
-        Output("heatmap", "figure"),
-        Output("heatmap-render-state", "data"),
-        Input("render-interval", "n_intervals"),
-        Input("ingest-stats-store", "data"),
-        Input("paused-store", "data"),
-        Input("selected-cell-store", "data"),
-        Input("color-mode", "value"),
-        Input("fixed-min", "value"),
-        Input("fixed-max", "value"),
-        Input("unit-mode", "value"),
+        Output("render-control-store", "data"),
+        Input("cell-dropdown", "value"),
         Input("frame-type-dropdown", "value"),
-        State("heatmap-render-state", "data"),
-    )
-    def render_heatmap(
-        _n_intervals: int,
-        _ingest_stats: dict | None,
-        paused: bool,
-        selected_cell: str | None,
-        color_mode: str,
-        fixed_min: Any,
-        fixed_max: Any,
-        unit_mode: str,
-        frame_type: str | None,
-        previous_state: dict | None,
-    ) -> tuple[Any, Any]:
-        selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
-        selected_type = frame_type or "FAST_BINARY"
-        display_type = dataStore.resolveFrameType(selected_type)
-        latest_matrix_raw, latest_meta, revision = dataStore.getLatestMatrixAndMeta(selected_type)
-        display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
-        render_state = {
-            "revision": revision,
-            "selectedCell": selected_cell,
-            "frameType": selected_type,
-            "displayType": display_type,
-            "colorMode": color_mode,
-            "fixedMin": _safe_float(fixed_min),
-            "fixedMax": _safe_float(fixed_max),
-            "unitMode": unit_mode,
-            "displayUnit": display_unit,
-        }
-        data_trigger = ctx.triggered_id in ("render-interval", "ingest-stats-store")
-        if data_trigger and bool(paused):
-            runtime_state.recordRenderCompletion(False)
-            return no_update, no_update
-        if data_trigger and previous_state == render_state:
-            runtime_state.recordRenderCompletion(False)
-            return no_update, no_update
-
-        heatmap = _build_heatmap_figure(display_matrix, latest_meta, selected_cell, color_mode, fixed_min, fixed_max, display_unit, display_type)
-        runtime_state.recordDisplayFrame(latest_meta, bool(paused))
-        runtime_state.recordRenderCompletion(True)
-        return heatmap, render_state
-
-    @app.callback(
-        Output("history-graph", "figure"),
-        Output("history-graph", "extendData"),
-        Output("history-render-state", "data"),
-        Output("history-stats", "children"),
-        Input("render-interval", "n_intervals"),
-        Input("ingest-stats-store", "data"),
-        Input("paused-store", "data"),
-        Input("selected-cell-store", "data"),
         Input("unit-mode", "value"),
-        Input("frame-type-dropdown", "value"),
         Input("x-axis", "value"),
         Input("history-window", "value"),
         Input("last-n-points", "value"),
         Input("custom-x-min", "value"),
         Input("custom-x-max", "value"),
         Input("history-follow-store", "data"),
-        Input("show-markers", "value"),
-        State("history-render-state", "data"),
+        Input("render-mode", "value"),
+        Input("gui-target-fps", "value"),
+        Input("history-max-points", "value"),
     )
-    def render_history(
-        _n_intervals: int,
-        _ingest_stats: dict | None,
-        paused: bool,
+    def update_render_controls(
         selected_cell: str | None,
-        unit_mode: str,
         frame_type: str | None,
-        x_axis: str,
-        history_window: str,
+        unit_mode: str | None,
+        x_axis: str | None,
+        history_window: str | None,
         last_n: Any,
         custom_min: Any,
         custom_max: Any,
-        auto_follow: bool,
-        show_markers: list[str] | None,
-        previous_state: dict | None,
-    ) -> tuple[Any, Any, Any, Any]:
+        follow_latest: bool,
+        render_mode: str | None,
+        gui_target_fps: Any,
+        history_max_points: Any,
+    ) -> dict:
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
         selected_type = frame_type or "FAST_BINARY"
-        display_type = dataStore.resolveFrameType(selected_type)
-        x_values, raw_values, history_meta = dataStore.getCellHistoryArrays(
-            selected_type,
-            selected_cell,
-            xAxis=x_axis,
-            windowMode=history_window,
-            lastN=_safe_int(last_n),
-            customMin=_safe_float(custom_min),
-            customMax=_safe_float(custom_max),
+        target_fps = _target_fps(render_mode, gui_target_fps)
+        max_points = _history_points_limit(history_max_points, render_mode)
+        heatmap_cache.updateControls(stream=selected_type, selectedCell=selected_cell, targetFps=target_fps)
+        history_cache.updateControls(
+            stream=selected_type,
+            selectedCell=selected_cell,
+            xAxis=x_axis or "timeSeconds",
+            unitMode=unit_mode or "auto",
+            historyWindow=history_window or "last_30s",
+            lastN=_safe_int(last_n) or 1000,
+            customXMin=_safe_float(custom_min),
+            customXMax=_safe_float(custom_max),
+            followLatest=bool(follow_latest),
+            targetFps=target_fps,
+            maxPoints=max_points,
         )
-        marker_enabled = "enabled" in (show_markers or [])
-        rendered_indices, downsampled = MatrixDataStore.downsampleHistoryArrays(x_values, raw_values, DISPLAY_DOWNSAMPLE_TARGET_POINTS)
-        x_rendered = x_values[rendered_indices]
-        raw_rendered = raw_values[rendered_indices]
-        rendered_units = history_meta["unit"][rendered_indices] if rendered_indices.size else np.array([], dtype=object)
-        y_rendered, unit_label, mixed_units, converted = _convert_history_arrays_for_display(raw_rendered, rendered_units, unit_mode)
-        revision = int(history_meta.get("revision") or 0)
-        last_seq = _last_finite(history_meta.get("seq"))
-        control_state = {
+        return {
             "selectedCell": selected_cell,
-            "frameType": selected_type,
-            "displayType": display_type,
-            "xAxis": history_meta.get("xColumn") or x_axis,
-            "unitMode": unit_mode,
-            "unitLabel": unit_label,
-            "historyWindow": history_window,
-            "lastN": _safe_int(last_n),
-            "customMin": _safe_float(custom_min),
-            "customMax": _safe_float(custom_max),
-            "autoFollow": bool(auto_follow),
-            "markers": marker_enabled,
+            "stream": selected_type,
+            "targetFps": target_fps,
+            "maxPoints": max_points,
+            "unitMode": unit_mode or "auto",
+            "xAxis": x_axis or "timeSeconds",
+            "historyWindow": history_window or "last_30s",
+            "followLatest": bool(follow_latest),
         }
-        render_state = {
-            **control_state,
-            "revision": revision,
-            "lastSeqRendered": last_seq,
-            "visibleRawPoints": int(history_meta.get("visiblePointCount") or 0),
-            "renderedPoints": int(len(x_rendered)),
-            "downsampled": bool(downsampled),
-        }
-        data_trigger = ctx.triggered_id in ("render-interval", "ingest-stats-store")
-        if data_trigger and bool(paused):
-            return no_update, no_update, no_update, no_update
-        if data_trigger and previous_state == render_state:
-            return no_update, no_update, no_update, no_update
 
-        previous_controls = {key: previous_state.get(key) for key in control_state} if isinstance(previous_state, dict) else {}
-        can_extend = (
-            data_trigger
-            and isinstance(previous_state, dict)
-            and previous_controls == control_state
-            and history_window in {"last_10s", "last_30s", "last_60s", "last_5min"}
-            and not marker_enabled
-            and previous_state.get("revision", 0) < revision
-            and previous_state.get("lastSeqRendered") is not None
-            and last_seq is not None
-            and unit_label == previous_state.get("unitLabel")
-            and not downsampled
-        )
-        if can_extend:
-            seq_values = history_meta.get("seq")
-            new_mask = np.isfinite(seq_values) & (seq_values > float(previous_state["lastSeqRendered"]))
-            if np.any(new_mask):
-                new_x = x_values[new_mask]
-                new_raw = raw_values[new_mask]
-                new_units = history_meta["unit"][new_mask]
-                new_y, new_unit_label, _mixed, _converted = _convert_history_arrays_for_display(new_raw, new_units, unit_mode)
-                if new_unit_label == unit_label:
-                    extend_data = (
-                        {"x": [new_x.tolist()], "y": [new_y.tolist()], "customdata": [_history_customdata(history_meta, new_mask)]},
-                        [0],
-                        _history_max_points(history_window, runtime_state.getStats(), display_type),
-                    )
-                    history_stats = _history_stats_text(display_type, selected_type, selected_cell, history_meta, len(x_values), len(x_values), False, bool(auto_follow), runtime_state.getStats())
-                    return no_update, extend_data, render_state, history_stats
+    @app.callback(
+        Output("heatmap-snapshot-store", "data"),
+        Input("render-interval", "n_intervals"),
+        Input("render-control-store", "data"),
+        Input("paused-store", "data"),
+        State("heatmap-snapshot-store", "data"),
+    )
+    def publish_heatmap_snapshot(_n_intervals: int, _control_state: dict | None, paused: bool, previous: dict | None) -> Any:
+        if paused:
+            runtime_state.recordRenderCompletion(False)
+            return no_update
+        snapshot = heatmap_cache.getLatest()
+        if not snapshot:
+            return no_update
+        if previous and previous.get("cacheRevision") == snapshot.get("cacheRevision"):
+            runtime_state.recordRenderCompletion(False)
+            return no_update
+        runtime_state.recordRenderCompletion(True)
+        return snapshot
 
-        history = _build_history_arrays_figure(
-            cell_name=selected_cell,
-            frame_type=display_type,
-            x_values=x_rendered,
-            y_values=y_rendered,
-            raw_values=raw_rendered,
-            unit_values=rendered_units,
-            seq_values=history_meta["seq"][rendered_indices] if rendered_indices.size else np.array([], dtype=float),
-            timestamp_values=history_meta["timestampUs"][rendered_indices] if rendered_indices.size else np.array([], dtype=float),
-            x_column=history_meta.get("xColumn") or x_axis,
-            unit_label=unit_label,
-            mixed_units=mixed_units,
-            converted=converted,
-            auto_follow=bool(auto_follow),
-            window_mode=history_window,
-            last_n=_safe_int(last_n),
-            custom_min=_safe_float(custom_min),
-            custom_max=_safe_float(custom_max),
-            show_markers=marker_enabled,
-            raw_x_values=x_values,
+    @app.callback(
+        Output("history-snapshot-store", "data"),
+        Output("history-stats", "children"),
+        Input("render-interval", "n_intervals"),
+        Input("render-control-store", "data"),
+        Input("paused-store", "data"),
+        State("history-snapshot-store", "data"),
+    )
+    def publish_history_snapshot(_n_intervals: int, control_state: dict | None, paused: bool, previous: dict | None) -> tuple[Any, Any]:
+        if paused:
+            return no_update, no_update
+        snapshot = history_cache.getLatest()
+        if not snapshot:
+            return no_update, no_update
+        if previous and previous.get("cacheRevision") == snapshot.get("cacheRevision"):
+            return no_update, no_update
+        stats = runtime_state.getStats()
+        text = (
+            f"stream: {snapshot.get('stream')} | cell: {snapshot.get('selectedCell')} | "
+            f"x: {snapshot.get('xAxis', control_state.get('xAxis') if control_state else 'timeSeconds')} | "
+            f"points: {len(snapshot.get('x') or [])} | reset: {'yes' if snapshot.get('reset') else 'no'} | "
+            f"input fps: {stats.get('parsedBinaryFps', 0.0):.1f}"
         )
-        history_stats = _history_stats_text(display_type, selected_type, selected_cell, history_meta, len(x_values), len(x_rendered), downsampled, bool(auto_follow), runtime_state.getStats())
-        return history, no_update, render_state, history_stats
+        return snapshot, text
 
     @app.callback(
         Output("status-bar", "children"),
         Output("warning-state-store", "data"),
         Input("status-interval", "n_intervals"),
         Input("paused-store", "data"),
-        Input("selected-cell-store", "data"),
+        Input("cell-dropdown", "value"),
         Input("unit-mode", "value"),
         Input("frame-type-dropdown", "value"),
+        State("frontend-fps-store", "data"),
         State("warning-state-store", "data"),
     )
     def update_compact_status(
@@ -619,6 +555,7 @@ def createDashApp(
         selected_cell: str | None,
         unit_mode: str,
         frame_type: str | None,
+        frontend_stats: dict | None,
         previous_warning_state: dict | None,
     ) -> tuple[list, dict]:
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
@@ -629,6 +566,8 @@ def createDashApp(
         parser_stats = parser.getStats()
         connection_status = manager.getStatus()
         runtime_stats = runtime_state.getStats()
+        runtime_stats.update(_render_runtime_stats(heatmap_cache, history_cache, frontend_stats or {}))
+        runtime_stats["deviceSummary"] = dataStore.getLatestDeviceStatus().get("summary", {})
         warning_badge, next_warning_state = _warning_badge(parser_stats, connection_status, runtime_stats, latest_meta, previous_warning_state or {})
         status = _build_compact_status_bar(
             meta=latest_meta,
@@ -673,9 +612,12 @@ def createDashApp(
 def _build_layout() -> html.Div:
     return html.Div(
         [
-            dcc.Store(id="selected-cell-store", data=DEFAULT_SELECTED_CELL),
             dcc.Store(id="paused-store", data=False),
             dcc.Store(id="ingest-stats-store", data={}),
+            dcc.Store(id="render-control-store", data={}),
+            dcc.Store(id="heatmap-snapshot-store", data={}),
+            dcc.Store(id="history-snapshot-store", data={}),
+            dcc.Store(id="frontend-fps-store", data={}),
             dcc.Store(id="heatmap-render-state", data={}),
             dcc.Store(id="history-render-state", data={}),
             dcc.Store(id="history-follow-store", data=True),
@@ -718,6 +660,15 @@ def _build_layout() -> html.Div:
                                 {"label": "V", "value": "V"},
                             ])),
                             _control("Color scale", dcc.Dropdown(id="color-mode", value="auto", clearable=False, options=_color_mode_options(False))),
+                            _control("Render mode", dcc.Dropdown(id="render-mode", value="Normal", clearable=False, options=[
+                                {"label": "Normal", "value": "Normal"},
+                                {"label": "Performance", "value": "Performance"},
+                                {"label": "Quality", "value": "Quality"},
+                            ])),
+                            _control("GUI target fps", dcc.Dropdown(id="gui-target-fps", value=30, clearable=False, options=[
+                                {"label": "30", "value": 30},
+                                {"label": "60", "value": 60},
+                            ])),
                             html.Button("Follow Latest", id="follow-latest-button", n_clicks=0, className="button secondary"),
                         ],
                         className="toolbar display-toolbar",
@@ -804,7 +755,19 @@ def _build_layout() -> html.Div:
                                             _control("Custom x max", dcc.Input(id="custom-x-max", type="number", debounce=True, className="input")),
                                             _control("Fixed min", dcc.Input(id="fixed-min", type="number", debounce=True, className="input")),
                                             _control("Fixed max", dcc.Input(id="fixed-max", type="number", debounce=True, className="input")),
-                                            _control("Refresh ms", dcc.Input(id="interval-ms", type="number", value=DEFAULT_RENDER_INTERVAL_MS, min=25, step=25, debounce=True, className="input")),
+                                            _control("GUI render interval ms", dcc.Input(id="interval-ms", type="number", value=DEFAULT_RENDER_INTERVAL_MS, min=16, step=1, debounce=True, className="input")),
+                                            _control("History max points", dcc.Dropdown(id="history-max-points", value="Auto", clearable=False, options=[
+                                                {"label": "Auto", "value": "Auto"},
+                                                {"label": "1000", "value": "1000"},
+                                                {"label": "1200", "value": "1200"},
+                                                {"label": "5000", "value": "5000"},
+                                            ])),
+                                            _control("Heatmap text refresh", dcc.Dropdown(id="heatmap-text-refresh", value="10Hz", clearable=False, options=[
+                                                {"label": "Off", "value": "Off"},
+                                                {"label": "5Hz", "value": "5Hz"},
+                                                {"label": "10Hz", "value": "10Hz"},
+                                                {"label": "30Hz", "value": "30Hz"},
+                                            ])),
                                             _control("Auto follow latest", dcc.Checklist(id="auto-follow", value=["enabled"], options=[{"label": "Enabled", "value": "enabled"}], className="checklist")),
                                             _control("History markers", dcc.Checklist(id="show-markers", value=[], options=[{"label": "Show markers", "value": "enabled"}], className="checklist")),
                                         ],
@@ -1283,13 +1246,33 @@ def _build_compact_status_bar(
     status_code = f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}"
     if status_code.startswith("-"):
         status_code = "OK"
+    device = runtime_stats.get("deviceSummary") or {}
+    device_drop = _first_non_empty(device.get("latestDrop"), meta.get("droppedFrames"), 0)
+    device_decimated = _first_non_empty(device.get("latestDecimated"), meta.get("outputDecimatedFrames"), 0)
+    output_div = _first_non_empty(device.get("latestOutputDiv"), meta.get("outputDivider"), "-")
+    partial = int(device.get("partialAfterFirstByte") or 0)
+    pollution = int(parser_stats.get("protocolPollutionCount") or 0)
     return [
         _status_chip("connection", f"{_connection_label(connection_status, paused)} {port}".strip(), "ok" if connection_status.get("serialConnected") or connection_status.get("mode") == "replay" else ""),
         _status_chip("stream", display_type or "-"),
         _status_chip("selected", f"{selected_cell} {selected_value}".strip()),
         _status_chip("seq", _dash_if_none(meta.get("seq"))),
-        _status_chip("input fps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
-        _status_chip("gui fps", f"{runtime_stats.get('renderedFrameFps', 0.0):.1f}"),
+        _status_chip("scanFps", _fmt_rate(device.get("latestScanFps"))),
+        _status_chip("outFps", _fmt_rate(device.get("latestOutFps"))),
+        _status_chip("parsedFps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
+        _status_chip("storedFps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
+        _status_chip("GUI heatmap fps", f"{runtime_stats.get('guiHeatmapFps', 0.0):.1f}"),
+        _status_chip("GUI history fps", f"{runtime_stats.get('guiHistoryFps', 0.0):.1f}"),
+        _status_chip("DEVICE_DROP", device_drop, "error" if int(device_drop or 0) > 0 else ""),
+        _status_chip("DEVICE_DECIMATED", device_decimated, "warn" if int(device_decimated or 0) > 0 else ""),
+        _status_chip("OUTPUT_DIV", output_div, "warn" if _safe_int(output_div) and int(output_div) > 1 else ""),
+        _status_chip("DROPPED_BEFORE_FIRST_BYTE", device.get("droppedBeforeFirstByte", 0), "warn" if int(device.get("droppedBeforeFirstByte") or 0) else ""),
+        _status_chip("PARTIAL_AFTER_FIRST_BYTE", partial, "error" if partial > 0 else ""),
+        _status_chip("HOST_CRC", parser_stats.get("binaryCrcErrors", 0), "warn" if parser_stats.get("binaryCrcErrors", 0) else ""),
+        _status_chip("HOST_RESYNC", parser_stats.get("binaryMagicResyncs", 0), "warn" if parser_stats.get("binaryMagicResyncs", 0) else ""),
+        _status_chip("HOST_QUEUE_DROP", connection_status.get("droppedInputChunks", 0), "warn" if connection_status.get("droppedInputChunks", 0) else ""),
+        _status_chip("RENDER_SKIPPED", runtime_stats.get("renderSkipped", 0), "info" if runtime_stats.get("renderSkipped", 0) else ""),
+        _status_chip("ASCII_AFTER_FAST_BINARY_START", pollution, "error" if pollution else ""),
         _status_chip("status", status_code, "warn" if bool(meta.get("lastStatusCode")) else "ok"),
         warning_badge,
     ]
@@ -1560,7 +1543,7 @@ def _choose_auto_voltage_unit(values_uv: np.ndarray) -> str:
 
 
 def _normalize_unit(unit: Any) -> str:
-    return str(unit or "").strip().replace("碌", "u").replace("渭", "u").lower()
+    return str(unit or "").strip().replace("\u00b5", "u").replace("\u03bc", "u").lower()
 
 
 def _format_value(value: float, unit: str = "") -> str:
@@ -1651,6 +1634,14 @@ def _safe_qsize(input_queue: "queue.Queue[bytes]") -> int | str:
         return "-"
 
 
+def _clear_input_queue(input_queue: "queue.Queue[bytes]") -> None:
+    while True:
+        try:
+            input_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
 def _safe_int(value: Any) -> int | None:
     try:
         return int(value)
@@ -1664,6 +1655,42 @@ def _safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _target_fps(render_mode: str | None, gui_target_fps: Any) -> int:
+    explicit = _safe_int(gui_target_fps)
+    if explicit in (30, 60):
+        return explicit
+    if render_mode == "Performance":
+        return 60
+    return 30
+
+
+def _history_points_limit(value: Any, render_mode: str | None) -> int:
+    if str(value or "").lower() == "auto":
+        return 5000 if render_mode == "Quality" else 1200
+    parsed = _safe_int(value)
+    return max(100, parsed or 1200)
+
+
+def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache: HistoryRenderCacheThread, frontend_stats: dict) -> dict:
+    heatmap_stats = heatmap_cache.getStats()
+    history_stats = history_cache.getStats()
+    heatmap_fps = float(frontend_stats.get("heatmapActualFps") or heatmap_stats.get("actualFps") or 0.0)
+    history_fps = float(frontend_stats.get("historyActualFps") or history_stats.get("actualFps") or 0.0)
+    render_skipped = int(frontend_stats.get("frontendRenderSkipped") or 0) + int(heatmap_stats.get("renderSkipped") or 0) + int(history_stats.get("renderSkipped") or 0)
+    return {
+        "guiHeatmapFps": heatmap_fps,
+        "guiHistoryFps": history_fps,
+        "renderSkipped": render_skipped,
+    }
+
+
+def _fmt_rate(value: Any) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def _format_wall_time(timestamp: float | None) -> str:

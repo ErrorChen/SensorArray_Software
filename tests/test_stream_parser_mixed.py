@@ -19,6 +19,7 @@ def build_binary_frame(seq: int) -> bytes:
         0,
         0,
         0,
+        0,
         (1 << 64) - 1,
         *list(range(64)),
         15,
@@ -34,7 +35,7 @@ def build_binary_frame(seq: int) -> bytes:
 def test_appmode_binary_stat_binary_mixed_stream():
     parser = SensorArrayStreamParser()
     data = (
-        b"APPMODE,mode=FastSpeed\n"
+        b"APPMODE,mode=UpperSpeed\n"
         + build_binary_frame(1)
         + b"STAT,fps=30.0,pps=1920,scanAvgUs=31000,drop=0,decimated=0,code=0x0000\n"
         + build_binary_frame(2)

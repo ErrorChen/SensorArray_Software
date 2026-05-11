@@ -25,7 +25,7 @@ from matrix_log_viewer.protocol_parser import SensorArrayStreamParser
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SensorArray FastSpeed/MATV 8x8 matrix viewer")
+    parser = argparse.ArgumentParser(description="SensorArray UpperSpeed FAST_BINARY/MATV 8x8 matrix viewer")
     parser.add_argument("--port", help="Initial serial COM/device path, for example COM5 or /dev/ttyUSB0")
     parser.add_argument(
         "--baud",

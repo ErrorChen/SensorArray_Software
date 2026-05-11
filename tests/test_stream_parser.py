@@ -19,6 +19,7 @@ def build_binary_frame(seq: int) -> bytes:
         0,
         0,
         0,
+        0,
         (1 << 64) - 1,
         *list(range(64)),
         15,
