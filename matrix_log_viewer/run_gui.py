@@ -32,7 +32,7 @@ class ViewerLauncher(tk.Tk):
         self.baud = tk.StringVar(value="921600")
         self.read_size = tk.StringVar(value="8192")
         self.auto_reconnect = tk.BooleanVar(value=False)
-        self.max_points = tk.StringVar(value="5000")
+        self.max_points = tk.StringVar(value="200000")
         self.save_csv = tk.StringVar(value="")
         self.replay_file = tk.StringVar(value="")
         self.replay_speed = tk.StringVar(value="10")

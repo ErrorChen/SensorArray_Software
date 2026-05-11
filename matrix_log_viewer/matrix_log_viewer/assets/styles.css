@@ -172,6 +172,69 @@
   font-size: 12px;
 }
 
+.key-metrics-shell {
+  margin-top: 10px;
+}
+
+.key-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+}
+
+.metric-card {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  background: white;
+}
+
+.metric-card-title {
+  margin: 0 0 6px;
+  color: #17202a;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.metric-rows {
+  display: grid;
+  gap: 3px;
+}
+
+.metric-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: baseline;
+  min-height: 19px;
+}
+
+.metric-row.warn .metric-value {
+  color: #b45309;
+}
+
+.metric-label {
+  min-width: 0;
+  color: #52606d;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metric-value {
+  max-width: 140px;
+  color: #17202a;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .main-grid {
   display: grid;
   grid-template-columns: minmax(360px, 0.85fr) minmax(480px, 1.15fr);
@@ -227,6 +290,56 @@
   font-size: 16px;
   font-weight: 700;
   letter-spacing: 0;
+}
+
+.kv-panel {
+  min-width: 0;
+}
+
+.kv-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.kv-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.kv-table th {
+  padding: 6px;
+  border-bottom: 1px solid #d9e2ec;
+  color: #334e68;
+  text-align: left;
+}
+
+.kv-table td {
+  padding: 6px;
+  border-bottom: 1px solid #eef2f5;
+  vertical-align: top;
+}
+
+.kv-table tr.warn td {
+  background: #fff7ed;
+}
+
+.kv-metric {
+  color: #52606d;
+}
+
+.kv-value {
+  color: #17202a;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.diagnostic-message {
+  margin-top: 10px;
+  color: #334e68;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 
 @media (max-width: 1100px) {

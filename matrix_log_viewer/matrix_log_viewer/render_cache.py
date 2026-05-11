@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import CELL_NAMES
+from .config import CELL_NAMES, DEFAULT_RENDER_TARGET_FPS, MATRIX_SIZE
 from .data_store import MatrixDataStore
 
 VOLTAGE_FACTORS_TO_UV = {"uV": 1.0, "mV": 1_000.0, "V": 1_000_000.0}
@@ -26,13 +26,14 @@ class HistoryKey:
     customXMax: float | None
     followLatest: bool
     maxPoints: int
+    showMarkers: bool
 
     def as_string(self) -> str:
         return "|".join(str(value) for value in self.__dict__.values())
 
 
 class HeatmapRenderCacheThread(threading.Thread):
-    def __init__(self, dataStore: MatrixDataStore, targetFps: int = 30):
+    def __init__(self, dataStore: MatrixDataStore, targetFps: int = DEFAULT_RENDER_TARGET_FPS):
         super().__init__(name="SensorArrayHeatmapRenderCache", daemon=True)
         self.dataStore = dataStore
         self._lock = threading.RLock()
@@ -40,6 +41,10 @@ class HeatmapRenderCacheThread(threading.Thread):
         self.targetFps = int(targetFps)
         self.stream = "FAST_BINARY"
         self.selectedCell = "S1D1"
+        self.unitMode = "auto"
+        self.colorMode = "auto"
+        self.fixedMin: float | None = None
+        self.fixedMax: float | None = None
         self.latestHeatmapSnapshot: dict | None = None
         self._cacheRevision = 0
         self._lastDataRevision: int | None = None
@@ -49,7 +54,16 @@ class HeatmapRenderCacheThread(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    def updateControls(self, stream: str | None = None, selectedCell: str | None = None, targetFps: int | None = None) -> None:
+    def updateControls(
+        self,
+        stream: str | None = None,
+        selectedCell: str | None = None,
+        targetFps: int | None = None,
+        unitMode: str | None = None,
+        colorMode: str | None = None,
+        fixedMin: float | None = None,
+        fixedMax: float | None = None,
+    ) -> None:
         with self._lock:
             if stream:
                 self.stream = stream
@@ -57,6 +71,12 @@ class HeatmapRenderCacheThread(threading.Thread):
                 self.selectedCell = str(selectedCell)
             if targetFps:
                 self.targetFps = max(1, int(targetFps))
+            if unitMode is not None:
+                self.unitMode = str(unitMode or "auto")
+            if colorMode is not None:
+                self.colorMode = str(colorMode or "auto")
+            self.fixedMin = _finite_or_none(fixedMin)
+            self.fixedMax = _finite_or_none(fixedMax)
             self._cacheRevision += 1
             self.latestHeatmapSnapshot = self._build_snapshot_locked(force=True)
 
@@ -95,7 +115,20 @@ class HeatmapRenderCacheThread(threading.Thread):
             self.renderSkipped += data_revision - self._lastDataRevision - 1
         self._lastDataRevision = data_revision
         self._cacheRevision += 1
-        matrix = np.asarray(snapshot.get("matrixUv"), dtype=float)
+        matrix_uv = np.asarray(snapshot.get("matrixUv"), dtype=float)
+        display_unit = _resolve_display_unit(matrix_uv, self.unitMode)
+        matrix_display = _convert_uv(matrix_uv, display_unit)
+        zmin, zmax = _resolve_color_range(matrix_display, self.colorMode, self.fixedMin, self.fixedMax)
+        zauto = zmin is None or zmax is None
+        text = _build_heatmap_text(matrix_display, display_unit)
+        customdata = _build_heatmap_customdata(
+            matrix_uv=matrix_uv,
+            matrix_display=matrix_display,
+            display_unit=display_unit,
+            seq=snapshot.get("seq"),
+            status_code=snapshot.get("lastStatusCode"),
+            status_name=snapshot.get("lastStatusCodeName"),
+        )
         return {
             "kind": "heatmap",
             "cacheRevision": self._cacheRevision,
@@ -105,17 +138,28 @@ class HeatmapRenderCacheThread(threading.Thread):
             "timestampUs": snapshot.get("timestampUs"),
             "timeSeconds": snapshot.get("timeSeconds"),
             "durationUs": snapshot.get("durationUs"),
-            "matrixUv": _json_matrix(matrix),
+            "matrixUv": _json_matrix(matrix_uv),
+            "matrixDisplay": _json_matrix(matrix_display),
+            "displayUnit": display_unit,
+            "text": text,
+            "customdata": customdata,
+            "colorbarTitle": display_unit,
+            "colorbarTickFormat": _colorbar_tick_format(display_unit),
+            "zmin": zmin,
+            "zmax": zmax,
+            "zauto": zauto,
             "validMask": snapshot.get("validMask"),
             "selectedCell": self.selectedCell,
             "statusFlags": snapshot.get("statusFlags"),
             "firstStatusCode": snapshot.get("firstStatusCode"),
+            "firstStatusCodeName": snapshot.get("firstStatusCodeName"),
             "lastStatusCode": snapshot.get("lastStatusCode"),
+            "lastStatusCodeName": snapshot.get("lastStatusCodeName"),
         }
 
 
 class HistoryRenderCacheThread(threading.Thread):
-    def __init__(self, dataStore: MatrixDataStore, targetFps: int = 30, appendLimit: int = 256):
+    def __init__(self, dataStore: MatrixDataStore, targetFps: int = DEFAULT_RENDER_TARGET_FPS, appendLimit: int = 256):
         super().__init__(name="SensorArrayHistoryRenderCache", daemon=True)
         self.dataStore = dataStore
         self._lock = threading.RLock()
@@ -132,6 +176,7 @@ class HistoryRenderCacheThread(threading.Thread):
         self.customXMax: float | None = None
         self.followLatest = True
         self.maxPoints = 1200
+        self.showMarkers = False
         self.latestHistorySnapshot: dict | None = None
         self._currentKey: HistoryKey | None = None
         self._lastSeq: int | None = None
@@ -205,6 +250,7 @@ class HistoryRenderCacheThread(threading.Thread):
             self.customXMax,
             bool(self.followLatest),
             int(self.maxPoints),
+            bool(self.showMarkers),
         )
         key_changed = key != self._currentKey
         if force_reset or key_changed or self._lastSeq is None:
@@ -228,6 +274,7 @@ class HistoryRenderCacheThread(threading.Thread):
                 self.customXMax,
                 bool(self.followLatest),
                 int(self.maxPoints),
+                bool(self.showMarkers),
             )
             selected, _downsampled = MatrixDataStore.downsampleHistoryArrays(x_full, y_full, self.maxPoints)
             self._currentKey = key
@@ -247,6 +294,7 @@ class HistoryRenderCacheThread(threading.Thread):
                 "y": _json_array(_convert_uv(y_full[selected], resolved_unit)),
                 "lastSeq": self._lastSeq,
                 "maxPoints": self.maxPoints,
+                "showMarkers": bool(self.showMarkers),
                 "revision": int(meta_full.get("revision") or 0),
                 "followLatest": bool(self.followLatest),
             }
@@ -271,6 +319,7 @@ class HistoryRenderCacheThread(threading.Thread):
             "y": _json_array(_convert_uv(y_uv, key.resolvedUnit)),
             "lastSeq": self._lastSeq,
             "maxPoints": self.maxPoints,
+            "showMarkers": bool(self.showMarkers),
             "revision": int(meta.get("revision") or 0),
             "followLatest": bool(self.followLatest),
         }
@@ -291,8 +340,136 @@ class DiagnosticsCache(StatusCache):
     pass
 
 
+def _resolve_display_unit(matrix_uv: np.ndarray, unit_mode: str) -> str:
+    requested = CANONICAL_UNITS.get(str(unit_mode or "auto").strip().lower())
+    if requested in VOLTAGE_FACTORS_TO_UV:
+        return requested
+    return _resolve_unit(matrix_uv, "auto")
+
+
+def _build_heatmap_text(matrix_display: np.ndarray, unit: str) -> list[list[str]]:
+    text: list[list[str]] = []
+    matrix = np.asarray(matrix_display, dtype=float)
+    for source_index in range(MATRIX_SIZE):
+        row: list[str] = []
+        for detector_index in range(MATRIX_SIZE):
+            cell = f"S{source_index + 1}D{detector_index + 1}"
+            value = matrix[source_index, detector_index]
+            if math.isfinite(float(value)):
+                row.append(f"{cell}<br>{_format_display_value(float(value), unit)}")
+            else:
+                row.append(f"{cell}<br>invalid")
+        text.append(row)
+    return text
+
+
+def _build_heatmap_customdata(
+    matrix_uv: np.ndarray,
+    matrix_display: np.ndarray,
+    display_unit: str,
+    seq: Any,
+    status_code: Any,
+    status_name: Any,
+) -> list[list[list[Any]]]:
+    matrix_uv = np.asarray(matrix_uv, dtype=float)
+    matrix_display = np.asarray(matrix_display, dtype=float)
+    status_text = _format_hex(status_code, 4)
+    customdata: list[list[list[Any]]] = []
+    for source_index in range(MATRIX_SIZE):
+        row: list[list[Any]] = []
+        for detector_index in range(MATRIX_SIZE):
+            cell = f"S{source_index + 1}D{detector_index + 1}"
+            raw_uv = float(matrix_uv[source_index, detector_index])
+            display_value = float(matrix_display[source_index, detector_index])
+            valid = math.isfinite(raw_uv) and math.isfinite(display_value)
+            row.append(
+                [
+                    cell,
+                    "valid" if valid else "invalid",
+                    _format_display_number(display_value, display_unit) if valid else "invalid",
+                    display_unit,
+                    seq if seq is not None else "-",
+                    raw_uv if valid else None,
+                    status_text,
+                    status_name or "-",
+                ]
+            )
+        customdata.append(row)
+    return customdata
+
+
+def _resolve_color_range(matrix_display: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
+    matrix = np.asarray(matrix_display, dtype=float)
+    finite_values = matrix[np.isfinite(matrix)]
+    if str(color_mode or "auto") == "symmetric" and finite_values.size:
+        max_abs = float(np.max(np.abs(finite_values)))
+        if max_abs > 0:
+            return -max_abs, max_abs
+    if str(color_mode or "auto") == "fixed":
+        zmin = _finite_or_none(fixed_min)
+        zmax = _finite_or_none(fixed_max)
+        if zmin is not None and zmax is not None and zmin < zmax:
+            return zmin, zmax
+    return None, None
+
+
+def _format_display_value(value: float, unit: str) -> str:
+    if not math.isfinite(float(value)):
+        return "invalid"
+    return f"{_format_display_number(float(value), unit)} {unit}".strip()
+
+
+def _format_display_number(value: float, unit: str) -> str:
+    if not math.isfinite(float(value)):
+        return "invalid"
+    abs_value = abs(float(value))
+    if unit == "uV":
+        if abs_value < 10:
+            return _strip_trailing_zeros(f"{float(value):,.2f}")
+        if abs_value < 1_000:
+            return _strip_trailing_zeros(f"{float(value):,.1f}")
+        if math.isclose(float(value), round(float(value)), rel_tol=0.0, abs_tol=1e-9):
+            return f"{int(round(float(value))):,}"
+        return _strip_trailing_zeros(f"{float(value):,.1f}")
+    if unit == "mV":
+        if abs_value >= 100:
+            return _strip_trailing_zeros(f"{float(value):,.1f}")
+        if abs_value >= 10:
+            return _strip_trailing_zeros(f"{float(value):,.2f}")
+        return _strip_trailing_zeros(f"{float(value):,.3f}")
+    if unit == "V":
+        if abs_value >= 10:
+            return _strip_trailing_zeros(f"{float(value):,.4f}")
+        return _strip_trailing_zeros(f"{float(value):,.6f}")
+    return _strip_trailing_zeros(f"{float(value):,.6f}")
+
+
+def _strip_trailing_zeros(value: str) -> str:
+    if "." not in value:
+        return value
+    return value.rstrip("0").rstrip(".")
+
+
+def _colorbar_tick_format(unit: str) -> str:
+    if unit == "uV":
+        return ",.1f"
+    if unit == "mV":
+        return ",.3f"
+    if unit == "V":
+        return ",.6f"
+    return ",.3f"
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 def _resolve_unit(values_uv: np.ndarray, unit_mode: str) -> str:
-    requested = str(unit_mode or "auto")
+    requested = CANONICAL_UNITS.get(str(unit_mode or "auto").strip().lower(), str(unit_mode or "auto"))
     if requested in VOLTAGE_FACTORS_TO_UV:
         return requested
     finite = np.asarray(values_uv, dtype=float)
@@ -341,3 +518,12 @@ def _sample_fps(samples: list[float]) -> float:
     if len(samples) < 2:
         return 0.0
     return (len(samples) - 1) / max(1e-6, samples[-1] - samples[0])
+
+
+def _format_hex(value: Any, width: int = 4) -> str:
+    if value is None or value == "":
+        return "-"
+    try:
+        return f"0x{int(value):0{width}X}"
+    except (TypeError, ValueError):
+        return str(value)

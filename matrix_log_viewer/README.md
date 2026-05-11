@@ -14,6 +14,18 @@ title: UpperSpeed
 
 `FAST_BINARY` is the default path. Legacy `MATV` CSV remains available for SAFE/CSV/debug firmware, but UpperSpeed FAST/BINARY should switch to pure binary after startup.
 
+## Host GUI Fix Baseline
+
+This GUI fix was applied in the local `SensorArray_Software` worktree on branch `main`.
+
+No local or remote `UpperSpeed` branch was present during the fix, so the worktree was left on the current debugging branch instead of being forced back to another branch.
+
+Baseline HEAD before these edits:
+
+```text
+6992248 UpperSpeed
+```
+
 ## Install And Run
 
 ```powershell
@@ -105,19 +117,19 @@ PROTOCOL_RISK: firmware reported partialAfterFirstByte > 0
 
 ## GUI Performance
 
-Receive/parse/store runs independently from browser rendering. `MatrixDataStore` uses numpy ring buffers and live history callbacks do not build pandas DataFrames. Python publishes lightweight snapshots; `assets/plotly_live_update.js` updates Plotly with `restyle`, `extendTraces`, `relayout`, and requestAnimationFrame coalescing.
+Receive/parse/store runs independently from browser rendering. `MatrixDataStore` uses numpy ring buffers and live history callbacks do not build pandas DataFrames. Python publishes lightweight snapshots; `assets/plotly_live_update.js` coalesces browser work with requestAnimationFrame. Heatmap updates carry only the latest 8x8 matrix plus cell text/customdata; history uses `scattergl` and appends new points with an on-screen point limit.
 
 Recommended high-rate settings:
 
 - Stream: `FAST_BINARY`
 - Render mode: `Performance`
-- GUI target fps: `60` or `30`
 - Markers: off
 - Advanced diagnostics: collapsed
-- Heatmap text: off or 10 Hz
 - History max points: 1000-1200
 
-`GUI render interval ms` affects display refresh only. It does not change device sampling, parser throughput, or dataStore/CSV retention.
+The GUI render target is fixed at 60 FPS by default; there is no user-facing target-FPS selector. `GUI render interval ms` affects display refresh only. It does not change device sampling, parser throughput, or dataStore/CSV retention.
+
+Display unit selection applies consistently to heatmap cell text, hover labels, colorbar title/ticks, and fixed color ranges. In Auto mode, values such as `400000 uV` display as `400 mV` rather than Plotly SI labels like `400k`.
 
 ## Binary Debug CLI
 

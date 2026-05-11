@@ -66,8 +66,50 @@
     if (!div || !window.Plotly) {
       return;
     }
-    const z = snapshot.matrixUv || [];
+    const z = snapshot.matrixDisplay || snapshot.matrixUv || [];
+    const unit = snapshot.displayUnit || "uV";
+    const tickFormat = snapshot.colorbarTickFormat || ",.3f";
     const xy = selectedXY(snapshot.selectedCell);
+    const colorbar = {
+      title: { text: snapshot.colorbarTitle || unit },
+      tickformat: tickFormat,
+      exponentformat: "none",
+      separatethousands: true
+    };
+    const heatmapTrace = {
+      type: "heatmap",
+      z: z,
+      x: labels("D"),
+      y: labels("S"),
+      text: snapshot.text || [],
+      texttemplate: "%{text}",
+      textfont: { size: 11, color: "#111827" },
+      customdata: snapshot.customdata || [],
+      colorscale: "RdYlBu",
+      reversescale: true,
+      colorbar: colorbar,
+      zauto: snapshot.zauto !== false,
+      hovertemplate:
+        "cell=%{customdata[0]}<br>" +
+        "valid=%{customdata[1]}<br>" +
+        "value=%{customdata[2]} " + unit + "<br>" +
+        "raw=%{customdata[5]} uV<br>" +
+        "seq=%{customdata[4]}<br>" +
+        "status=%{customdata[6]} %{customdata[7]}<extra></extra>"
+    };
+    if (snapshot.zauto === false && Number.isFinite(snapshot.zmin) && Number.isFinite(snapshot.zmax)) {
+      heatmapTrace.zmin = snapshot.zmin;
+      heatmapTrace.zmax = snapshot.zmax;
+    }
+    const selectionTrace = {
+      type: "scatter",
+      mode: "markers",
+      x: xy.x,
+      y: xy.y,
+      marker: { symbol: "square-open", size: 62, line: { color: "#111827", width: 3 } },
+      hoverinfo: "skip",
+      showlegend: false
+    };
     const layout = {
       title: "8x8 Matrix",
       margin: { l: 58, r: 24, t: 56, b: 52 },
@@ -76,38 +118,16 @@
       font: { family: "Segoe UI, Arial, sans-serif", size: 12, color: "#17202a" },
       clickmode: "event+select",
       xaxis: { side: "top", constrain: "domain" },
-      yaxis: { autorange: "reversed", scaleanchor: "x", scaleratio: 1 }
+      yaxis: { autorange: "reversed", scaleanchor: "x", scaleratio: 1 },
+      uirevision: "heatmap:" + (snapshot.stream || "FAST_BINARY")
     };
     if (!root.heatmapInitialized) {
-      Plotly.newPlot(div, [
-        {
-          type: "heatmap",
-          z: z,
-          x: labels("D"),
-          y: labels("S"),
-          colorscale: "RdYlBu",
-          reversescale: true,
-          colorbar: { title: "uV" },
-          hovertemplate: "value=%{z}<extra></extra>"
-        },
-        {
-          type: "scatter",
-          mode: "markers",
-          x: xy.x,
-          y: xy.y,
-          marker: { symbol: "square-open", size: 62, line: { color: "#111827", width: 3 } },
-          hoverinfo: "skip",
-          showlegend: false
-        }
-      ], layout, { displayModeBar: false, responsive: true });
+      Plotly.newPlot(div, [heatmapTrace, selectionTrace], layout, { displayModeBar: false, responsive: true });
       root.heatmapInitialized = true;
       root.heatmapSelectedCell = snapshot.selectedCell;
     } else {
-      Plotly.restyle(div, { z: [z] }, [0]);
-      if (root.heatmapSelectedCell !== snapshot.selectedCell) {
-        Plotly.restyle(div, { x: [xy.x], y: [xy.y] }, [1]);
-        root.heatmapSelectedCell = snapshot.selectedCell;
-      }
+      Plotly.react(div, [heatmapTrace, selectionTrace], layout, { displayModeBar: false, responsive: true });
+      root.heatmapSelectedCell = snapshot.selectedCell;
     }
     record(root.heatmapSamples);
   }
@@ -134,11 +154,12 @@
     if (snapshot.reset || !root.historyInitialized || root.currentHistoryKey !== snapshot.key) {
       Plotly.react(div, [{
         type: "scattergl",
-        mode: "lines",
+        mode: snapshot.showMarkers ? "lines+markers" : "lines",
         x: snapshot.x || [],
         y: snapshot.y || [],
         name: (snapshot.selectedCell || "-") + " / " + (snapshot.stream || "-"),
         line: { color: "#0f766e", width: 2 },
+        marker: { size: 4 },
         hovertemplate: "%{x}<br>%{y}<extra></extra>"
       }], layout, { displayModeBar: true, responsive: true, scrollZoom: true });
       root.historyInitialized = true;

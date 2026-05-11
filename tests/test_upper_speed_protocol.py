@@ -188,6 +188,36 @@ def test_render_cache_decouples_input_and_gui():
     assert cache.getStats()["renderSkipped"] > 0
 
 
+def test_heatmap_snapshot_carries_display_unit_text_and_customdata():
+    store = MatrixDataStore(maxPointsPerCell=10)
+    values = {cell: 0.0 for cell in CELL_NAMES}
+    values["S1D1"] = -158.0
+    values["S1D2"] = 400_000.0
+    values["S8D5"] = 123.0
+    s8d5_bit = (8 - 1) * 8 + (5 - 1)
+    store.addFrame(MatrixFrame(**{**_frame(1).__dict__, "values": values, "validMask": ALL_VALID & ~(1 << s8d5_bit)}))
+
+    cache = HeatmapRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D2", unitMode="auto")
+    auto_snapshot = cache.getLatest()
+
+    assert auto_snapshot["displayUnit"] == "mV"
+    assert auto_snapshot["matrixDisplay"][0][1] == 400.0
+    assert "S1D2<br>400 mV" in auto_snapshot["text"][0][1]
+    assert auto_snapshot["text"][7][4] == "S8D5<br>invalid"
+    assert auto_snapshot["customdata"][0][1][0] == "S1D2"
+    assert auto_snapshot["customdata"][0][1][1] == "valid"
+    assert auto_snapshot["customdata"][0][1][3] == "mV"
+    assert auto_snapshot["customdata"][0][1][5] == 400_000.0
+
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D2", unitMode="uV")
+    uv_snapshot = cache.getLatest()
+
+    assert uv_snapshot["displayUnit"] == "uV"
+    assert "400,000 uV" in uv_snapshot["text"][0][1]
+    assert "400k" not in uv_snapshot["text"][0][1].lower()
+
+
 def test_no_pandas_in_live_render_cache_path():
     source = inspect.getsource(__import__("matrix_log_viewer.render_cache", fromlist=["dummy"]))
 

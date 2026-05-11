@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import CELL_NAMES, MATRIX_SIZE, WIDE_CSV_COLUMNS
+from .config import CELL_NAMES, DEFAULT_MAX_RAW_FRAMES_PER_STREAM, MATRIX_SIZE, WIDE_CSV_COLUMNS
 from .protocol_types import DeviceEvent, DeviceStatus, MatrixFrame
 from .sensorarray_status_codes import statusCodeName
 
@@ -230,7 +230,7 @@ class StreamRingBuffer:
 
 
 class MatrixDataStore:
-    def __init__(self, maxPointsPerCell: int = 5000):
+    def __init__(self, maxPointsPerCell: int = DEFAULT_MAX_RAW_FRAMES_PER_STREAM):
         self.maxPointsPerCell = max(1, int(maxPointsPerCell))
         self._lock = threading.RLock()
         self._streams: dict[str, StreamRingBuffer] = {}
