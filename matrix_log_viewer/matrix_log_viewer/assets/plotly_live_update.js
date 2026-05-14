@@ -9,10 +9,12 @@
     historyInitialized: false,
     currentHistoryKey: null,
     heatmapSelectedCell: null,
-    frontendRenderSkipped: 0,
+    coalescedFrames: 0,
+    droppedFrames: 0,
     lastClientError: "",
     heatmapSamples: [],
-    historySamples: []
+    historySamples: [],
+    historyPromise: Promise.resolve()
   };
 
   function graphDiv(id) {
@@ -55,13 +57,26 @@
     return values.map(numberOrNull).filter(function (value) { return value !== null; });
   }
 
+  function snapshotFollowRange(snapshot) {
+    const start = numberOrNull(snapshot.followRangeStart);
+    const end = numberOrNull(snapshot.followRangeEnd);
+    if (start !== null && end !== null && end > start) {
+      return [start, end];
+    }
+    return null;
+  }
+
   function applyFollowRange(div, snapshot) {
     if (!snapshot.followLatest) {
-      return;
+      return Promise.resolve();
+    }
+    const explicitRange = snapshotFollowRange(snapshot);
+    if (explicitRange) {
+      return Promise.resolve(Plotly.relayout(div, { "xaxis.range": explicitRange }));
     }
     const values = visibleXValues(div, snapshot.x || []);
     if (!values.length) {
-      return;
+      return Promise.resolve();
     }
     const latest = values[values.length - 1];
     let earliest = values[0];
@@ -70,8 +85,9 @@
       earliest = latest - seconds;
     }
     if (Number.isFinite(earliest) && Number.isFinite(latest) && latest > earliest) {
-      Plotly.relayout(div, { "xaxis.range": [earliest, latest] });
+      return Promise.resolve(Plotly.relayout(div, { "xaxis.range": [earliest, latest] }));
     }
+    return Promise.resolve();
   }
 
   function nowSeconds() {
@@ -170,9 +186,6 @@
       if (fixedRange) {
         update.zmin = [Number(snapshot.zmin)];
         update.zmax = [Number(snapshot.zmax)];
-      } else {
-        update.zmin = [null];
-        update.zmax = [null];
       }
       Plotly.restyle(div, update, [0]);
       if (root.heatmapSelectedCell !== snapshot.selectedCell) {
@@ -185,11 +198,23 @@
 
   function applyHistory(snapshot) {
     if (!snapshot || snapshot.kind !== "history") {
-      return;
+      return Promise.resolve();
+    }
+    root.historyPromise = root.historyPromise.catch(function () {
+      return undefined;
+    }).then(function () {
+      return applyHistoryNow(snapshot);
+    });
+    return root.historyPromise;
+  }
+
+  function applyHistoryNow(snapshot) {
+    if (!snapshot || snapshot.kind !== "history") {
+      return Promise.resolve();
     }
     const div = graphDiv("history-graph");
     if (!div || !window.Plotly) {
-      return;
+      return Promise.resolve();
     }
     const title = snapshot.title || ("History of " + snapshot.selectedCell + " / " + snapshot.stream);
     const layout = {
@@ -204,7 +229,7 @@
     };
     const mode = snapshot.showMarkers ? "lines+markers" : "lines";
     if (snapshot.reset || !root.historyInitialized || root.currentHistoryKey !== snapshot.key) {
-      Plotly.react(div, [{
+      const reactPromise = Promise.resolve(Plotly.react(div, [{
         type: "scattergl",
         mode: mode,
         x: snapshot.x || [],
@@ -212,21 +237,31 @@
         name: (snapshot.selectedCell || "-") + " / " + (snapshot.stream || "-"),
         line: { color: "#0f766e", width: 2 },
         hovertemplate: "%{x}<br>%{y}<extra></extra>"
-      }], layout, { displayModeBar: true, responsive: true, scrollZoom: true });
-      root.historyInitialized = true;
-      root.currentHistoryKey = snapshot.key;
+      }], layout, { displayModeBar: true, responsive: true, scrollZoom: true }));
+      return reactPromise.then(function () {
+        root.historyInitialized = true;
+        root.currentHistoryKey = snapshot.key;
+        return applyFollowRange(div, snapshot);
+      }).then(function () {
+        record(root.historySamples);
+      });
     } else if (snapshot.key === root.currentHistoryKey) {
       const x = snapshot.x || [];
       const y = snapshot.y || [];
       if (x.length || y.length) {
-        Plotly.extendTraces(div, { x: [x], y: [y] }, [0], snapshot.maxPoints || 1200);
+        return Promise.resolve(Plotly.extendTraces(div, { x: [x], y: [y] }, [0], snapshot.maxPoints || 1200)).then(function () {
+          return applyFollowRange(div, snapshot);
+        }).then(function () {
+          record(root.historySamples);
+        });
       }
+      return applyFollowRange(div, snapshot).then(function () {
+        record(root.historySamples);
+      });
     } else {
-      root.frontendRenderSkipped += 1;
-      return;
+      root.droppedFrames += 1;
+      return Promise.resolve();
     }
-    applyFollowRange(div, snapshot);
-    record(root.historySamples);
   }
 
   function flush() {
@@ -237,8 +272,12 @@
     root.pendingHistorySnapshot = null;
     try {
       applyHeatmap(heatmap);
-      applyHistory(history);
-      root.lastClientError = "";
+      Promise.resolve(applyHistory(history)).then(function () {
+        root.lastClientError = "";
+      }).catch(function (error) {
+        root.lastClientError = String(error && error.message ? error.message : error);
+        console.error("SensorArray live Plotly update failed", error);
+      });
     } catch (error) {
       root.lastClientError = String(error && error.message ? error.message : error);
       console.error("SensorArray live Plotly update failed", error);
@@ -247,7 +286,7 @@
 
   function schedule() {
     if (root.rafScheduled) {
-      root.frontendRenderSkipped += 1;
+      root.coalescedFrames += 1;
       return;
     }
     root.rafScheduled = true;
@@ -258,7 +297,13 @@
     if (heatmapSnapshot && heatmapSnapshot.cacheRevision !== (current || {}).lastHeatmapRevision) {
       root.pendingHeatmapSnapshot = heatmapSnapshot;
     }
-    if (historySnapshot && historySnapshot.cacheRevision !== (current || {}).lastHistoryRevision) {
+    if (
+      historySnapshot &&
+      (
+        historySnapshot.cacheRevision !== (current || {}).lastHistoryRevision ||
+        historySnapshot.followRevision !== (current || {}).lastHistoryFollowRevision
+      )
+    ) {
       root.pendingHistorySnapshot = historySnapshot;
     }
     if (root.pendingHeatmapSnapshot || root.pendingHistorySnapshot) {
@@ -267,9 +312,12 @@
     return {
       lastHeatmapRevision: heatmapSnapshot ? heatmapSnapshot.cacheRevision : (current || {}).lastHeatmapRevision,
       lastHistoryRevision: historySnapshot ? historySnapshot.cacheRevision : (current || {}).lastHistoryRevision,
+      lastHistoryFollowRevision: historySnapshot ? historySnapshot.followRevision : (current || {}).lastHistoryFollowRevision,
       heatmapActualFps: fps(root.heatmapSamples),
       historyActualFps: fps(root.historySamples),
-      frontendRenderSkipped: root.frontendRenderSkipped,
+      coalescedFrames: root.coalescedFrames,
+      droppedFrames: root.droppedFrames,
+      frontendRenderSkipped: root.droppedFrames,
       lastClientError: root.lastClientError
     };
   };

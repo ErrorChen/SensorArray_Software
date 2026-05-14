@@ -6,6 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from matrix_log_viewer.config import DEFAULT_GUI_TARGET_FPS, DEFAULT_RENDER_INTERVAL_MS
+from matrix_log_viewer.data_store import MatrixDataStore
+from matrix_log_viewer.render_cache import HeatmapRenderCacheThread, HistoryRenderCacheThread
+
 
 def test_benchmark_gui_pipeline_replays_fast_binary_sample_if_available():
     sample = Path("matrix_log_viewer/sample_logs/sample_fast_binary_pure_120fps.bin")
@@ -27,3 +31,10 @@ def test_benchmark_gui_pipeline_replays_fast_binary_sample_if_available():
     assert result.returncode == 0, result.stderr
     assert "parser/store fps:" in result.stdout
     assert "gui helpers: ok" in result.stdout
+
+
+def test_default_gui_fps_is_60():
+    assert DEFAULT_GUI_TARGET_FPS == 60
+    assert DEFAULT_RENDER_INTERVAL_MS <= 17
+    assert HeatmapRenderCacheThread(MatrixDataStore()).targetFps == 60
+    assert HistoryRenderCacheThread(MatrixDataStore()).targetFps == 60

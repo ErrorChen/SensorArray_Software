@@ -96,3 +96,17 @@ def test_fast_binary_and_matv_stream_options_remain_available():
         assert "MATV" in values
     finally:
         stop_app(app)
+
+
+def test_gui_target_fps_control_defaults_to_60():
+    app = make_app()
+    try:
+        fps_dropdown = find_component(app.layout, "gui-target-fps")
+        interval_input = find_component(app.layout, "interval-ms")
+
+        assert fps_dropdown.value == 60
+        assert interval_input.value <= 17
+        assert app._sensorarray_heatmap_cache.targetFps == 60
+        assert app._sensorarray_history_cache.targetFps == 60
+    finally:
+        stop_app(app)

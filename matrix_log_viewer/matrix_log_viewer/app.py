@@ -18,6 +18,7 @@ from .config import (
     CELL_NAMES,
     DEFAULT_BAUD,
     DEFAULT_DIAGNOSTICS_INTERVAL_MS,
+    DEFAULT_GUI_TARGET_FPS,
     DEFAULT_INGEST_INTERVAL_MS,
     DEFAULT_RENDER_INTERVAL_MS,
     DEFAULT_SERIAL_READ_SIZE,
@@ -230,8 +231,8 @@ def createDashApp(
     )
     input_processor.start()
     app._sensorarray_input_processor = input_processor
-    heatmap_cache = HeatmapRenderCacheThread(dataStore, targetFps=30)
-    history_cache = HistoryRenderCacheThread(dataStore, targetFps=30)
+    heatmap_cache = HeatmapRenderCacheThread(dataStore, targetFps=DEFAULT_GUI_TARGET_FPS)
+    history_cache = HistoryRenderCacheThread(dataStore, targetFps=DEFAULT_GUI_TARGET_FPS)
     heatmap_cache.start()
     history_cache.start()
     app._sensorarray_heatmap_cache = heatmap_cache
@@ -259,6 +260,10 @@ def createDashApp(
             return max(16, min(10_000, int(interval_ms)))
         except (TypeError, ValueError):
             return DEFAULT_RENDER_INTERVAL_MS
+
+    @app.callback(Output("interval-ms", "value"), Input("gui-target-fps", "value"), prevent_initial_call=True)
+    def sync_render_interval_to_target_fps(gui_target_fps: Any) -> int:
+        return _render_interval_for_target_fps(gui_target_fps)
 
     @app.callback(
         Output("paused-store", "data"),
@@ -419,21 +424,31 @@ def createDashApp(
 
     @app.callback(
         Output("history-follow-store", "data"),
+        Output("history-follow-revision-store", "data"),
         Input("history-graph", "relayoutData"),
         Input("follow-latest-button", "n_clicks"),
         Input("auto-follow", "value"),
         State("history-follow-store", "data"),
+        State("history-follow-revision-store", "data"),
         prevent_initial_call=True,
     )
-    def update_history_follow(relayout_data: dict | None, _follow_clicks: int | None, auto_follow_values: list[str] | None, current: bool) -> bool:
+    def update_history_follow(
+        relayout_data: dict | None,
+        _follow_clicks: int | None,
+        auto_follow_values: list[str] | None,
+        current: bool,
+        current_revision: Any,
+    ) -> tuple[bool, int]:
         triggered = ctx.triggered_id
+        revision = _safe_int(current_revision, default=0) or 0
         if triggered == "follow-latest-button":
-            return True
+            return True, revision + 1
         if triggered == "auto-follow":
-            return "enabled" in (auto_follow_values or [])
+            enabled = "enabled" in (auto_follow_values or [])
+            return enabled, revision + 1 if enabled and not bool(current) else revision
         if triggered == "history-graph" and _relayout_has_manual_x_range(relayout_data):
-            return False
-        return bool(current)
+            return False, revision
+        return bool(current), revision
 
     @app.callback(
         Output("render-control-store", "data"),
@@ -449,6 +464,7 @@ def createDashApp(
         Input("custom-x-min", "value"),
         Input("custom-x-max", "value"),
         Input("history-follow-store", "data"),
+        Input("history-follow-revision-store", "data"),
         Input("render-mode", "value"),
         Input("gui-target-fps", "value"),
         Input("history-max-points", "value"),
@@ -467,6 +483,7 @@ def createDashApp(
         custom_min: Any,
         custom_max: Any,
         follow_latest: bool,
+        follow_revision: Any,
         render_mode: str | None,
         gui_target_fps: Any,
         history_max_points: Any,
@@ -495,6 +512,7 @@ def createDashApp(
             customXMin=_safe_float(custom_min, default=None),
             customXMax=_safe_float(custom_max, default=None),
             followLatest=bool(follow_latest),
+            followRevision=_safe_int(follow_revision, default=0) or 0,
             targetFps=target_fps,
             maxPoints=max_points,
             showMarkers="enabled" in (show_markers or []),
@@ -509,6 +527,7 @@ def createDashApp(
             "xAxis": x_axis or "timeSeconds",
             "historyWindow": history_window or "last_30s",
             "followLatest": bool(follow_latest),
+            "followRevision": _safe_int(follow_revision, default=0) or 0,
         }
 
     @app.callback(
@@ -617,6 +636,7 @@ def createDashApp(
         parser_stats = parser.getStats()
         connection_status = manager.getStatus()
         runtime_stats = runtime_state.getStats()
+        runtime_stats.update(_render_runtime_stats(heatmap_cache, history_cache, {}))
         queue_depth = _safe_qsize(inputQueue)
         return (
             _build_parser_diagnostics(parser_stats, runtime_stats, queue_depth),
@@ -639,6 +659,7 @@ def _build_layout() -> html.Div:
             dcc.Store(id="heatmap-render-state", data={}),
             dcc.Store(id="history-render-state", data={}),
             dcc.Store(id="history-follow-store", data=True),
+            dcc.Store(id="history-follow-revision-store", data=0),
             dcc.Store(id="warning-state-store", data={}),
             dcc.Interval(id="ingest-interval", interval=DEFAULT_INGEST_INTERVAL_MS, n_intervals=0),
             dcc.Interval(id="render-interval", interval=DEFAULT_RENDER_INTERVAL_MS, n_intervals=0),
@@ -779,7 +800,7 @@ def _build_layout() -> html.Div:
                                                 {"label": "Performance", "value": "Performance"},
                                                 {"label": "Quality", "value": "Quality"},
                                             ])),
-                                            _control("GUI target fps", dcc.Dropdown(id="gui-target-fps", value=30, clearable=False, options=[
+                                            _control("GUI target fps", dcc.Dropdown(id="gui-target-fps", value=DEFAULT_GUI_TARGET_FPS, clearable=False, options=[
                                                 {"label": "30", "value": 30},
                                                 {"label": "60", "value": 60},
                                             ])),
@@ -1300,7 +1321,8 @@ def _build_compact_status_bar(
     cb_fps = _first_non_missing(runtime_stats.get("renderTickFps"), 0.0)
     idle_callbacks = _safe_int(runtime_stats.get("idleCallbacks"), default=0)
     no_revision_callbacks = _safe_int(runtime_stats.get("noRevisionCallbacks"), default=0)
-    busy_skip = _safe_int(runtime_stats.get("renderSkipped"), default=0)
+    coalesced_frames = _safe_int(runtime_stats.get("frontendCoalescedFrames"), default=0)
+    dropped_frames = _safe_int(runtime_stats.get("frontendDroppedFrames"), default=0) + _safe_int(runtime_stats.get("renderCacheSkipped"), default=0)
     warning_chip = warning_badge or _status_chip("warning", "clear", "ok")
     return [
         _status_chip("connection", f"{_connection_label(connection_status, paused)} {port}".strip(), connection_tone),
@@ -1311,7 +1333,7 @@ def _build_compact_status_bar(
         _status_chip("gui fps", _fmt_rate(gui_fps)),
         _status_chip("cb fps", _fmt_rate(cb_fps)),
         _status_chip("idle/no rev", f"{idle_callbacks}/{no_revision_callbacks}"),
-        _status_chip("busy skip", _format_counter(busy_skip)),
+        _status_chip("coalesced/drop", f"{_format_counter(coalesced_frames)}/{_format_counter(dropped_frames)}"),
         _status_chip("status", status_code, status_tone),
         warning_chip,
     ]
@@ -1394,6 +1416,15 @@ def _build_parser_diagnostics(parser_stats: dict, runtime_stats: dict, queue_dep
         ("queue_depth", queue_depth),
         ("render_tick_fps", _fmt_rate(runtime_stats.get("renderTickFps"))),
         ("rendered_frame_fps", _fmt_rate(runtime_stats.get("renderedFrameFps"))),
+        ("frontend_coalesced", _format_counter(runtime_stats.get("frontendCoalescedFrames"))),
+        ("frontend_dropped", _format_counter(runtime_stats.get("frontendDroppedFrames"))),
+        ("render_cache_skipped", _format_counter(runtime_stats.get("renderCacheSkipped"))),
+        ("heatmapUnit", runtime_stats.get("heatmapUnit") or "-"),
+        ("heatmapFiniteMin", _fmt_rate(runtime_stats.get("heatmapFiniteMin"))),
+        ("heatmapFiniteMax", _fmt_rate(runtime_stats.get("heatmapFiniteMax"))),
+        ("heatmapZMin", _fmt_rate(runtime_stats.get("heatmapZMin"))),
+        ("heatmapZMax", _fmt_rate(runtime_stats.get("heatmapZMax"))),
+        ("heatmapColorMode", runtime_stats.get("heatmapColorMode") or "-"),
         ("last_error", _first_non_empty(runtime_stats.get("lastCsvError", ""), parser_stats.get("lastError", ""), "-")),
     ]
     return [_status_item(label, value, warning=label in {"crc_errors", "resyncs", "parse_errors"} and _safe_counter_positive(value)) for label, value in items]
@@ -1549,16 +1580,26 @@ def _connection_tone(status: dict) -> str:
 
 def _resolve_color_range(matrix: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
     finite_values = matrix[np.isfinite(matrix)]
-    if color_mode == "symmetric" and finite_values.size:
-        max_abs = float(np.max(np.abs(finite_values)))
-        if max_abs > 0:
-            return -max_abs, max_abs
-    elif color_mode == "fixed":
+    mode = str(color_mode or "auto").lower()
+    if mode == "fixed":
         zmin = _safe_float(fixed_min, default=None)
         zmax = _safe_float(fixed_max, default=None)
         if zmin is not None and zmax is not None and zmin < zmax:
             return zmin, zmax
-    return None, None
+    if not finite_values.size:
+        return None, None
+    if mode == "symmetric":
+        max_abs = float(np.max(np.abs(finite_values)))
+        if max_abs > 0:
+            return -max_abs, max_abs
+        return -1e-9, 1e-9
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    if math.isclose(vmin, vmax, rel_tol=0.0, abs_tol=1e-12):
+        margin = max(abs(vmin) * 0.05, 1e-9)
+    else:
+        margin = (vmax - vmin) * 0.05
+    return vmin - margin, vmax + margin
 
 
 def _convert_matrix_for_display(matrix: np.ndarray, source_unit: str, unit_mode: str) -> tuple[np.ndarray, str]:
@@ -1793,13 +1834,18 @@ def _format_counter(value: Any, missing: str = "-") -> str:
     return str(parsed)
 
 
+def _render_interval_for_target_fps(gui_target_fps: Any) -> int:
+    target = _safe_int(gui_target_fps, default=DEFAULT_GUI_TARGET_FPS) or DEFAULT_GUI_TARGET_FPS
+    return 33 if target <= 30 else DEFAULT_RENDER_INTERVAL_MS
+
+
 def _target_fps(render_mode: str | None, gui_target_fps: Any) -> int:
     explicit = _safe_int(gui_target_fps, default=None)
     if explicit in (30, 60):
         return explicit
     if render_mode == "Performance":
         return 60
-    return 30
+    return DEFAULT_GUI_TARGET_FPS
 
 
 def _history_points_limit(value: Any, render_mode: str | None) -> int:
@@ -1812,17 +1858,25 @@ def _history_points_limit(value: Any, render_mode: str | None) -> int:
 def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache: HistoryRenderCacheThread, frontend_stats: dict) -> dict:
     heatmap_stats = heatmap_cache.getStats()
     history_stats = history_cache.getStats()
+    heatmap_snapshot = heatmap_cache.getLatest() or {}
     heatmap_fps = _safe_float(_first_non_missing(frontend_stats.get("heatmapActualFps"), heatmap_stats.get("actualFps")), default=0.0)
     history_fps = _safe_float(_first_non_missing(frontend_stats.get("historyActualFps"), history_stats.get("actualFps")), default=0.0)
-    render_skipped = (
-        _safe_int(frontend_stats.get("frontendRenderSkipped"), default=0)
-        + _safe_int(heatmap_stats.get("renderSkipped"), default=0)
-        + _safe_int(history_stats.get("renderSkipped"), default=0)
-    )
+    frontend_dropped = _safe_int(frontend_stats.get("droppedFrames"), default=0)
+    frontend_coalesced = _safe_int(frontend_stats.get("coalescedFrames"), default=0)
+    cache_skipped = _safe_int(heatmap_stats.get("renderSkipped"), default=0) + _safe_int(history_stats.get("renderSkipped"), default=0)
     return {
         "guiHeatmapFps": heatmap_fps,
         "guiHistoryFps": history_fps,
-        "renderSkipped": render_skipped,
+        "renderSkipped": frontend_dropped + cache_skipped,
+        "frontendCoalescedFrames": frontend_coalesced,
+        "frontendDroppedFrames": frontend_dropped,
+        "renderCacheSkipped": cache_skipped,
+        "heatmapUnit": heatmap_snapshot.get("unit") or "-",
+        "heatmapFiniteMin": heatmap_snapshot.get("finiteMin"),
+        "heatmapFiniteMax": heatmap_snapshot.get("finiteMax"),
+        "heatmapZMin": heatmap_snapshot.get("zmin"),
+        "heatmapZMax": heatmap_snapshot.get("zmax"),
+        "heatmapColorMode": heatmap_snapshot.get("colorMode") or "-",
     }
 
 

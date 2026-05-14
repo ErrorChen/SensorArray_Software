@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from matrix_log_viewer.app import _build_compact_status_bar, _convert_matrix_for_display, _warning_badge
+from matrix_log_viewer.config import DEFAULT_GUI_TARGET_FPS
 from matrix_log_viewer.data_store import MatrixDataStore
 from matrix_log_viewer.protocol_parser import SensorArrayStreamParser
 from matrix_log_viewer.render_cache import HeatmapRenderCacheThread, HistoryRenderCacheThread
@@ -71,9 +72,9 @@ def main() -> int:
         warning_badge=warning_badge,
     )
 
-    heatmap_cache = HeatmapRenderCacheThread(data_store, targetFps=30)
+    heatmap_cache = HeatmapRenderCacheThread(data_store, targetFps=DEFAULT_GUI_TARGET_FPS)
     heatmap_cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", unitMode="auto", colorMode="auto")
-    history_cache = HistoryRenderCacheThread(data_store, targetFps=30)
+    history_cache = HistoryRenderCacheThread(data_store, targetFps=DEFAULT_GUI_TARGET_FPS)
     history_cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", unitMode="auto", historyWindow="last_30s")
     heatmap_snapshot = heatmap_cache.getLatest() or {}
     history_snapshot = history_cache.getLatest() or {}

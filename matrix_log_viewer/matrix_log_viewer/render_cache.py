@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import CELL_NAMES, MATRIX_SIZE
+from .config import CELL_NAMES, DEFAULT_GUI_TARGET_FPS, MATRIX_SIZE
 from .data_store import MatrixDataStore
 
 VOLTAGE_FACTORS_TO_UV = {"uV": 1.0, "mV": 1_000.0, "V": 1_000_000.0}
@@ -32,7 +32,7 @@ class HistoryKey:
 
 
 class HeatmapRenderCacheThread(threading.Thread):
-    def __init__(self, dataStore: MatrixDataStore, targetFps: int = 30):
+    def __init__(self, dataStore: MatrixDataStore, targetFps: int = DEFAULT_GUI_TARGET_FPS):
         super().__init__(name="SensorArrayHeatmapRenderCache", daemon=True)
         self.dataStore = dataStore
         self._lock = threading.RLock()
@@ -118,6 +118,7 @@ class HeatmapRenderCacheThread(threading.Thread):
         unit = _resolve_unit(matrix.ravel(), self.unitMode)
         display_matrix = _convert_uv(matrix, unit)
         zmin, zmax = _resolve_color_range(display_matrix, self.colorMode, self.fixedMin, self.fixedMax)
+        finite_min, finite_max = _finite_min_max(display_matrix)
         return {
             "kind": "heatmap",
             "cacheRevision": self._cacheRevision,
@@ -134,6 +135,9 @@ class HeatmapRenderCacheThread(threading.Thread):
             "cellNames": _cell_names_matrix(),
             "zmin": zmin,
             "zmax": zmax,
+            "finiteMin": finite_min,
+            "finiteMax": finite_max,
+            "colorMode": self.colorMode,
             "validMask": snapshot.get("validMask"),
             "selectedCell": self.selectedCell,
             "statusFlags": snapshot.get("statusFlags"),
@@ -143,7 +147,7 @@ class HeatmapRenderCacheThread(threading.Thread):
 
 
 class HistoryRenderCacheThread(threading.Thread):
-    def __init__(self, dataStore: MatrixDataStore, targetFps: int = 30, appendLimit: int = 256):
+    def __init__(self, dataStore: MatrixDataStore, targetFps: int = DEFAULT_GUI_TARGET_FPS, appendLimit: int = 256):
         super().__init__(name="SensorArrayHistoryRenderCache", daemon=True)
         self.dataStore = dataStore
         self._lock = threading.RLock()
@@ -159,6 +163,7 @@ class HistoryRenderCacheThread(threading.Thread):
         self.customXMin: float | None = None
         self.customXMax: float | None = None
         self.followLatest = True
+        self.followRevision = 0
         self.maxPoints = 1200
         self.showMarkers = False
         self.latestHistorySnapshot: dict | None = None
@@ -186,12 +191,14 @@ class HistoryRenderCacheThread(threading.Thread):
                 self.showMarkers,
             )
             old_follow_latest = self.followLatest
+            old_follow_revision = self.followRevision
             for key, value in kwargs.items():
                 if hasattr(self, key) and value is not None:
                     setattr(self, key, value)
             if self.selectedCell not in CELL_NAMES:
                 self.selectedCell = "S1D1"
             self.targetFps = max(1, int(self.targetFps))
+            self.followRevision = max(0, int(self.followRevision))
             self.maxPoints = max(100, int(self.maxPoints))
             new_reset_state = (
                 self.stream,
@@ -205,12 +212,18 @@ class HistoryRenderCacheThread(threading.Thread):
                 self.maxPoints,
                 self.showMarkers,
             )
-            force_reset = self.latestHistorySnapshot is None or old_reset_state != new_reset_state or (not old_follow_latest and self.followLatest)
+            follow_revision_changed = old_follow_revision != self.followRevision
+            force_reset = (
+                self.latestHistorySnapshot is None
+                or old_reset_state != new_reset_state
+                or (not old_follow_latest and self.followLatest)
+                or follow_revision_changed
+            )
             if force_reset:
                 self._currentKey = None
                 self._lastSeq = None
                 self._cacheRevision += 1
-                self.latestHistorySnapshot = self._build_snapshot_locked(force_reset=True)
+                self.latestHistorySnapshot = self._build_snapshot_locked(force_reset=True, follow_forced=follow_revision_changed)
 
     def getLatest(self) -> dict | None:
         with self._lock:
@@ -239,7 +252,7 @@ class HistoryRenderCacheThread(threading.Thread):
             period = 1.0 / max(1, self.targetFps)
             self._stop_event.wait(max(0.001, period - (time.monotonic() - start)))
 
-    def _build_snapshot_locked(self, force_reset: bool) -> dict | None:
+    def _build_snapshot_locked(self, force_reset: bool, follow_forced: bool = False) -> dict | None:
         x, y_uv, meta = self.dataStore.getCellHistoryArrays(
             self.stream,
             self.selectedCell,
@@ -289,6 +302,17 @@ class HistoryRenderCacheThread(threading.Thread):
             self._currentKey = key
             self._lastSeq = _last_seq(meta_full.get("seq"))
             self._cacheRevision += 1
+            rendered_x = x_full[selected]
+            follow_range = _resolve_follow_range(
+                x_full,
+                key.xAxis,
+                self.historyWindow,
+                self.lastN,
+                self.customXMin,
+                self.customXMax,
+                follow_forced,
+            )
+            earliest_x, latest_x = _finite_bounds(x_full)
             return {
                 "kind": "history",
                 "reset": True,
@@ -301,12 +325,18 @@ class HistoryRenderCacheThread(threading.Thread):
                 "unit": resolved_unit,
                 "historyWindow": self.historyWindow,
                 "showMarkers": bool(self.showMarkers),
-                "x": _json_array(x_full[selected]),
+                "x": _json_array(rendered_x),
                 "y": _json_array(_convert_uv(y_full[selected], resolved_unit)),
                 "lastSeq": self._lastSeq,
                 "maxPoints": self.maxPoints,
                 "revision": int(meta_full.get("revision") or 0),
                 "followLatest": bool(self.followLatest),
+                "followRevision": int(self.followRevision),
+                "followForced": bool(follow_forced),
+                "earliestX": earliest_x,
+                "latestX": latest_x,
+                "followRangeStart": follow_range[0] if follow_range is not None else None,
+                "followRangeEnd": follow_range[1] if follow_range is not None else None,
             }
 
         if len(x) == 0:
@@ -318,6 +348,27 @@ class HistoryRenderCacheThread(threading.Thread):
             meta["seq"] = meta["seq"][-self.appendLimit :]
         self._lastSeq = _last_seq(meta.get("seq")) or self._lastSeq
         self._cacheRevision += 1
+        range_x = x
+        if self.followLatest and _needs_full_range_source(key.xAxis, self.historyWindow):
+            range_x, _range_y, _range_meta = self.dataStore.getCellHistoryArrays(
+                self.stream,
+                self.selectedCell,
+                xAxis=self.xAxis,
+                windowMode=self.historyWindow,
+                lastN=self.lastN,
+                customMin=self.customXMin,
+                customMax=self.customXMax,
+            )
+        follow_range = _resolve_follow_range(
+            range_x,
+            key.xAxis,
+            self.historyWindow,
+            self.lastN,
+            self.customXMin,
+            self.customXMax,
+            follow_forced=False,
+        )
+        earliest_x, latest_x = _finite_bounds(range_x)
         return {
             "kind": "history",
             "reset": False,
@@ -336,6 +387,12 @@ class HistoryRenderCacheThread(threading.Thread):
             "maxPoints": self.maxPoints,
             "revision": int(meta.get("revision") or 0),
             "followLatest": bool(self.followLatest),
+            "followRevision": int(self.followRevision),
+            "followForced": False,
+            "earliestX": earliest_x,
+            "latestX": latest_x,
+            "followRangeStart": follow_range[0] if follow_range is not None else None,
+            "followRangeEnd": follow_range[1] if follow_range is not None else None,
         }
 
 
@@ -383,16 +440,96 @@ def _canonical_unit(unit: Any) -> str:
 def _resolve_color_range(matrix: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
     values = np.asarray(matrix, dtype=float)
     finite = values[np.isfinite(values)]
-    if str(color_mode or "auto").lower() == "symmetric" and finite.size:
-        max_abs = float(np.max(np.abs(finite)))
-        if max_abs > 0:
-            return -max_abs, max_abs
-    if str(color_mode or "auto").lower() == "fixed":
+    mode = str(color_mode or "auto").lower()
+    if mode == "fixed":
         zmin = _safe_float(fixed_min)
         zmax = _safe_float(fixed_max)
         if zmin is not None and zmax is not None and zmin < zmax:
             return zmin, zmax
-    return None, None
+    if not finite.size:
+        return None, None
+    if mode == "symmetric":
+        max_abs = float(np.max(np.abs(finite)))
+        if max_abs > 0:
+            return -max_abs, max_abs
+        return -1e-9, 1e-9
+    vmin = float(np.min(finite))
+    vmax = float(np.max(finite))
+    if math.isclose(vmin, vmax, rel_tol=0.0, abs_tol=1e-12):
+        margin = max(abs(vmin) * 0.05, 1e-9)
+    else:
+        margin = (vmax - vmin) * 0.05
+    return vmin - margin, vmax + margin
+
+
+def _finite_min_max(values: np.ndarray) -> tuple[float | None, float | None]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return None, None
+    return float(np.min(finite)), float(np.max(finite))
+
+
+def _finite_bounds(values: np.ndarray) -> tuple[float | None, float | None]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return None, None
+    return float(finite[0]), float(finite[-1])
+
+
+def _resolve_follow_range(
+    x_values: np.ndarray,
+    x_axis: str,
+    history_window: str,
+    last_n: int | None,
+    custom_min: float | None,
+    custom_max: float | None,
+    follow_forced: bool = False,
+) -> tuple[float, float] | None:
+    finite = np.asarray(x_values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return None
+
+    window = str(history_window or "all")
+    latest = float(finite[-1])
+    earliest = float(finite[0])
+    if window == "all":
+        return None
+    if window == "custom" and not follow_forced:
+        if custom_min is not None and custom_max is not None and custom_min < custom_max:
+            return float(custom_min), float(custom_max)
+        return None
+    if window == "last_n":
+        count = max(1, int(last_n or 1000))
+        if (x_axis or "timeSeconds") == "seq":
+            return latest - float(count), latest
+        subset = finite[-count:]
+        return (float(subset[0]), float(subset[-1])) if subset.size else None
+
+    seconds = _window_seconds(window)
+    if seconds is None:
+        return (earliest, latest) if follow_forced and latest > earliest else None
+    axis = x_axis or "timeSeconds"
+    if axis == "timeSeconds":
+        return latest - seconds, latest
+    if axis == "timestampUs":
+        return latest - (seconds * 1_000_000.0), latest
+    return earliest, latest
+
+
+def _window_seconds(history_window: str) -> float | None:
+    return {
+        "last_10s": 10.0,
+        "last_30s": 30.0,
+        "last_60s": 60.0,
+        "last_5min": 300.0,
+    }.get(history_window)
+
+
+def _needs_full_range_source(x_axis: str, history_window: str) -> bool:
+    return (x_axis or "timeSeconds") == "seq" and _window_seconds(str(history_window or "")) is not None
 
 
 def _safe_float(value: Any) -> float | None:
