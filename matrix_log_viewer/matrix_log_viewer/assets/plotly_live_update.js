@@ -35,6 +35,45 @@
     return { x: ["D" + match[2]], y: ["S" + match[1]] };
   }
 
+  function numberOrNull(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function windowSeconds(windowName) {
+    return {
+      last_10s: 10,
+      last_30s: 30,
+      last_60s: 60,
+      last_5min: 300
+    }[windowName || ""];
+  }
+
+  function visibleXValues(div, fallback) {
+    const trace = div && div.data && div.data[0];
+    const values = trace && Array.isArray(trace.x) ? trace.x : (fallback || []);
+    return values.map(numberOrNull).filter(function (value) { return value !== null; });
+  }
+
+  function applyFollowRange(div, snapshot) {
+    if (!snapshot.followLatest) {
+      return;
+    }
+    const values = visibleXValues(div, snapshot.x || []);
+    if (!values.length) {
+      return;
+    }
+    const latest = values[values.length - 1];
+    let earliest = values[0];
+    const seconds = windowSeconds(snapshot.historyWindow);
+    if ((snapshot.xAxis || "timeSeconds") === "timeSeconds" && seconds) {
+      earliest = latest - seconds;
+    }
+    if (Number.isFinite(earliest) && Number.isFinite(latest) && latest > earliest) {
+      Plotly.relayout(div, { "xaxis.range": [earliest, latest] });
+    }
+  }
+
   function nowSeconds() {
     return performance.now() / 1000.0;
   }
@@ -66,11 +105,14 @@
     if (!div || !window.Plotly) {
       return;
     }
-    const z = snapshot.matrixUv || [];
+    const z = snapshot.matrix || snapshot.matrixUv || [];
+    const unit = snapshot.unit || "uV";
+    const text = snapshot.cellText || [];
+    const cellNames = snapshot.cellNames || [];
     const xy = selectedXY(snapshot.selectedCell);
     const layout = {
       title: "8x8 Matrix",
-      margin: { l: 58, r: 24, t: 56, b: 52 },
+      margin: { l: 50, r: 58, t: 48, b: 38 },
       paper_bgcolor: "white",
       plot_bgcolor: "white",
       font: { family: "Segoe UI, Arial, sans-serif", size: 12, color: "#17202a" },
@@ -78,24 +120,38 @@
       xaxis: { side: "top", constrain: "domain" },
       yaxis: { autorange: "reversed", scaleanchor: "x", scaleratio: 1 }
     };
+    const colorbar = { title: { text: unit }, len: 0.82, thickness: 12, y: 0.47 };
+    const fixedRange = Number.isFinite(Number(snapshot.zmin)) && Number.isFinite(Number(snapshot.zmax));
+    const heatmapTrace = {
+      type: "heatmap",
+      z: z,
+      x: labels("D"),
+      y: labels("S"),
+      text: text,
+      customdata: cellNames,
+      texttemplate: "%{text}",
+      textfont: { size: 10, color: "#111827" },
+      colorscale: "RdYlBu",
+      reversescale: true,
+      colorbar: colorbar,
+      hovertemplate: "cell=%{customdata}<br>value=%{z:,.3g} " + unit + "<br>seq=" + (snapshot.seq ?? "-") + "<extra></extra>",
+      zauto: !fixedRange,
+      xgap: 1,
+      ygap: 1
+    };
+    if (fixedRange) {
+      heatmapTrace.zmin = Number(snapshot.zmin);
+      heatmapTrace.zmax = Number(snapshot.zmax);
+    }
     if (!root.heatmapInitialized) {
       Plotly.newPlot(div, [
-        {
-          type: "heatmap",
-          z: z,
-          x: labels("D"),
-          y: labels("S"),
-          colorscale: "RdYlBu",
-          reversescale: true,
-          colorbar: { title: "uV" },
-          hovertemplate: "value=%{z}<extra></extra>"
-        },
+        heatmapTrace,
         {
           type: "scatter",
           mode: "markers",
           x: xy.x,
           y: xy.y,
-          marker: { symbol: "square-open", size: 62, line: { color: "#111827", width: 3 } },
+          marker: { symbol: "square-open", size: 58, line: { color: "#111827", width: 3 } },
           hoverinfo: "skip",
           showlegend: false
         }
@@ -103,7 +159,22 @@
       root.heatmapInitialized = true;
       root.heatmapSelectedCell = snapshot.selectedCell;
     } else {
-      Plotly.restyle(div, { z: [z] }, [0]);
+      const update = {
+        z: [z],
+        text: [text],
+        customdata: [cellNames],
+        colorbar: [colorbar],
+        hovertemplate: [heatmapTrace.hovertemplate],
+        zauto: [!fixedRange]
+      };
+      if (fixedRange) {
+        update.zmin = [Number(snapshot.zmin)];
+        update.zmax = [Number(snapshot.zmax)];
+      } else {
+        update.zmin = [null];
+        update.zmax = [null];
+      }
+      Plotly.restyle(div, update, [0]);
       if (root.heatmapSelectedCell !== snapshot.selectedCell) {
         Plotly.restyle(div, { x: [xy.x], y: [xy.y] }, [1]);
         root.heatmapSelectedCell = snapshot.selectedCell;
@@ -123,7 +194,7 @@
     const title = snapshot.title || ("History of " + snapshot.selectedCell + " / " + snapshot.stream);
     const layout = {
       title: title,
-      margin: { l: 58, r: 24, t: 56, b: 52 },
+      margin: { l: 58, r: 24, t: 48, b: 50 },
       paper_bgcolor: "white",
       plot_bgcolor: "white",
       font: { family: "Segoe UI, Arial, sans-serif", size: 12, color: "#17202a" },
@@ -131,10 +202,11 @@
       yaxis: { title: "value (" + (snapshot.unit || "uV") + ")", showgrid: true, gridcolor: "#e5e7eb", autorange: true },
       uirevision: snapshot.key
     };
+    const mode = snapshot.showMarkers ? "lines+markers" : "lines";
     if (snapshot.reset || !root.historyInitialized || root.currentHistoryKey !== snapshot.key) {
       Plotly.react(div, [{
         type: "scattergl",
-        mode: "lines",
+        mode: mode,
         x: snapshot.x || [],
         y: snapshot.y || [],
         name: (snapshot.selectedCell || "-") + " / " + (snapshot.stream || "-"),
@@ -153,13 +225,7 @@
       root.frontendRenderSkipped += 1;
       return;
     }
-    if (snapshot.followLatest && snapshot.x && snapshot.x.length) {
-      const xmax = snapshot.x[snapshot.x.length - 1];
-      const xmin = snapshot.x[0];
-      if (Number.isFinite(xmin) && Number.isFinite(xmax) && xmax > xmin) {
-        Plotly.relayout(div, { "xaxis.range": [xmin, xmax] });
-      }
-    }
+    applyFollowRange(div, snapshot);
     record(root.historySamples);
   }
 

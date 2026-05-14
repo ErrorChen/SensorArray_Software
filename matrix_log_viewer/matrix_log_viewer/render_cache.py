@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import CELL_NAMES
+from .config import CELL_NAMES, MATRIX_SIZE
 from .data_store import MatrixDataStore
 
 VOLTAGE_FACTORS_TO_UV = {"uV": 1.0, "mV": 1_000.0, "V": 1_000_000.0}
@@ -24,8 +24,8 @@ class HistoryKey:
     historyWindow: str
     customXMin: float | None
     customXMax: float | None
-    followLatest: bool
     maxPoints: int
+    showMarkers: bool
 
     def as_string(self) -> str:
         return "|".join(str(value) for value in self.__dict__.values())
@@ -40,6 +40,10 @@ class HeatmapRenderCacheThread(threading.Thread):
         self.targetFps = int(targetFps)
         self.stream = "FAST_BINARY"
         self.selectedCell = "S1D1"
+        self.unitMode = "auto"
+        self.colorMode = "auto"
+        self.fixedMin: float | None = None
+        self.fixedMax: float | None = None
         self.latestHeatmapSnapshot: dict | None = None
         self._cacheRevision = 0
         self._lastDataRevision: int | None = None
@@ -49,7 +53,16 @@ class HeatmapRenderCacheThread(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    def updateControls(self, stream: str | None = None, selectedCell: str | None = None, targetFps: int | None = None) -> None:
+    def updateControls(
+        self,
+        stream: str | None = None,
+        selectedCell: str | None = None,
+        targetFps: int | None = None,
+        unitMode: str | None = None,
+        colorMode: str | None = None,
+        fixedMin: float | None = None,
+        fixedMax: float | None = None,
+    ) -> None:
         with self._lock:
             if stream:
                 self.stream = stream
@@ -57,6 +70,12 @@ class HeatmapRenderCacheThread(threading.Thread):
                 self.selectedCell = str(selectedCell)
             if targetFps:
                 self.targetFps = max(1, int(targetFps))
+            if unitMode:
+                self.unitMode = str(unitMode)
+            if colorMode:
+                self.colorMode = str(colorMode)
+            self.fixedMin = fixedMin
+            self.fixedMax = fixedMax
             self._cacheRevision += 1
             self.latestHeatmapSnapshot = self._build_snapshot_locked(force=True)
 
@@ -96,6 +115,9 @@ class HeatmapRenderCacheThread(threading.Thread):
         self._lastDataRevision = data_revision
         self._cacheRevision += 1
         matrix = np.asarray(snapshot.get("matrixUv"), dtype=float)
+        unit = _resolve_unit(matrix.ravel(), self.unitMode)
+        display_matrix = _convert_uv(matrix, unit)
+        zmin, zmax = _resolve_color_range(display_matrix, self.colorMode, self.fixedMin, self.fixedMax)
         return {
             "kind": "heatmap",
             "cacheRevision": self._cacheRevision,
@@ -106,6 +128,12 @@ class HeatmapRenderCacheThread(threading.Thread):
             "timeSeconds": snapshot.get("timeSeconds"),
             "durationUs": snapshot.get("durationUs"),
             "matrixUv": _json_matrix(matrix),
+            "matrix": _json_matrix(display_matrix),
+            "unit": unit,
+            "cellText": _cell_text(display_matrix, unit),
+            "cellNames": _cell_names_matrix(),
+            "zmin": zmin,
+            "zmax": zmax,
             "validMask": snapshot.get("validMask"),
             "selectedCell": self.selectedCell,
             "statusFlags": snapshot.get("statusFlags"),
@@ -132,6 +160,7 @@ class HistoryRenderCacheThread(threading.Thread):
         self.customXMax: float | None = None
         self.followLatest = True
         self.maxPoints = 1200
+        self.showMarkers = False
         self.latestHistorySnapshot: dict | None = None
         self._currentKey: HistoryKey | None = None
         self._lastSeq: int | None = None
@@ -144,6 +173,19 @@ class HistoryRenderCacheThread(threading.Thread):
 
     def updateControls(self, **kwargs: Any) -> None:
         with self._lock:
+            old_reset_state = (
+                self.stream,
+                self.selectedCell,
+                self.xAxis,
+                self.unitMode,
+                self.historyWindow,
+                self.lastN,
+                self.customXMin,
+                self.customXMax,
+                self.maxPoints,
+                self.showMarkers,
+            )
+            old_follow_latest = self.followLatest
             for key, value in kwargs.items():
                 if hasattr(self, key) and value is not None:
                     setattr(self, key, value)
@@ -151,10 +193,24 @@ class HistoryRenderCacheThread(threading.Thread):
                 self.selectedCell = "S1D1"
             self.targetFps = max(1, int(self.targetFps))
             self.maxPoints = max(100, int(self.maxPoints))
-            self._currentKey = None
-            self._lastSeq = None
-            self._cacheRevision += 1
-            self.latestHistorySnapshot = self._build_snapshot_locked(force_reset=True)
+            new_reset_state = (
+                self.stream,
+                self.selectedCell,
+                self.xAxis,
+                self.unitMode,
+                self.historyWindow,
+                self.lastN,
+                self.customXMin,
+                self.customXMax,
+                self.maxPoints,
+                self.showMarkers,
+            )
+            force_reset = self.latestHistorySnapshot is None or old_reset_state != new_reset_state or (not old_follow_latest and self.followLatest)
+            if force_reset:
+                self._currentKey = None
+                self._lastSeq = None
+                self._cacheRevision += 1
+                self.latestHistorySnapshot = self._build_snapshot_locked(force_reset=True)
 
     def getLatest(self) -> dict | None:
         with self._lock:
@@ -203,8 +259,8 @@ class HistoryRenderCacheThread(threading.Thread):
             self.historyWindow,
             self.customXMin,
             self.customXMax,
-            bool(self.followLatest),
             int(self.maxPoints),
+            bool(self.showMarkers),
         )
         key_changed = key != self._currentKey
         if force_reset or key_changed or self._lastSeq is None:
@@ -226,8 +282,8 @@ class HistoryRenderCacheThread(threading.Thread):
                 self.historyWindow,
                 self.customXMin,
                 self.customXMax,
-                bool(self.followLatest),
                 int(self.maxPoints),
+                bool(self.showMarkers),
             )
             selected, _downsampled = MatrixDataStore.downsampleHistoryArrays(x_full, y_full, self.maxPoints)
             self._currentKey = key
@@ -243,6 +299,8 @@ class HistoryRenderCacheThread(threading.Thread):
                 "title": f"History of {self.selectedCell} / {self.stream}",
                 "xAxis": key.xAxis,
                 "unit": resolved_unit,
+                "historyWindow": self.historyWindow,
+                "showMarkers": bool(self.showMarkers),
                 "x": _json_array(x_full[selected]),
                 "y": _json_array(_convert_uv(y_full[selected], resolved_unit)),
                 "lastSeq": self._lastSeq,
@@ -267,6 +325,11 @@ class HistoryRenderCacheThread(threading.Thread):
             "key": key.as_string(),
             "stream": self.stream,
             "selectedCell": self.selectedCell,
+            "title": f"History of {self.selectedCell} / {self.stream}",
+            "xAxis": key.xAxis,
+            "unit": key.resolvedUnit,
+            "historyWindow": self.historyWindow,
+            "showMarkers": bool(self.showMarkers),
             "x": _json_array(x),
             "y": _json_array(_convert_uv(y_uv, key.resolvedUnit)),
             "lastSeq": self._lastSeq,
@@ -292,7 +355,7 @@ class DiagnosticsCache(StatusCache):
 
 
 def _resolve_unit(values_uv: np.ndarray, unit_mode: str) -> str:
-    requested = str(unit_mode or "auto")
+    requested = _canonical_unit(unit_mode)
     if requested in VOLTAGE_FACTORS_TO_UV:
         return requested
     finite = np.asarray(values_uv, dtype=float)
@@ -310,6 +373,60 @@ def _resolve_unit(values_uv: np.ndarray, unit_mode: str) -> str:
 def _convert_uv(values_uv: np.ndarray, unit: str) -> np.ndarray:
     factor = VOLTAGE_FACTORS_TO_UV.get(unit, 1.0)
     return np.asarray(values_uv, dtype=float) / factor
+
+
+def _canonical_unit(unit: Any) -> str:
+    text = str(unit or "").strip().replace("\u00b5", "u").replace("\u03bc", "u").lower()
+    return CANONICAL_UNITS.get(text, str(unit or ""))
+
+
+def _resolve_color_range(matrix: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
+    values = np.asarray(matrix, dtype=float)
+    finite = values[np.isfinite(values)]
+    if str(color_mode or "auto").lower() == "symmetric" and finite.size:
+        max_abs = float(np.max(np.abs(finite)))
+        if max_abs > 0:
+            return -max_abs, max_abs
+    if str(color_mode or "auto").lower() == "fixed":
+        zmin = _safe_float(fixed_min)
+        zmax = _safe_float(fixed_max)
+        if zmin is not None and zmax is not None and zmin < zmax:
+            return zmin, zmax
+    return None, None
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _cell_names_matrix() -> list[list[str]]:
+    return [[f"S{row + 1}D{col + 1}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)]
+
+
+def _cell_text(matrix: np.ndarray, unit: str) -> list[list[str]]:
+    values = np.asarray(matrix, dtype=float)
+    names = _cell_names_matrix()
+    return [[f"{names[row][col]}<br>{_format_value(values[row, col], unit)}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)]
+
+
+def _format_value(value: Any, unit: str) -> str:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(parsed):
+        return "-"
+    if math.isclose(parsed, round(parsed), rel_tol=0.0, abs_tol=1e-9):
+        text = f"{int(round(parsed)):,}"
+    else:
+        text = f"{parsed:,.3g}"
+    return f"{text} {unit}".strip()
 
 
 def _json_matrix(matrix: np.ndarray) -> list[list[float | None]]:

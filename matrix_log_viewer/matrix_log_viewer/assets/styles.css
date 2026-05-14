@@ -1,8 +1,9 @@
+.app-shell,
 .page {
   min-height: 100vh;
-  padding: 14px;
+  padding: 12px;
   box-sizing: border-box;
-  background: #eef2f5;
+  background: #f3f6f8;
   color: #17202a;
   font-family: "Segoe UI", Arial, sans-serif;
 }
@@ -28,6 +29,7 @@
   flex-wrap: wrap;
   gap: 6px;
   justify-content: flex-end;
+  align-items: center;
 }
 
 .status-chip {
@@ -78,7 +80,7 @@
   white-space: nowrap;
 }
 
-.operator-panel,
+.control-card,
 .panel,
 .advanced-panel {
   border: 1px solid #d9e2ec;
@@ -87,7 +89,12 @@
 }
 
 .operator-panel {
-  padding: 9px;
+  display: grid;
+  gap: 8px;
+}
+
+.control-card {
+  padding: 8px;
 }
 
 .toolbar {
@@ -97,12 +104,11 @@
 }
 
 .connection-toolbar {
-  grid-template-columns: minmax(190px, 1.2fr) repeat(7, max-content);
+  grid-template-columns: minmax(280px, 1fr) repeat(7, max-content);
 }
 
 .display-toolbar {
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  margin-top: 8px;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(100px, 0.8fr) minmax(120px, 0.8fr) minmax(110px, 0.7fr) minmax(120px, 0.8fr) max-content;
 }
 
 .compact-control {
@@ -134,7 +140,7 @@
 }
 
 .button {
-  height: 36px;
+  min-height: 34px;
   padding: 0 12px;
   border-radius: 6px;
   font-weight: 700;
@@ -174,7 +180,7 @@
 
 .main-grid {
   display: grid;
-  grid-template-columns: minmax(360px, 0.85fr) minmax(480px, 1.15fr);
+  grid-template-columns: minmax(420px, 0.85fr) minmax(650px, 1.35fr);
   gap: 12px;
   margin-top: 12px;
 }
@@ -186,8 +192,8 @@
 
 .graph {
   width: 100%;
-  height: calc(100vh - 220px);
-  min-height: 520px;
+  height: min(52vh, 520px);
+  min-height: 430px;
 }
 
 .advanced-panel {
@@ -229,7 +235,7 @@
   letter-spacing: 0;
 }
 
-@media (max-width: 1100px) {
+@media (max-width: 1180px) {
   .top-bar,
   .main-grid {
     grid-template-columns: 1fr;

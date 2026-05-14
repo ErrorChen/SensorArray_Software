@@ -367,7 +367,7 @@ def createDashApp(
     def save_snapshot(n_clicks: int | None, frame_type: str | None) -> str:
         if not n_clicks:
             return no_update
-        selected_type = frame_type or "FAST_BINARY"
+        selected_type = _requested_frame_type(frame_type)
         snapshot = dataStore.toWideDataFrame(selected_type)
         if snapshot.empty:
             return "No data to save."
@@ -440,6 +440,9 @@ def createDashApp(
         Input("cell-dropdown", "value"),
         Input("frame-type-dropdown", "value"),
         Input("unit-mode", "value"),
+        Input("color-mode", "value"),
+        Input("fixed-min", "value"),
+        Input("fixed-max", "value"),
         Input("x-axis", "value"),
         Input("history-window", "value"),
         Input("last-n-points", "value"),
@@ -449,11 +452,15 @@ def createDashApp(
         Input("render-mode", "value"),
         Input("gui-target-fps", "value"),
         Input("history-max-points", "value"),
+        Input("show-markers", "value"),
     )
     def update_render_controls(
         selected_cell: str | None,
         frame_type: str | None,
         unit_mode: str | None,
+        color_mode: str | None,
+        fixed_min: Any,
+        fixed_max: Any,
         x_axis: str | None,
         history_window: str | None,
         last_n: Any,
@@ -463,12 +470,21 @@ def createDashApp(
         render_mode: str | None,
         gui_target_fps: Any,
         history_max_points: Any,
+        show_markers: list[str] | None,
     ) -> dict:
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
-        selected_type = frame_type or "FAST_BINARY"
+        selected_type = _requested_frame_type(frame_type)
         target_fps = _target_fps(render_mode, gui_target_fps)
         max_points = _history_points_limit(history_max_points, render_mode)
-        heatmap_cache.updateControls(stream=selected_type, selectedCell=selected_cell, targetFps=target_fps)
+        heatmap_cache.updateControls(
+            stream=selected_type,
+            selectedCell=selected_cell,
+            targetFps=target_fps,
+            unitMode=unit_mode or "auto",
+            colorMode=color_mode or "auto",
+            fixedMin=_safe_float(fixed_min, default=None),
+            fixedMax=_safe_float(fixed_max, default=None),
+        )
         history_cache.updateControls(
             stream=selected_type,
             selectedCell=selected_cell,
@@ -476,11 +492,12 @@ def createDashApp(
             unitMode=unit_mode or "auto",
             historyWindow=history_window or "last_30s",
             lastN=_safe_int(last_n) or 1000,
-            customXMin=_safe_float(custom_min),
-            customXMax=_safe_float(custom_max),
+            customXMin=_safe_float(custom_min, default=None),
+            customXMax=_safe_float(custom_max, default=None),
             followLatest=bool(follow_latest),
             targetFps=target_fps,
             maxPoints=max_points,
+            showMarkers="enabled" in (show_markers or []),
         )
         return {
             "selectedCell": selected_cell,
@@ -488,6 +505,7 @@ def createDashApp(
             "targetFps": target_fps,
             "maxPoints": max_points,
             "unitMode": unit_mode or "auto",
+            "colorMode": color_mode or "auto",
             "xAxis": x_axis or "timeSeconds",
             "historyWindow": history_window or "last_30s",
             "followLatest": bool(follow_latest),
@@ -559,7 +577,7 @@ def createDashApp(
         previous_warning_state: dict | None,
     ) -> tuple[list, dict]:
         selected_cell = selected_cell if selected_cell in CELL_NAMES else DEFAULT_SELECTED_CELL
-        selected_type = frame_type or "FAST_BINARY"
+        selected_type = _requested_frame_type(frame_type)
         display_type = dataStore.resolveFrameType(selected_type)
         latest_matrix_raw, latest_meta, _revision = dataStore.getLatestMatrixAndMeta(selected_type)
         display_matrix, display_unit = _convert_matrix_for_display(latest_matrix_raw, latest_meta.get("unit") or "", unit_mode)
@@ -594,7 +612,7 @@ def createDashApp(
     def update_diagnostics(_n_intervals: int, advanced_open: bool, frame_type: str | None) -> tuple[Any, Any, Any]:
         if not advanced_open:
             return no_update, no_update, no_update
-        selected_type = frame_type or "FAST_BINARY"
+        selected_type = _requested_frame_type(frame_type)
         latest_meta = dataStore.getLatestFrameMeta(selected_type)
         parser_stats = parser.getStats()
         connection_status = manager.getStatus()
@@ -637,41 +655,42 @@ def _build_layout() -> html.Div:
                 [
                     html.Div(
                         [
-                            _control("COM Port", dcc.Dropdown(id="com-port-dropdown", options=[], placeholder="Refresh ports")),
-                            html.Button("Refresh Ports", id="refresh-ports-button", n_clicks=0, className="button secondary"),
-                            html.Button("Connect", id="connect-button", n_clicks=0, className="button primary"),
-                            html.Button("Disconnect", id="disconnect-button", n_clicks=0, className="button secondary"),
-                            html.Button("Reconnect", id="reconnect-button", n_clicks=0, className="button quiet"),
-                            html.Button("Pause", id="pause-button", n_clicks=0, className="button secondary"),
-                            html.Button("Clear", id="clear-button", n_clicks=0, className="button secondary"),
-                            html.Button("Save Snapshot CSV", id="save-button", n_clicks=0, className="button secondary"),
+                            html.Div(
+                                [
+                                    _control("COM Port", dcc.Dropdown(id="com-port-dropdown", options=[], placeholder="Refresh ports")),
+                                    html.Button("Refresh Ports", id="refresh-ports-button", n_clicks=0, className="button secondary"),
+                                    html.Button("Connect", id="connect-button", n_clicks=0, className="button primary"),
+                                    html.Button("Disconnect", id="disconnect-button", n_clicks=0, className="button secondary"),
+                                    html.Button("Reconnect", id="reconnect-button", n_clicks=0, className="button quiet"),
+                                    html.Button("Pause", id="pause-button", n_clicks=0, className="button secondary"),
+                                    html.Button("Clear", id="clear-button", n_clicks=0, className="button secondary"),
+                                    html.Button("Save Snapshot CSV", id="save-button", n_clicks=0, className="button secondary"),
+                                ],
+                                className="toolbar connection-toolbar",
+                            ),
                         ],
-                        className="toolbar connection-toolbar",
+                        className="control-card connection-card",
                     ),
                     html.Div(
                         [
-                            _control("Data stream", dcc.Dropdown(id="frame-type-dropdown", value="FAST_BINARY", clearable=False, options=_frame_type_options(DEFAULT_FRAME_TYPES))),
-                            _control("Cell", dcc.Dropdown(id="cell-dropdown", value=DEFAULT_SELECTED_CELL, clearable=False, options=[{"label": cell, "value": cell} for cell in CELL_NAMES])),
-                            _control("History window", dcc.Dropdown(id="history-window", value="last_30s", clearable=False, options=_history_window_options(False))),
-                            _control("Display unit", dcc.Dropdown(id="unit-mode", value="auto", clearable=False, options=[
-                                {"label": "Auto", "value": "auto"},
-                                {"label": "uV", "value": "uV"},
-                                {"label": "mV", "value": "mV"},
-                                {"label": "V", "value": "V"},
-                            ])),
-                            _control("Color scale", dcc.Dropdown(id="color-mode", value="auto", clearable=False, options=_color_mode_options(False))),
-                            _control("Render mode", dcc.Dropdown(id="render-mode", value="Normal", clearable=False, options=[
-                                {"label": "Normal", "value": "Normal"},
-                                {"label": "Performance", "value": "Performance"},
-                                {"label": "Quality", "value": "Quality"},
-                            ])),
-                            _control("GUI target fps", dcc.Dropdown(id="gui-target-fps", value=30, clearable=False, options=[
-                                {"label": "30", "value": 30},
-                                {"label": "60", "value": 60},
-                            ])),
-                            html.Button("Follow Latest", id="follow-latest-button", n_clicks=0, className="button secondary"),
+                            html.Div(
+                                [
+                                    _control("Data stream", dcc.Dropdown(id="frame-type-dropdown", value="FAST_BINARY", clearable=False, options=_frame_type_options(DEFAULT_FRAME_TYPES))),
+                                    _control("Cell", dcc.Dropdown(id="cell-dropdown", value=DEFAULT_SELECTED_CELL, clearable=False, options=[{"label": cell, "value": cell} for cell in CELL_NAMES])),
+                                    _control("History window", dcc.Dropdown(id="history-window", value="last_30s", clearable=False, options=_history_window_options(False))),
+                                    _control("Display unit", dcc.Dropdown(id="unit-mode", value="auto", clearable=False, options=[
+                                        {"label": "Auto", "value": "auto"},
+                                        {"label": "uV", "value": "uV"},
+                                        {"label": "mV", "value": "mV"},
+                                        {"label": "V", "value": "V"},
+                                    ])),
+                                    _control("Color scale", dcc.Dropdown(id="color-mode", value="auto", clearable=False, options=_color_mode_options(False))),
+                                    html.Button("Follow Latest", id="follow-latest-button", n_clicks=0, className="button secondary"),
+                                ],
+                                className="toolbar display-toolbar",
+                            ),
                         ],
-                        className="toolbar display-toolbar",
+                        className="control-card view-card",
                     ),
                     html.Div(
                         [
@@ -755,6 +774,15 @@ def _build_layout() -> html.Div:
                                             _control("Custom x max", dcc.Input(id="custom-x-max", type="number", debounce=True, className="input")),
                                             _control("Fixed min", dcc.Input(id="fixed-min", type="number", debounce=True, className="input")),
                                             _control("Fixed max", dcc.Input(id="fixed-max", type="number", debounce=True, className="input")),
+                                            _control("Render mode", dcc.Dropdown(id="render-mode", value="Normal", clearable=False, options=[
+                                                {"label": "Normal", "value": "Normal"},
+                                                {"label": "Performance", "value": "Performance"},
+                                                {"label": "Quality", "value": "Quality"},
+                                            ])),
+                                            _control("GUI target fps", dcc.Dropdown(id="gui-target-fps", value=30, clearable=False, options=[
+                                                {"label": "30", "value": 30},
+                                                {"label": "60", "value": 60},
+                                            ])),
                                             _control("GUI render interval ms", dcc.Input(id="interval-ms", type="number", value=DEFAULT_RENDER_INTERVAL_MS, min=16, step=1, debounce=True, className="input")),
                                             _control("History max points", dcc.Dropdown(id="history-max-points", value="Auto", clearable=False, options=[
                                                 {"label": "Auto", "value": "Auto"},
@@ -788,7 +816,7 @@ def _build_layout() -> html.Div:
                 className="advanced-panel",
             ),
         ],
-        className="page",
+        className="app-shell page",
     )
 
 
@@ -852,6 +880,7 @@ def _build_heatmap_figure(
     display_unit: str,
     requested_frame_type: str,
 ) -> go.Figure:
+    matrix = np.asarray(matrix, dtype=float)
     unit = display_unit or meta.get("unit") or ""
     if meta.get("seq") is None and not np.isfinite(matrix).any():
         return _empty_figure(f"No data for selected stream: {requested_frame_type}", "8x8 Matrix")
@@ -859,7 +888,7 @@ def _build_heatmap_figure(
     cell_names = np.array([[f"S{row + 1}D{col + 1}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
     validity = np.where(np.isfinite(matrix), "valid", "invalid")
     custom_data = np.dstack([cell_names, validity])
-    text = np.array([[f"{cell_names[row, col]}<br>{_format_value(matrix[row, col], unit) if np.isfinite(matrix[row, col]) else 'invalid'}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
+    text = np.array([[f"{cell_names[row, col]}<br>{_format_value(matrix[row, col], unit) if np.isfinite(matrix[row, col]) else '-'}" for col in range(MATRIX_SIZE)] for row in range(MATRIX_SIZE)])
 
     heatmap_kwargs: dict[str, Any] = {}
     zmin, zmax = _resolve_color_range(matrix, color_mode, fixed_min, fixed_max)
@@ -884,7 +913,7 @@ def _build_heatmap_figure(
                     f"status={_format_hex(meta.get('lastStatusCode'), 4)}<extra></extra>"
                 ),
                 colorscale="RdYlBu_r",
-                colorbar={"title": unit or "value"},
+                colorbar={"title": unit or "value", "len": 0.82, "thickness": 12},
                 showscale=True,
                 **heatmap_kwargs,
             )
@@ -1116,7 +1145,7 @@ def _resolve_follow_range(history, x_column: str, window_mode: str, last_n: int 
             return [float(custom_min), float(custom_max)]
         return None
     if window_mode == "last_n":
-        subset = history.tail(max(1, int(last_n or 1000)))
+        subset = history.tail(max(1, _safe_int(last_n, default=1000)))
         return [float(subset[x_column].iloc[0]), float(subset[x_column].iloc[-1])] if x_column in subset.columns else None
 
     seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(window_mode)
@@ -1139,7 +1168,7 @@ def _resolve_follow_range_arrays(x_values: np.ndarray, x_column: str, window_mod
             return [float(custom_min), float(custom_max)]
         return None
     if window_mode == "last_n":
-        count = max(1, int(last_n or 1000))
+        count = max(1, _safe_int(last_n, default=1000))
         subset = finite_x[-count:]
         return [float(subset[0]), float(subset[-1])] if subset.size else None
 
@@ -1183,9 +1212,9 @@ def _history_customdata(history_meta: dict, mask: np.ndarray) -> list:
 def _history_max_points(window_mode: str, runtime_stats: dict, frame_type: str) -> int:
     seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(window_mode, 30.0)
     if frame_type == "FAST_BINARY":
-        fps = float(runtime_stats.get("parsedBinaryFps") or 20.0)
+        fps = _safe_float(runtime_stats.get("parsedBinaryFps"), default=20.0)
     else:
-        fps = max(float(runtime_stats.get("parsedTextFps") or 0.0), 20.0)
+        fps = max(_safe_float(runtime_stats.get("parsedTextFps"), default=0.0), 20.0)
     return min(2000, max(200, int(seconds * fps * 1.5)))
 
 
@@ -1230,64 +1259,80 @@ def _relayout_has_manual_x_range(relayout_data: dict | None) -> bool:
 
 
 def _build_compact_status_bar(
-    meta: dict,
+    meta: dict | None,
     matrix: np.ndarray,
     selected_cell: str,
-    parser_stats: dict,
-    connection_status: dict,
-    runtime_stats: dict,
+    parser_stats: dict | None,
+    connection_status: dict | None,
+    runtime_stats: dict | None,
     paused: bool,
     display_unit: str,
     display_type: str,
-    warning_badge: html.Div,
+    warning_badge: html.Div | None = None,
 ) -> list:
+    meta = meta or {}
+    parser_stats = parser_stats or {}
+    connection_status = connection_status or {}
+    runtime_stats = runtime_stats or {}
     port = connection_status.get("serialPort") or connection_status.get("port") or "-"
     selected_value = _selected_cell_value(matrix, selected_cell, display_unit)
-    status_code = f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}"
-    if status_code.startswith("-"):
-        status_code = "OK"
-    device = runtime_stats.get("deviceSummary") or {}
-    device_drop = _first_non_empty(device.get("latestDrop"), meta.get("droppedFrames"), 0)
-    device_decimated = _first_non_empty(device.get("latestDecimated"), meta.get("outputDecimatedFrames"), 0)
-    output_div = _first_non_empty(device.get("latestOutputDiv"), meta.get("outputDivider"), "-")
-    partial = int(device.get("partialAfterFirstByte") or 0)
-    pollution = int(parser_stats.get("protocolPollutionCount") or 0)
+    last_status = _safe_int(meta.get("lastStatusCode"), default=None)
+    if last_status is None:
+        status_code = "-"
+        status_tone = "neutral"
+    else:
+        status_name = meta.get("lastStatusCodeName") or ("OK" if last_status == 0 else "-")
+        status_code = f"{_format_hex(last_status, 4)} {status_name}".strip()
+        status_tone = "ok" if last_status == 0 else "warn"
+    connection_tone = _connection_tone(connection_status)
+    input_fps = _first_non_missing(
+        runtime_stats.get("parsedBinaryFps") if (display_type or "").upper() == "FAST_BINARY" else runtime_stats.get("parsedTextFps"),
+        runtime_stats.get("parsedBinaryFps"),
+        0.0,
+    )
+    gui_fps = _first_non_missing(
+        runtime_stats.get("guiHistoryFps"),
+        runtime_stats.get("guiHeatmapFps"),
+        runtime_stats.get("renderedFrameFps"),
+        runtime_stats.get("guiDisplayedFps"),
+        0.0,
+    )
+    cb_fps = _first_non_missing(runtime_stats.get("renderTickFps"), 0.0)
+    idle_callbacks = _safe_int(runtime_stats.get("idleCallbacks"), default=0)
+    no_revision_callbacks = _safe_int(runtime_stats.get("noRevisionCallbacks"), default=0)
+    busy_skip = _safe_int(runtime_stats.get("renderSkipped"), default=0)
+    warning_chip = warning_badge or _status_chip("warning", "clear", "ok")
     return [
-        _status_chip("connection", f"{_connection_label(connection_status, paused)} {port}".strip(), "ok" if connection_status.get("serialConnected") or connection_status.get("mode") == "replay" else ""),
+        _status_chip("connection", f"{_connection_label(connection_status, paused)} {port}".strip(), connection_tone),
         _status_chip("stream", display_type or "-"),
         _status_chip("selected", f"{selected_cell} {selected_value}".strip()),
-        _status_chip("seq", _dash_if_none(meta.get("seq"))),
-        _status_chip("scanFps", _fmt_rate(device.get("latestScanFps"))),
-        _status_chip("outFps", _fmt_rate(device.get("latestOutFps"))),
-        _status_chip("parsedFps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
-        _status_chip("storedFps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
-        _status_chip("GUI heatmap fps", f"{runtime_stats.get('guiHeatmapFps', 0.0):.1f}"),
-        _status_chip("GUI history fps", f"{runtime_stats.get('guiHistoryFps', 0.0):.1f}"),
-        _status_chip("DEVICE_DROP", device_drop, "error" if int(device_drop or 0) > 0 else ""),
-        _status_chip("DEVICE_DECIMATED", device_decimated, "warn" if int(device_decimated or 0) > 0 else ""),
-        _status_chip("OUTPUT_DIV", output_div, "warn" if _safe_int(output_div) and int(output_div) > 1 else ""),
-        _status_chip("DROPPED_BEFORE_FIRST_BYTE", device.get("droppedBeforeFirstByte", 0), "warn" if int(device.get("droppedBeforeFirstByte") or 0) else ""),
-        _status_chip("PARTIAL_AFTER_FIRST_BYTE", partial, "error" if partial > 0 else ""),
-        _status_chip("HOST_CRC", parser_stats.get("binaryCrcErrors", 0), "warn" if parser_stats.get("binaryCrcErrors", 0) else ""),
-        _status_chip("HOST_RESYNC", parser_stats.get("binaryMagicResyncs", 0), "warn" if parser_stats.get("binaryMagicResyncs", 0) else ""),
-        _status_chip("HOST_QUEUE_DROP", connection_status.get("droppedInputChunks", 0), "warn" if connection_status.get("droppedInputChunks", 0) else ""),
-        _status_chip("RENDER_SKIPPED", runtime_stats.get("renderSkipped", 0), "info" if runtime_stats.get("renderSkipped", 0) else ""),
-        _status_chip("ASCII_AFTER_FAST_BINARY_START", pollution, "error" if pollution else ""),
-        _status_chip("status", status_code, "warn" if bool(meta.get("lastStatusCode")) else "ok"),
-        warning_badge,
+        _status_chip("seq", _format_counter(meta.get("seq"))),
+        _status_chip("input fps", _fmt_rate(input_fps)),
+        _status_chip("gui fps", _fmt_rate(gui_fps)),
+        _status_chip("cb fps", _fmt_rate(cb_fps)),
+        _status_chip("idle/no rev", f"{idle_callbacks}/{no_revision_callbacks}"),
+        _status_chip("busy skip", _format_counter(busy_skip)),
+        _status_chip("status", status_code, status_tone),
+        warning_chip,
     ]
 
 
-def _warning_badge(parser_stats: dict, connection_status: dict, runtime_stats: dict, meta: dict, previous: dict) -> tuple[html.Div, dict]:
+def _warning_badge(parser_stats: dict | None, connection_status: dict | None, runtime_stats: dict | None, meta: dict | None, previous: dict | None) -> tuple[html.Div, dict]:
+    parser_stats = parser_stats or {}
+    connection_status = connection_status or {}
+    runtime_stats = runtime_stats or {}
+    meta = meta or {}
+    previous = previous or {}
+    device = runtime_stats.get("deviceSummary") or {}
     current = {
-        "crc": int(parser_stats.get("binaryCrcErrors") or 0),
-        "resync": int(parser_stats.get("binaryMagicResyncs") or 0),
-        "parse": int(parser_stats.get("parseErrors") or 0),
-        "seq_gap": int(runtime_stats.get("seqGap") or 0),
-        "device_drop": int(meta.get("droppedFrames") or 0),
-        "host_drop": int(connection_status.get("droppedInputChunks") or 0),
+        "crc": _safe_int(parser_stats.get("binaryCrcErrors"), default=0),
+        "resync": _safe_int(parser_stats.get("binaryMagicResyncs"), default=0),
+        "parse": _safe_int(parser_stats.get("parseErrors"), default=0),
+        "seq_gap": _safe_int(runtime_stats.get("seqGap"), default=0),
+        "device_drop": _safe_int(_first_non_missing(device.get("latestDrop"), meta.get("droppedFrames")), default=0),
+        "host_drop": _safe_int(connection_status.get("droppedInputChunks"), default=0),
     }
-    deltas = {key: max(0, current[key] - int(previous.get(key, current[key]) or 0)) for key in current}
+    deltas = {key: max(0, current[key] - _safe_int(previous.get(key), default=0)) for key in current}
     labels = []
     if deltas["crc"]:
         labels.append(f"CRC +{deltas['crc']}")
@@ -1300,8 +1345,18 @@ def _warning_badge(parser_stats: dict, connection_status: dict, runtime_stats: d
         labels.append(f"DROP +{drop_delta}")
     if labels:
         return _status_chip("warning", " / ".join(labels), "error" if deltas["crc"] or deltas["parse"] else "warn"), current
-    has_existing_warning = any(current.values())
-    return _status_chip("warning", "OK", "warn" if has_existing_warning else "ok"), current
+    total_drop = current["seq_gap"] + current["device_drop"] + current["host_drop"]
+    if current["crc"]:
+        labels.append(f"CRC {current['crc']}")
+    if current["resync"]:
+        labels.append(f"RESYNC {current['resync']}")
+    if current["parse"]:
+        labels.append(f"PARSE {current['parse']}")
+    if total_drop:
+        labels.append(f"DROP {total_drop}")
+    if labels:
+        return _status_chip("warning", " / ".join(labels), "error" if current["crc"] or current["parse"] else "warn"), current
+    return _status_chip("warning", "clear", "ok"), current
 
 
 def _selected_cell_value(matrix: np.ndarray, selected_cell: str, display_unit: str) -> str:
@@ -1311,68 +1366,75 @@ def _selected_cell_value(matrix: np.ndarray, selected_cell: str, display_unit: s
     try:
         value = float(matrix[source - 1, detector - 1])
     except Exception:
-        return ""
-    return _format_value(value, display_unit) if np.isfinite(value) else "invalid"
+        return "-"
+    return _format_value(value, display_unit) if _is_finite_number(value) else "-"
 
 
-def _status_chip(label: str, value: Any, tone: str = "") -> html.Div:
+def _status_chip(label: str, value: Any, tone: str = "neutral", title: str | None = None) -> html.Div:
     class_name = "status-chip"
-    if tone:
+    if tone and tone != "neutral":
         class_name = f"{class_name} {tone}"
-    return html.Div([html.Span(label, className="status-label"), html.Strong(str(value), className="status-value")], className=class_name)
+    display_value = _dash_if_missing(value)
+    return html.Div(
+        [html.Span(label, className="status-label"), html.Strong(str(display_value), className="status-value")],
+        className=class_name,
+        title=title,
+    )
 
 
 def _build_parser_diagnostics(parser_stats: dict, runtime_stats: dict, queue_depth: int | str) -> list:
     items = [
-        ("parsed_total", parser_stats.get("parsedFramesTotal", 0)),
-        ("parsed_binary", parser_stats.get("parsedBinaryFrames", 0)),
-        ("parsed_text", parser_stats.get("parsedTextFrames", 0)),
-        ("crc_errors", parser_stats.get("binaryCrcErrors", 0)),
-        ("resyncs", parser_stats.get("binaryMagicResyncs", 0)),
-        ("parse_errors", parser_stats.get("parseErrors", 0)),
-        ("bytes/sec", f"{runtime_stats.get('bytesPerSec', 0.0):.0f}"),
+        ("parsed_total", _format_counter(parser_stats.get("parsedFramesTotal"))),
+        ("parsed_binary", _format_counter(parser_stats.get("parsedBinaryFrames"))),
+        ("parsed_text", _format_counter(parser_stats.get("parsedTextFrames"))),
+        ("crc_errors", _format_counter(parser_stats.get("binaryCrcErrors"))),
+        ("resyncs", _format_counter(parser_stats.get("binaryMagicResyncs"))),
+        ("parse_errors", _format_counter(parser_stats.get("parseErrors"))),
+        ("bytes/sec", f"{_safe_float(runtime_stats.get('bytesPerSec'), default=0.0):.0f}"),
         ("queue_depth", queue_depth),
-        ("render_tick_fps", f"{runtime_stats.get('renderTickFps', 0.0):.1f}"),
-        ("rendered_frame_fps", f"{runtime_stats.get('renderedFrameFps', 0.0):.1f}"),
+        ("render_tick_fps", _fmt_rate(runtime_stats.get("renderTickFps"))),
+        ("rendered_frame_fps", _fmt_rate(runtime_stats.get("renderedFrameFps"))),
         ("last_error", _first_non_empty(runtime_stats.get("lastCsvError", ""), parser_stats.get("lastError", ""), "-")),
     ]
-    return [_status_item(label, value, warning=label in {"crc_errors", "resyncs", "parse_errors"} and bool(value)) for label, value in items]
+    return [_status_item(label, value, warning=label in {"crc_errors", "resyncs", "parse_errors"} and _safe_counter_positive(value)) for label, value in items]
 
 
 def _build_status_bar(meta: dict, parser_stats: dict, connection_status: dict, runtime_stats: dict, paused: bool, queue_depth: int | str, display_unit: str) -> list:
-    dropped = int(meta.get("droppedFrames") or 0)
-    decimated = int(meta.get("outputDecimatedFrames") or 0)
-    host_drop_chunks = int(connection_status.get("droppedInputChunks") or 0)
+    dropped = _safe_int(meta.get("droppedFrames"), default=0)
+    decimated = _safe_int(meta.get("outputDecimatedFrames"), default=0)
+    host_drop_chunks = _safe_int(connection_status.get("droppedInputChunks"), default=0)
+    seq_gap = _safe_int(runtime_stats.get("seqGap"), default=0)
+    last_status = _safe_int(meta.get("lastStatusCode"), default=0)
     return [
         _status_item("Input", _connection_label(connection_status, paused)),
         _status_item("frame_type", meta.get("frameType") or "-"),
-        _status_item("seq", _dash_if_none(meta.get("seq"))),
-        _status_item("latest_seq", _dash_if_none(runtime_stats.get("latestSeq"))),
-        _status_item("seq_gap", runtime_stats.get("seqGap", 0), warning=runtime_stats.get("seqGap", 0) > 0),
+        _status_item("seq", _format_counter(meta.get("seq"))),
+        _status_item("latest_seq", _format_counter(runtime_stats.get("latestSeq"))),
+        _status_item("seq_gap", seq_gap, warning=seq_gap > 0),
         _status_item("timestamp_us", _dash_if_none(meta.get("timestampUs"))),
         _status_item("duration_us", _dash_if_none(meta.get("durationUs"))),
         _status_item("unit", meta.get("unit") or "-"),
         _status_item("display_unit", display_unit or meta.get("unit") or "-"),
-        _status_item("status_code", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=bool(meta.get("lastStatusCode"))),
+        _status_item("status_code", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=last_status > 0),
         _status_item("device_dropped", dropped, warning=dropped > 0),
         _status_item("device_decimated", decimated, warning=decimated > 0),
         _status_item("host_drop_chunks", host_drop_chunks, warning=host_drop_chunks > 0),
         _status_item("adsDr", _dash_if_none(meta.get("adsDr"))),
         _status_item("outputDiv", _dash_if_none(meta.get("outputDivider"))),
-        _status_item("bytes/sec", f"{runtime_stats.get('bytesPerSec', 0.0):.0f}"),
-        _status_item("binary_fps", f"{runtime_stats.get('parsedBinaryFps', 0.0):.1f}"),
-        _status_item("text_fps", f"{runtime_stats.get('parsedTextFps', 0.0):.1f}"),
-        _status_item("gui_fps", f"{runtime_stats.get('guiDisplayedFps', 0.0):.1f}"),
-        _status_item("bytes", connection_status.get("bytesReceived", 0)),
-        _status_item("chunks", connection_status.get("chunksReceived", 0)),
+        _status_item("bytes/sec", f"{_safe_float(runtime_stats.get('bytesPerSec'), default=0.0):.0f}"),
+        _status_item("binary_fps", _fmt_rate(runtime_stats.get("parsedBinaryFps"))),
+        _status_item("text_fps", _fmt_rate(runtime_stats.get("parsedTextFps"))),
+        _status_item("gui_fps", _fmt_rate(runtime_stats.get("guiDisplayedFps"))),
+        _status_item("bytes", _format_counter(connection_status.get("bytesReceived"))),
+        _status_item("chunks", _format_counter(connection_status.get("chunksReceived"))),
         _status_item("queue_depth", queue_depth),
-        _status_item("parsed_total", parser_stats.get("parsedFramesTotal", 0)),
-        _status_item("parsed_binary", parser_stats.get("parsedBinaryFrames", 0)),
-        _status_item("parsed_text", parser_stats.get("parsedTextFrames", 0)),
-        _status_item("crc_errors", parser_stats.get("binaryCrcErrors", 0), warning=parser_stats.get("binaryCrcErrors", 0) > 0),
-        _status_item("resyncs", parser_stats.get("binaryMagicResyncs", 0), warning=parser_stats.get("binaryMagicResyncs", 0) > 0),
-        _status_item("parse_errors", parser_stats.get("parseErrors", 0), warning=parser_stats.get("parseErrors", 0) > 0),
-        _status_item("csv_rows", runtime_stats.get("csvRowsWritten", 0)),
+        _status_item("parsed_total", _format_counter(parser_stats.get("parsedFramesTotal"))),
+        _status_item("parsed_binary", _format_counter(parser_stats.get("parsedBinaryFrames"))),
+        _status_item("parsed_text", _format_counter(parser_stats.get("parsedTextFrames"))),
+        _status_item("crc_errors", _format_counter(parser_stats.get("binaryCrcErrors")), warning=_safe_counter_positive(parser_stats.get("binaryCrcErrors"))),
+        _status_item("resyncs", _format_counter(parser_stats.get("binaryMagicResyncs")), warning=_safe_counter_positive(parser_stats.get("binaryMagicResyncs"))),
+        _status_item("parse_errors", _format_counter(parser_stats.get("parseErrors")), warning=_safe_counter_positive(parser_stats.get("parseErrors"))),
+        _status_item("csv_rows", _format_counter(runtime_stats.get("csvRowsWritten"))),
         _status_item("last_error", _first_non_empty(runtime_stats.get("lastCsvError", ""), connection_status.get("lastError", ""), parser_stats.get("lastError", ""), "-"), warning=bool(_first_non_empty(runtime_stats.get("lastCsvError", ""), connection_status.get("lastError", ""), parser_stats.get("lastError", ""), ""))),
     ]
 
@@ -1384,14 +1446,14 @@ def _build_connection_panel(status: dict, queue_depth: int | str) -> list:
         _status_item("baud", _dash_if_none(status.get("baud"))),
         _status_item("read_size", _dash_if_none(status.get("readSize"))),
         _status_item("connected", "yes" if status.get("serialConnected") else "no", warning=status.get("mode") == "serial" and not status.get("serialConnected")),
-        _status_item("bytes_received", status.get("bytesReceived", 0)),
-        _status_item("chunks_received", status.get("chunksReceived", 0)),
-        _status_item("raw_lines", status.get("rawLinesReceived", 0)),
-        _status_item("dropped_chunks", status.get("droppedInputChunks", 0), warning=status.get("droppedInputChunks", 0) > 0),
-        _status_item("dropped_bytes", status.get("droppedInputBytes", 0), warning=status.get("droppedInputBytes", 0) > 0),
+        _status_item("bytes_received", _format_counter(status.get("bytesReceived"))),
+        _status_item("chunks_received", _format_counter(status.get("chunksReceived"))),
+        _status_item("raw_lines", _format_counter(status.get("rawLinesReceived"))),
+        _status_item("dropped_chunks", _format_counter(status.get("droppedInputChunks")), warning=_safe_counter_positive(status.get("droppedInputChunks"))),
+        _status_item("dropped_bytes", _format_counter(status.get("droppedInputBytes")), warning=_safe_counter_positive(status.get("droppedInputBytes"))),
         _status_item("queue_depth", queue_depth),
         _status_item("last_data", _format_wall_time(status.get("lastDataTime"))),
-        _status_item("reconnects", status.get("reconnectAttempts", 0)),
+        _status_item("reconnects", _format_counter(status.get("reconnectAttempts"))),
         _status_item("auto_reconnect", "on" if status.get("autoReconnect") else "off"),
         _status_item("dependency", status.get("dependencyMissing") or "-"),
         _status_item("last_serial_error", status.get("lastError") or "-", warning=bool(status.get("lastError"))),
@@ -1436,10 +1498,10 @@ def _build_device_panel(meta: dict, parser_stats: dict, latest_status: dict, eve
     return [
         html.Div(
             [
-                _status_item("lastStatusCode", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=bool(meta.get("lastStatusCode"))),
-                _status_item("statusFlags", _format_hex(meta.get("statusFlags"), 8), warning=bool(meta.get("statusFlags"))),
-                _status_item("droppedFrames", _dash_if_none(meta.get("droppedFrames")), warning=bool(meta.get("droppedFrames"))),
-                _status_item("outputDecimatedFrames", _dash_if_none(meta.get("outputDecimatedFrames")), warning=bool(meta.get("outputDecimatedFrames"))),
+                _status_item("lastStatusCode", f"{_format_hex(meta.get('lastStatusCode'), 4)} {meta.get('lastStatusCodeName') or '-'}", warning=_safe_counter_positive(meta.get("lastStatusCode"))),
+                _status_item("statusFlags", _format_hex(meta.get("statusFlags"), 8), warning=_safe_counter_positive(meta.get("statusFlags"))),
+                _status_item("droppedFrames", _format_counter(meta.get("droppedFrames")), warning=_safe_counter_positive(meta.get("droppedFrames"))),
+                _status_item("outputDecimatedFrames", _format_counter(meta.get("outputDecimatedFrames")), warning=_safe_counter_positive(meta.get("outputDecimatedFrames"))),
                 _status_item("last parser status", parser_stats.get("lastStatusCodeName") or "-"),
             ],
             style=STATUS_GRID_STYLE,
@@ -1463,7 +1525,7 @@ def _status_item(label: str, value: Any, warning: bool = False) -> html.Div:
     style = dict(STATUS_ITEM_STYLE)
     if warning:
         style.update(WARNING_STATUS_ITEM_STYLE)
-    return html.Div([html.Div(label, style=STATUS_LABEL_STYLE), html.Div(str(value), style=STATUS_VALUE_STYLE)], style=style)
+    return html.Div([html.Div(label, style=STATUS_LABEL_STYLE), html.Div(str(_dash_if_missing(value)), style=STATUS_VALUE_STYLE)], style=style)
 
 
 def _connection_label(status: dict, paused: bool) -> str:
@@ -1477,6 +1539,14 @@ def _connection_label(status: dict, paused: bool) -> str:
     return f"{prefix}Disconnected"
 
 
+def _connection_tone(status: dict) -> str:
+    if status.get("lastError"):
+        return "error"
+    if status.get("serialConnected") or status.get("mode") == "replay":
+        return "ok"
+    return "neutral"
+
+
 def _resolve_color_range(matrix: np.ndarray, color_mode: str, fixed_min: Any, fixed_max: Any) -> tuple[float | None, float | None]:
     finite_values = matrix[np.isfinite(matrix)]
     if color_mode == "symmetric" and finite_values.size:
@@ -1484,13 +1554,10 @@ def _resolve_color_range(matrix: np.ndarray, color_mode: str, fixed_min: Any, fi
         if max_abs > 0:
             return -max_abs, max_abs
     elif color_mode == "fixed":
-        try:
-            zmin = float(fixed_min)
-            zmax = float(fixed_max)
-            if math.isfinite(zmin) and math.isfinite(zmax) and zmin < zmax:
-                return zmin, zmax
-        except (TypeError, ValueError):
-            pass
+        zmin = _safe_float(fixed_min, default=None)
+        zmax = _safe_float(fixed_max, default=None)
+        if zmin is not None and zmax is not None and zmin < zmax:
+            return zmin, zmax
     return None, None
 
 
@@ -1547,12 +1614,13 @@ def _normalize_unit(unit: Any) -> str:
 
 
 def _format_value(value: float, unit: str = "") -> str:
-    if not np.isfinite(value):
+    if not _is_finite_number(value):
         return "NaN"
-    if math.isclose(float(value), round(float(value)), rel_tol=0.0, abs_tol=1e-9):
-        value_text = f"{int(round(float(value))):,}"
+    parsed = float(value)
+    if math.isclose(parsed, round(parsed), rel_tol=0.0, abs_tol=1e-9):
+        value_text = f"{int(round(parsed)):,}"
     else:
-        value_text = f"{float(value):,.3g}"
+        value_text = f"{parsed:,.3g}"
     return f"{value_text} {unit}".strip()
 
 
@@ -1577,8 +1645,14 @@ def _control(label: str, child: Any) -> html.Div:
     return html.Div([html.Label(label, className="control-label"), child], className="compact-control")
 
 
+def _requested_frame_type(frame_type: str | None) -> str:
+    if not frame_type or str(frame_type).strip().lower() == "auto":
+        return "FAST_BINARY"
+    return str(frame_type)
+
+
 def _frame_type_options(frame_types: list[str]) -> list[dict]:
-    return [{"label": frame_type, "value": frame_type} for frame_type in list(dict.fromkeys([*DEFAULT_FRAME_TYPES, *frame_types]))]
+    return [{"label": frame_type, "value": frame_type} for frame_type in list(dict.fromkeys(["Auto", *DEFAULT_FRAME_TYPES, *frame_types]))]
 
 
 def _history_window_options(include_advanced: bool = False) -> list[dict]:
@@ -1602,10 +1676,9 @@ def _history_window_options(include_advanced: bool = False) -> list[dict]:
 def _color_mode_options(include_fixed: bool = False) -> list[dict]:
     options = [
         {"label": "Auto", "value": "auto"},
+        {"label": "Fixed", "value": "fixed"},
         {"label": "Symmetric", "value": "symmetric"},
     ]
-    if include_fixed:
-        options.append({"label": "Fixed", "value": "fixed"})
     return options
 
 
@@ -1642,23 +1715,86 @@ def _clear_input_queue(input_queue: "queue.Queue[bytes]") -> None:
             break
 
 
-def _safe_int(value: Any) -> int | None:
+MISSING_DISPLAY_VALUES = {"", "-", "--", "—", "n/a", "na", "nan", "none", "null"}
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in MISSING_DISPLAY_VALUES
     try:
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float):
+            return math.isnan(value)
+        return bool(np.isscalar(value) and np.isnan(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_finite_number(value: Any) -> bool:
+    if _is_missing_value(value):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_int(value: Any, default: int | None = 0) -> int | None:
+    if _is_missing_value(value):
+        return default
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.lower().startswith(("0x", "+0x", "-0x")):
+                return int(text, 0)
+            parsed = float(text) if any(char in text for char in ".eE") else int(text, 10)
+            if isinstance(parsed, float):
+                if not math.isfinite(parsed):
+                    return default
+                return int(parsed)
+            return parsed
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            parsed_float = float(value)
+            return int(parsed_float) if math.isfinite(parsed_float) else default
         return int(value)
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
-def _safe_float(value: Any) -> float | None:
+def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
+    if _is_missing_value(value):
+        return default
     try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if math.isfinite(parsed) else None
+        if isinstance(value, str):
+            text = value.strip()
+            parsed = float(int(text, 0)) if text.lower().startswith(("0x", "+0x", "-0x")) else float(text)
+        else:
+            parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _safe_counter_positive(value: Any) -> bool:
+    return _safe_int(value, default=0) > 0
+
+
+def _format_counter(value: Any, missing: str = "-") -> str:
+    if _is_missing_value(value):
+        return missing
+    parsed = _safe_int(value, default=None)
+    if parsed is None:
+        return str(value)
+    return str(parsed)
 
 
 def _target_fps(render_mode: str | None, gui_target_fps: Any) -> int:
-    explicit = _safe_int(gui_target_fps)
+    explicit = _safe_int(gui_target_fps, default=None)
     if explicit in (30, 60):
         return explicit
     if render_mode == "Performance":
@@ -1669,16 +1805,20 @@ def _target_fps(render_mode: str | None, gui_target_fps: Any) -> int:
 def _history_points_limit(value: Any, render_mode: str | None) -> int:
     if str(value or "").lower() == "auto":
         return 5000 if render_mode == "Quality" else 1200
-    parsed = _safe_int(value)
+    parsed = _safe_int(value, default=None)
     return max(100, parsed or 1200)
 
 
 def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache: HistoryRenderCacheThread, frontend_stats: dict) -> dict:
     heatmap_stats = heatmap_cache.getStats()
     history_stats = history_cache.getStats()
-    heatmap_fps = float(frontend_stats.get("heatmapActualFps") or heatmap_stats.get("actualFps") or 0.0)
-    history_fps = float(frontend_stats.get("historyActualFps") or history_stats.get("actualFps") or 0.0)
-    render_skipped = int(frontend_stats.get("frontendRenderSkipped") or 0) + int(heatmap_stats.get("renderSkipped") or 0) + int(history_stats.get("renderSkipped") or 0)
+    heatmap_fps = _safe_float(_first_non_missing(frontend_stats.get("heatmapActualFps"), heatmap_stats.get("actualFps")), default=0.0)
+    history_fps = _safe_float(_first_non_missing(frontend_stats.get("historyActualFps"), history_stats.get("actualFps")), default=0.0)
+    render_skipped = (
+        _safe_int(frontend_stats.get("frontendRenderSkipped"), default=0)
+        + _safe_int(heatmap_stats.get("renderSkipped"), default=0)
+        + _safe_int(history_stats.get("renderSkipped"), default=0)
+    )
     return {
         "guiHeatmapFps": heatmap_fps,
         "guiHistoryFps": history_fps,
@@ -1687,16 +1827,17 @@ def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache
 
 
 def _fmt_rate(value: Any) -> str:
-    try:
-        return f"{float(value):.1f}"
-    except (TypeError, ValueError):
+    parsed = _safe_float(value, default=None)
+    if parsed is None:
         return "-"
+    return f"{parsed:.1f}"
 
 
 def _format_wall_time(timestamp: float | None) -> str:
-    if not timestamp:
+    parsed = _safe_float(timestamp, default=None)
+    if parsed is None or parsed <= 0:
         return "-"
-    return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+    return datetime.fromtimestamp(parsed).strftime("%H:%M:%S")
 
 
 def _clock_text() -> str:
@@ -1707,6 +1848,10 @@ def _dash_if_none(value: Any) -> Any:
     return "-" if value is None else value
 
 
+def _dash_if_missing(value: Any) -> Any:
+    return "-" if _is_missing_value(value) else value
+
+
 def _first_non_empty(*values: Any) -> Any:
     for value in values:
         if value:
@@ -1714,13 +1859,20 @@ def _first_non_empty(*values: Any) -> Any:
     return "-"
 
 
+def _first_non_missing(*values: Any) -> Any:
+    for value in values:
+        if not _is_missing_value(value):
+            return value
+    return "-"
+
+
 def _format_hex(value: Any, width: int = 4) -> str:
-    if value is None or value == "":
+    if _is_missing_value(value):
         return "-"
-    try:
-        return f"0x{int(value):0{width}X}"
-    except (TypeError, ValueError):
+    parsed = _safe_int(value, default=None)
+    if parsed is None:
         return str(value)
+    return f"0x{parsed:0{width}X}"
 
 
 PAGE_STYLE = {
