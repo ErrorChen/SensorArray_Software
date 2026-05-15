@@ -4,7 +4,7 @@ import queue
 
 from dash.development.base_component import Component
 
-from matrix_log_viewer.app import _cell_name_from_click_data, createDashApp
+from matrix_log_viewer.app import _cell_name_from_click_data, _relayout_matches_expected_follow_range, createDashApp
 from matrix_log_viewer.connection_manager import ConnectionManager
 from matrix_log_viewer.data_store import MatrixDataStore
 from matrix_log_viewer.protocol_parser import SensorArrayStreamParser
@@ -110,3 +110,40 @@ def test_gui_target_fps_control_defaults_to_60():
         assert app._sensorarray_history_cache.targetFps == 60
     finally:
         stop_app(app)
+
+
+def test_clear_revision_store_and_initial_figures_exist():
+    app = make_app()
+    try:
+        layout = app.layout
+        assert find_component(layout, "clear-revision-store") is not None
+        assert find_component(layout, "heatmap").figure is not None
+        assert find_component(layout, "history-graph").figure is not None
+    finally:
+        stop_app(app)
+
+
+def test_programmatic_follow_relayout_matches_expected_range():
+    relayout = {"xaxis.range[0]": 70.0, "xaxis.range[1]": 100.0}
+    snapshot = {
+        "followLatest": True,
+        "followRangeStart": 70.0,
+        "followRangeEnd": 100.0,
+        "historyWindow": "last_30s",
+        "xAxis": "timeSeconds",
+    }
+
+    assert _relayout_matches_expected_follow_range(relayout, snapshot)
+    assert not _relayout_matches_expected_follow_range({"xaxis.range[0]": 10.0, "xaxis.range[1]": 20.0}, snapshot)
+
+
+def test_programmatic_single_point_follow_relayout_uses_same_padding_as_frontend():
+    snapshot = {
+        "followLatest": True,
+        "followRangeStart": 4.0,
+        "followRangeEnd": 4.0,
+        "historyWindow": "all",
+        "xAxis": "timeSeconds",
+    }
+
+    assert _relayout_matches_expected_follow_range({"xaxis.range[0]": 3.5, "xaxis.range[1]": 4.5}, snapshot)

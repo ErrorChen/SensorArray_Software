@@ -242,15 +242,17 @@ def createDashApp(
     app.layout = _build_layout()
 
     app.clientside_callback(
-        "function(heatmapSnapshot, historySnapshot, current) {"
+        "function(heatmapSnapshot, historySnapshot, clearRevision, statusTick, current) {"
         " if (!window.SensorArrayLive || !window.SensorArrayLive.applySnapshots) {"
         "   return current || {};"
         " }"
-        " return window.SensorArrayLive.applySnapshots(heatmapSnapshot, historySnapshot, current || {});"
+        " return window.SensorArrayLive.applySnapshots(heatmapSnapshot, historySnapshot, clearRevision || {}, statusTick, current || {});"
         "}",
         Output("frontend-fps-store", "data"),
         Input("heatmap-snapshot-store", "data"),
         Input("history-snapshot-store", "data"),
+        Input("clear-revision-store", "data"),
+        Input("status-interval", "n_intervals"),
         State("frontend-fps-store", "data"),
     )
 
@@ -359,14 +361,37 @@ def createDashApp(
         except Exception as exc:
             return f"Connection error: {exc}"
 
-    @app.callback(Output("clear-status", "children"), Input("clear-button", "n_clicks"), prevent_initial_call=True)
-    def clear_history(n_clicks: int | None) -> str:
+    @app.callback(
+        Output("clear-status", "children"),
+        Output("clear-revision-store", "data"),
+        Output("history-follow-store", "data", allow_duplicate=True),
+        Output("history-follow-revision-store", "data", allow_duplicate=True),
+        Output("auto-follow", "value"),
+        Output("heatmap-snapshot-store", "data", allow_duplicate=True),
+        Output("history-snapshot-store", "data", allow_duplicate=True),
+        Input("clear-button", "n_clicks"),
+        State("clear-revision-store", "data"),
+        State("history-follow-revision-store", "data"),
+        prevent_initial_call=True,
+    )
+    def clear_history(n_clicks: int | None, clear_state: dict | None, follow_revision: Any) -> tuple[Any, dict, bool, int, list[str], dict, dict]:
         if not n_clicks:
-            return no_update
+            return no_update, no_update, no_update, no_update, no_update, no_update, no_update
         dataStore.clear()
-        heatmap_cache.reset()
-        history_cache.reset()
-        return f"History cleared at {_clock_text()}."
+        heatmap_cache.reset(reason="clear")
+        history_cache.reset(reason="clear")
+        clear_revision = (_safe_int((clear_state or {}).get("revision"), default=0) or 0) + 1
+        next_follow_revision = (_safe_int(follow_revision, default=0) or 0) + 1
+        clear_payload = {"revision": clear_revision, "reason": "clear", "time": time.time()}
+        return (
+            f"History cleared at {_clock_text()}.",
+            clear_payload,
+            True,
+            next_follow_revision,
+            ["enabled"],
+            {},
+            {},
+        )
 
     @app.callback(Output("save-status", "children"), Input("save-button", "n_clicks"), State("frame-type-dropdown", "value"), prevent_initial_call=True)
     def save_snapshot(n_clicks: int | None, frame_type: str | None) -> str:
@@ -430,6 +455,7 @@ def createDashApp(
         Input("auto-follow", "value"),
         State("history-follow-store", "data"),
         State("history-follow-revision-store", "data"),
+        State("history-snapshot-store", "data"),
         prevent_initial_call=True,
     )
     def update_history_follow(
@@ -438,6 +464,7 @@ def createDashApp(
         auto_follow_values: list[str] | None,
         current: bool,
         current_revision: Any,
+        history_snapshot: dict | None,
     ) -> tuple[bool, int]:
         triggered = ctx.triggered_id
         revision = _safe_int(current_revision, default=0) or 0
@@ -447,6 +474,8 @@ def createDashApp(
             enabled = "enabled" in (auto_follow_values or [])
             return enabled, revision + 1 if enabled and not bool(current) else revision
         if triggered == "history-graph" and _relayout_has_manual_x_range(relayout_data):
+            if _relayout_matches_expected_follow_range(relayout_data, history_snapshot):
+                return bool(current), revision
             return False, revision
         return bool(current), revision
 
@@ -660,6 +689,7 @@ def _build_layout() -> html.Div:
             dcc.Store(id="history-render-state", data={}),
             dcc.Store(id="history-follow-store", data=True),
             dcc.Store(id="history-follow-revision-store", data=0),
+            dcc.Store(id="clear-revision-store", data={"revision": 0}),
             dcc.Store(id="warning-state-store", data={}),
             dcc.Interval(id="ingest-interval", interval=DEFAULT_INGEST_INTERVAL_MS, n_intervals=0),
             dcc.Interval(id="render-interval", interval=DEFAULT_RENDER_INTERVAL_MS, n_intervals=0),
@@ -731,6 +761,7 @@ def _build_layout() -> html.Div:
                     html.Section(
                         dcc.Graph(
                             id="heatmap",
+                            figure=_empty_figure("No data for selected stream.", "8x8 Matrix"),
                             config={"displayModeBar": False, "responsive": True, "doubleClick": "reset"},
                             className="graph graph-matrix",
                         ),
@@ -739,6 +770,7 @@ def _build_layout() -> html.Div:
                     html.Section(
                         dcc.Graph(
                             id="history-graph",
+                            figure=_empty_figure("No history data for selected cell.", "History"),
                             config={
                                 "displayModeBar": True,
                                 "modeBarButtonsToRemove": ["select2d", "lasso2d"],
@@ -1260,7 +1292,7 @@ def _history_stats_text(
         f"downsampled: {'yes' if downsampled else 'no'} | "
         f"follow latest: {'yes' if auto_follow else 'no'} | "
         f"input fps: {runtime_stats.get('parsedBinaryFps', 0.0):.1f} | "
-        f"gui fps: {runtime_stats.get('renderedFrameFps', 0.0):.1f}"
+        f"visual fps: {runtime_stats.get('visualUpdateFps', 0.0):.1f}"
     )
 
 
@@ -1277,6 +1309,76 @@ def _relayout_has_manual_x_range(relayout_data: dict | None) -> bool:
         return False
     keys = set(relayout_data)
     return bool({"xaxis.range[0]", "xaxis.range[1]", "xaxis.range"} & keys)
+
+
+def _relayout_matches_expected_follow_range(relayout_data: dict | None, snapshot: dict | None) -> bool:
+    actual = _relayout_x_range(relayout_data)
+    expected = _expected_follow_range_from_snapshot(snapshot)
+    if actual is None or expected is None:
+        return False
+    return _ranges_close(actual, expected)
+
+
+def _relayout_x_range(relayout_data: dict | None) -> tuple[float, float] | None:
+    if not relayout_data:
+        return None
+    if isinstance(relayout_data.get("xaxis.range"), (list, tuple)) and len(relayout_data["xaxis.range"]) >= 2:
+        start = _safe_float(relayout_data["xaxis.range"][0], default=None)
+        end = _safe_float(relayout_data["xaxis.range"][1], default=None)
+    else:
+        start = _safe_float(relayout_data.get("xaxis.range[0]"), default=None)
+        end = _safe_float(relayout_data.get("xaxis.range[1]"), default=None)
+    if start is None or end is None:
+        return None
+    return (float(start), float(end))
+
+
+def _expected_follow_range_from_snapshot(snapshot: dict | None) -> tuple[float, float] | None:
+    if not snapshot or not snapshot.get("followLatest", False):
+        return None
+    start = _safe_float(snapshot.get("followRangeStart"), default=None)
+    end = _safe_float(snapshot.get("followRangeEnd"), default=None)
+    if start is not None and end is not None:
+        return _pad_expected_follow_range(float(start), float(end), str(snapshot.get("xAxis") or "timeSeconds"), str(snapshot.get("historyWindow") or ""))
+
+    x_values = snapshot.get("xAppend") or snapshot.get("x") or []
+    finite_x = [float(value) for value in (_safe_float(value, default=None) for value in x_values) if value is not None]
+    if not finite_x:
+        return None
+    latest = finite_x[-1]
+    seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(str(snapshot.get("historyWindow") or ""))
+    x_axis = str(snapshot.get("xAxis") or "timeSeconds")
+    if seconds and x_axis == "timeSeconds":
+        return (latest - seconds, latest)
+    if seconds and x_axis == "timestampUs":
+        return (latest - seconds * 1_000_000.0, latest)
+    if len(finite_x) == 1:
+        pad = 500_000.0 if x_axis == "timestampUs" else 0.5
+        return (latest - pad, latest + pad)
+    return (min(finite_x), max(finite_x))
+
+
+def _pad_expected_follow_range(start: float, end: float, x_axis: str, history_window: str) -> tuple[float, float]:
+    if end < start:
+        start, end = end, start
+    if end > start:
+        return (start, end)
+    seconds = {"last_10s": 10.0, "last_30s": 30.0, "last_60s": 60.0, "last_5min": 300.0}.get(history_window)
+    if seconds and x_axis == "timestampUs":
+        pad = max(500_000.0, seconds * 1_000_000.0 * 0.05)
+    elif seconds and x_axis == "timeSeconds":
+        pad = max(0.5, seconds * 0.05)
+    else:
+        pad = 500_000.0 if x_axis == "timestampUs" else 0.5
+    return (start - pad, end + pad)
+
+
+def _ranges_close(actual: tuple[float, float], expected: tuple[float, float]) -> bool:
+    if not all(math.isfinite(value) for value in (*actual, *expected)):
+        return False
+    span = max(abs(expected[1] - expected[0]), abs(actual[1] - actual[0]), 1.0)
+    tolerance = max(span * 0.002, 1e-6)
+    return abs(actual[0] - expected[0]) <= tolerance and abs(actual[1] - expected[1]) <= tolerance
 
 
 def _build_compact_status_bar(
@@ -1311,14 +1413,9 @@ def _build_compact_status_bar(
         runtime_stats.get("parsedBinaryFps"),
         0.0,
     )
-    gui_fps = _first_non_missing(
-        runtime_stats.get("guiHistoryFps"),
-        runtime_stats.get("guiHeatmapFps"),
-        runtime_stats.get("renderedFrameFps"),
-        runtime_stats.get("guiDisplayedFps"),
-        0.0,
-    )
-    cb_fps = _first_non_missing(runtime_stats.get("renderTickFps"), 0.0)
+    visual_fps = _first_non_missing(runtime_stats.get("visualUpdateFps"), runtime_stats.get("guiHistoryFps"), runtime_stats.get("guiHeatmapFps"), 0.0)
+    cb_fps = _first_non_missing(runtime_stats.get("callbackFps"), runtime_stats.get("renderTickFps"), 0.0)
+    raf_fps = _first_non_missing(runtime_stats.get("browserRafFps"), 0.0)
     idle_callbacks = _safe_int(runtime_stats.get("idleCallbacks"), default=0)
     no_revision_callbacks = _safe_int(runtime_stats.get("noRevisionCallbacks"), default=0)
     coalesced_frames = _safe_int(runtime_stats.get("frontendCoalescedFrames"), default=0)
@@ -1330,8 +1427,9 @@ def _build_compact_status_bar(
         _status_chip("selected", f"{selected_cell} {selected_value}".strip()),
         _status_chip("seq", _format_counter(meta.get("seq"))),
         _status_chip("input fps", _fmt_rate(input_fps)),
-        _status_chip("gui fps", _fmt_rate(gui_fps)),
+        _status_chip("visual fps", _fmt_rate(visual_fps)),
         _status_chip("cb fps", _fmt_rate(cb_fps)),
+        _status_chip("raf fps", _fmt_rate(raf_fps)),
         _status_chip("idle/no rev", f"{idle_callbacks}/{no_revision_callbacks}"),
         _status_chip("coalesced/drop", f"{_format_counter(coalesced_frames)}/{_format_counter(dropped_frames)}"),
         _status_chip("status", status_code, status_tone),
@@ -1414,6 +1512,11 @@ def _build_parser_diagnostics(parser_stats: dict, runtime_stats: dict, queue_dep
         ("parse_errors", _format_counter(parser_stats.get("parseErrors"))),
         ("bytes/sec", f"{_safe_float(runtime_stats.get('bytesPerSec'), default=0.0):.0f}"),
         ("queue_depth", queue_depth),
+        ("browser_raf_fps", _fmt_rate(runtime_stats.get("browserRafFps"))),
+        ("visual_update_fps", _fmt_rate(runtime_stats.get("visualUpdateFps"))),
+        ("callback_fps", _fmt_rate(runtime_stats.get("callbackFps"))),
+        ("history_plotly_fps", _fmt_rate(runtime_stats.get("guiHistoryFps"))),
+        ("heatmap_plotly_fps", _fmt_rate(runtime_stats.get("guiHeatmapFps"))),
         ("render_tick_fps", _fmt_rate(runtime_stats.get("renderTickFps"))),
         ("rendered_frame_fps", _fmt_rate(runtime_stats.get("renderedFrameFps"))),
         ("frontend_coalesced", _format_counter(runtime_stats.get("frontendCoalescedFrames"))),
@@ -1455,7 +1558,8 @@ def _build_status_bar(meta: dict, parser_stats: dict, connection_status: dict, r
         _status_item("bytes/sec", f"{_safe_float(runtime_stats.get('bytesPerSec'), default=0.0):.0f}"),
         _status_item("binary_fps", _fmt_rate(runtime_stats.get("parsedBinaryFps"))),
         _status_item("text_fps", _fmt_rate(runtime_stats.get("parsedTextFps"))),
-        _status_item("gui_fps", _fmt_rate(runtime_stats.get("guiDisplayedFps"))),
+        _status_item("visual_fps", _fmt_rate(runtime_stats.get("visualUpdateFps"))),
+        _status_item("browser_raf_fps", _fmt_rate(runtime_stats.get("browserRafFps"))),
         _status_item("bytes", _format_counter(connection_status.get("bytesReceived"))),
         _status_item("chunks", _format_counter(connection_status.get("chunksReceived"))),
         _status_item("queue_depth", queue_depth),
@@ -1861,16 +1965,29 @@ def _render_runtime_stats(heatmap_cache: HeatmapRenderCacheThread, history_cache
     heatmap_snapshot = heatmap_cache.getLatest() or {}
     heatmap_fps = _safe_float(_first_non_missing(frontend_stats.get("heatmapActualFps"), heatmap_stats.get("actualFps")), default=0.0)
     history_fps = _safe_float(_first_non_missing(frontend_stats.get("historyActualFps"), history_stats.get("actualFps")), default=0.0)
+    visual_fps = _safe_float(frontend_stats.get("visualUpdateFps"), default=0.0)
+    browser_raf_fps = _safe_float(frontend_stats.get("browserRafFps"), default=0.0)
+    callback_fps = _safe_float(frontend_stats.get("callbackFps"), default=0.0)
     frontend_dropped = _safe_int(frontend_stats.get("droppedFrames"), default=0)
-    frontend_coalesced = _safe_int(frontend_stats.get("coalescedFrames"), default=0)
+    frontend_coalesced = (
+        _safe_int(frontend_stats.get("coalescedFrames"), default=0)
+        + _safe_int(frontend_stats.get("coalescedHistoryUpdates"), default=0)
+        + _safe_int(frontend_stats.get("coalescedHeatmapUpdates"), default=0)
+    )
     cache_skipped = _safe_int(heatmap_stats.get("renderSkipped"), default=0) + _safe_int(history_stats.get("renderSkipped"), default=0)
     return {
         "guiHeatmapFps": heatmap_fps,
         "guiHistoryFps": history_fps,
+        "visualUpdateFps": visual_fps,
+        "browserRafFps": browser_raf_fps,
+        "callbackFps": callback_fps,
         "renderSkipped": frontend_dropped + cache_skipped,
         "frontendCoalescedFrames": frontend_coalesced,
         "frontendDroppedFrames": frontend_dropped,
         "renderCacheSkipped": cache_skipped,
+        "lastClientError": frontend_stats.get("lastClientError", ""),
+        "lastHistoryError": frontend_stats.get("lastHistoryError", ""),
+        "lastHeatmapError": frontend_stats.get("lastHeatmapError", ""),
         "heatmapUnit": heatmap_snapshot.get("unit") or "-",
         "heatmapFiniteMin": heatmap_snapshot.get("finiteMin"),
         "heatmapFiniteMax": heatmap_snapshot.get("finiteMax"),

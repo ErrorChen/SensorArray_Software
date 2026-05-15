@@ -104,6 +104,88 @@ def test_history_follow_latest_range_time_seconds():
     assert snapshot["latestX"] == pytest.approx(100.0)
 
 
+def test_history_first_valid_data_after_empty_is_reset_with_lifecycle_fields():
+    store = MatrixDataStore(maxPointsPerCell=20)
+    cache = HistoryRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", xAxis="timeSeconds", historyWindow="last_30s", followLatest=True)
+    empty_snapshot = cache.getLatest()
+
+    store.addFrame(make_frame(1, timestamp_us=1_000_000))
+    with cache._lock:
+        first_data = cache._build_snapshot_locked(force_reset=False)
+        cache.latestHistorySnapshot = first_data
+
+    assert empty_snapshot["reset"] is True
+    assert first_data["reset"] is True
+    assert first_data["revisionReason"] == "first_data"
+    assert first_data["resetNonce"] > empty_snapshot["resetNonce"]
+    assert first_data["clearRevision"] == empty_snapshot["clearRevision"]
+    assert "followRangeStart" in first_data
+    assert "followRangeEnd" in first_data
+
+
+def test_history_append_snapshot_contains_lifecycle_and_follow_range():
+    store = MatrixDataStore(maxPointsPerCell=20)
+    for seq in range(3):
+        store.addFrame(make_frame(seq, timestamp_us=seq * 1_000_000))
+    cache = HistoryRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", xAxis="timeSeconds", historyWindow="last_30s", followLatest=True)
+    reset_snapshot = cache.getLatest()
+
+    store.addFrame(make_frame(3, timestamp_us=3_000_000))
+    with cache._lock:
+        append_snapshot = cache._build_snapshot_locked(force_reset=False)
+
+    assert reset_snapshot["reset"] is True
+    assert append_snapshot["reset"] is False
+    assert append_snapshot["revisionReason"] == "append"
+    assert append_snapshot["resetNonce"] == reset_snapshot["resetNonce"]
+    assert append_snapshot["clearRevision"] == reset_snapshot["clearRevision"]
+    assert append_snapshot["followRangeStart"] is not None
+    assert append_snapshot["followRangeEnd"] == pytest.approx(3.0)
+
+
+def test_history_clear_increments_clear_revision_and_next_data_resets():
+    store = MatrixDataStore(maxPointsPerCell=20)
+    for seq in range(3):
+        store.addFrame(make_frame(seq, timestamp_us=seq * 1_000_000))
+    cache = HistoryRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", xAxis="timeSeconds", historyWindow="last_30s", followLatest=True)
+    before_clear = cache.getLatest()
+
+    store.clear()
+    cache.reset(reason="clear")
+    cleared = cache.getLatest()
+    store.addFrame(make_frame(10, timestamp_us=10_000_000))
+    with cache._lock:
+        first_after_clear = cache._build_snapshot_locked(force_reset=False)
+
+    assert cleared["reset"] is True
+    assert cleared["revisionReason"] == "clear"
+    assert cleared["clearRevision"] > before_clear["clearRevision"]
+    assert cleared["resetNonce"] > before_clear["resetNonce"]
+    assert first_after_clear["reset"] is True
+    assert first_after_clear["revisionReason"] == "first_data"
+    assert first_after_clear["clearRevision"] == cleared["clearRevision"]
+
+
+def test_history_key_change_resets_and_bumps_reset_nonce():
+    store = MatrixDataStore(maxPointsPerCell=20)
+    for seq in range(3):
+        store.addFrame(make_frame(seq, timestamp_us=seq * 1_000_000))
+    cache = HistoryRenderCacheThread(store)
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D1", xAxis="timeSeconds", historyWindow="last_30s", followLatest=True)
+    first = cache.getLatest()
+
+    cache.updateControls(stream="FAST_BINARY", selectedCell="S1D2", xAxis="timeSeconds", historyWindow="last_30s", followLatest=True)
+    changed = cache.getLatest()
+
+    assert changed["reset"] is True
+    assert changed["revisionReason"] == "key_changed"
+    assert changed["selectedCell"] == "S1D2"
+    assert changed["resetNonce"] > first["resetNonce"]
+
+
 def test_follow_latest_click_forces_revision():
     store = MatrixDataStore(maxPointsPerCell=20)
     for seq in range(5):

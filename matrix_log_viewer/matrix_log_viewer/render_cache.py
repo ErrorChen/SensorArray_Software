@@ -46,6 +46,9 @@ class HeatmapRenderCacheThread(threading.Thread):
         self.fixedMax: float | None = None
         self.latestHeatmapSnapshot: dict | None = None
         self._cacheRevision = 0
+        self._resetNonce = 0
+        self._clearRevision = 0
+        self._revisionReason = "init"
         self._lastDataRevision: int | None = None
         self.renderSkipped = 0
         self._fpsSamples: list[float] = []
@@ -76,6 +79,7 @@ class HeatmapRenderCacheThread(threading.Thread):
                 self.colorMode = str(colorMode)
             self.fixedMin = fixedMin
             self.fixedMax = fixedMax
+            self._revisionReason = "controls"
             self._cacheRevision += 1
             self.latestHeatmapSnapshot = self._build_snapshot_locked(force=True)
 
@@ -87,8 +91,12 @@ class HeatmapRenderCacheThread(threading.Thread):
         with self._lock:
             return {"targetFps": self.targetFps, "actualFps": _sample_fps(self._fpsSamples), "renderSkipped": self.renderSkipped}
 
-    def reset(self) -> None:
+    def reset(self, reason: str = "reset") -> None:
         with self._lock:
+            if reason == "clear":
+                self._clearRevision += 1
+            self._resetNonce += 1
+            self._revisionReason = str(reason or "reset")
             self._lastDataRevision = None
             self._cacheRevision += 1
             self.latestHeatmapSnapshot = self._build_snapshot_locked(force=True)
@@ -122,6 +130,9 @@ class HeatmapRenderCacheThread(threading.Thread):
         return {
             "kind": "heatmap",
             "cacheRevision": self._cacheRevision,
+            "resetNonce": self._resetNonce,
+            "clearRevision": self._clearRevision,
+            "revisionReason": self._revisionReason if force else "append",
             "stream": snapshot.get("stream") or self.stream,
             "revision": data_revision,
             "seq": snapshot.get("seq"),
@@ -170,6 +181,9 @@ class HistoryRenderCacheThread(threading.Thread):
         self._currentKey: HistoryKey | None = None
         self._lastSeq: int | None = None
         self._cacheRevision = 0
+        self._resetNonce = 0
+        self._clearRevision = 0
+        self._pendingRevisionReason: str | None = None
         self.renderSkipped = 0
         self._fpsSamples: list[float] = []
 
@@ -220,6 +234,10 @@ class HistoryRenderCacheThread(threading.Thread):
                 or follow_revision_changed
             )
             if force_reset:
+                if follow_revision_changed or (not old_follow_latest and self.followLatest):
+                    self._pendingRevisionReason = "follow"
+                else:
+                    self._pendingRevisionReason = "key_changed"
                 self._currentKey = None
                 self._lastSeq = None
                 self._cacheRevision += 1
@@ -233,8 +251,11 @@ class HistoryRenderCacheThread(threading.Thread):
         with self._lock:
             return {"targetFps": self.targetFps, "actualFps": _sample_fps(self._fpsSamples), "renderSkipped": self.renderSkipped}
 
-    def reset(self) -> None:
+    def reset(self, reason: str = "reset") -> None:
         with self._lock:
+            if reason == "clear":
+                self._clearRevision += 1
+            self._pendingRevisionReason = str(reason or "reset")
             self._currentKey = None
             self._lastSeq = None
             self._cacheRevision += 1
@@ -276,6 +297,8 @@ class HistoryRenderCacheThread(threading.Thread):
             bool(self.showMarkers),
         )
         key_changed = key != self._currentKey
+        previous_key = self._currentKey
+        previous_last_seq = self._lastSeq
         if force_reset or key_changed or self._lastSeq is None:
             x_full, y_full, meta_full = self.dataStore.getCellHistoryArrays(
                 self.stream,
@@ -302,6 +325,18 @@ class HistoryRenderCacheThread(threading.Thread):
             self._currentKey = key
             self._lastSeq = _last_seq(meta_full.get("seq"))
             self._cacheRevision += 1
+            self._resetNonce += 1
+            revision_reason = self._pendingRevisionReason
+            if revision_reason is None:
+                if len(x_full) > 0 and previous_last_seq is None:
+                    revision_reason = "first_data"
+                elif previous_key is not None and key_changed:
+                    revision_reason = "key_changed"
+                elif force_reset:
+                    revision_reason = "reset"
+                else:
+                    revision_reason = "key_changed" if key_changed else "first_data"
+            self._pendingRevisionReason = None
             rendered_x = x_full[selected]
             follow_range = _resolve_follow_range(
                 x_full,
@@ -317,6 +352,9 @@ class HistoryRenderCacheThread(threading.Thread):
                 "kind": "history",
                 "reset": True,
                 "cacheRevision": self._cacheRevision,
+                "resetNonce": self._resetNonce,
+                "clearRevision": self._clearRevision,
+                "revisionReason": revision_reason,
                 "key": key.as_string(),
                 "stream": self.stream,
                 "selectedCell": self.selectedCell,
@@ -373,6 +411,9 @@ class HistoryRenderCacheThread(threading.Thread):
             "kind": "history",
             "reset": False,
             "cacheRevision": self._cacheRevision,
+            "resetNonce": self._resetNonce,
+            "clearRevision": self._clearRevision,
+            "revisionReason": "append",
             "key": key.as_string(),
             "stream": self.stream,
             "selectedCell": self.selectedCell,

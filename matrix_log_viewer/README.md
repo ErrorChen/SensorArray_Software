@@ -86,7 +86,9 @@ The UI deliberately separates these sources:
 - `outFps`: device output rate.
 - `parsedFps`: host parser frame rate.
 - `storedFps`: host store/CSV frame rate.
-- `guiFps`: browser render rate.
+- `browserRafFps`: browser `requestAnimationFrame` refresh rate.
+- `visualFps`: successful Plotly visual updates (`react`/`extendTraces`/`relayout`).
+- `callbackFps`: Dash clientside live-update callback frequency.
 - `DEVICE_DROP`: device-side passive drop.
 - `DEVICE_DECIMATED`: active firmware output decimation.
 - `OUTPUT_DIV`: active output divisor.
@@ -105,7 +107,7 @@ PROTOCOL_RISK: firmware reported partialAfterFirstByte > 0
 
 ## GUI Performance
 
-Receive/parse/store runs independently from browser rendering. `MatrixDataStore` uses numpy ring buffers and live history callbacks do not build pandas DataFrames. Python publishes lightweight snapshots; `assets/plotly_live_update.js` updates Plotly with `restyle`, `extendTraces`, `relayout`, and requestAnimationFrame coalescing.
+Receive/parse/store runs independently from browser rendering. `MatrixDataStore` uses numpy ring buffers and live history callbacks do not build pandas DataFrames. Python publishes lightweight snapshots; `assets/plotly_live_update.js` updates Plotly with `react`, `restyle`, `extendTraces`, `relayout`, and requestAnimationFrame coalescing. Snapshot revisions are acknowledged only after the relevant Plotly operation succeeds, so startup/reset snapshots are retried if the Dash graph div is not ready yet.
 
 Recommended high-rate settings:
 
@@ -118,6 +120,14 @@ Recommended high-rate settings:
 - History max points: 1000-1200
 
 `GUI render interval ms` affects display refresh only. It does not change device sampling, parser throughput, or dataStore/CSV retention.
+
+Manual history-graph acceptance after render-cache changes:
+
+1. Start the GUI with no hardware connected. The status chips should show `raf fps` near the browser refresh rate, while `visual fps` can be 0 because no Plotly data is changing.
+2. Connect a FAST_BINARY source and do not double-click the Plotly reset control. The history graph should reset on the first valid data snapshot, follow the latest selected window, and autoscale Y over the visible X range.
+3. Change the selected cell, unit, stream, or history window. The history graph should reset once and then continue on the append path.
+4. Click Clear. The backend store/cache and frontend Plotly state should both clear; the next valid snapshot should behave like first data without preserving the old axis range.
+5. Manually zoom or pan the history X axis. Follow Latest should turn off. Clicking Follow Latest should immediately relayout the existing data back to the newest window, even before new serial data arrives.
 
 ## Binary Debug CLI
 
