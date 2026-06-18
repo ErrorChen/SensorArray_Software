@@ -1,0 +1,2 @@
+RCMD,id=7,old=8,req=4,status=accepted,generation=3
+RAPP,id=7,seq=101,old=8,new=4,gen=4,status=applied

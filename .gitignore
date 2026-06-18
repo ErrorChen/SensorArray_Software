@@ -1,5 +1,6 @@
 /.venv/
 /.vscode/
+/.idea/
 
 # Python caches
 __pycache__/
@@ -17,8 +18,12 @@ env/
 
 # Runtime outputs
 exports/
+artifacts/
 *.log
 *.tmp
+
+# Editable/install metadata
+*.egg-info/
 
 # Local protocol/reference checkouts
 _hardware_ref/

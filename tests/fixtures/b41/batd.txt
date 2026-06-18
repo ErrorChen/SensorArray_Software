@@ -1,0 +1,1 @@
+BATD,read=ok,state=present,bt=3870,br=unknown,fresh=1,status=0x61,dg=1,a8d=100,ac=200,a8g=300,z=-1/2

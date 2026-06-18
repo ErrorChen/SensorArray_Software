@@ -1,0 +1,1 @@
+ADS,chip=1262,dev=0,rev=3,adc=ADC1

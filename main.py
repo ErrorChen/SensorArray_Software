@@ -6,15 +6,13 @@ from pathlib import Path
 
 def main() -> int:
     project_root = Path(__file__).resolve().parent
-    viewer_dir = project_root / "matrix_log_viewer"
-    if not viewer_dir.exists():
-        raise RuntimeError(f"Matrix viewer directory not found: {viewer_dir}")
+    src_dir = project_root / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
 
-    # Default entry point: launch the Dash viewer. COM ports can be selected in the web UI.
-    sys.path.insert(0, str(viewer_dir))
-    from run_viewer import main as run_viewer_main
+    from sensorarray_app.__main__ import main as app_main
 
-    return run_viewer_main()
+    return app_main(sys.argv[1:])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,212 @@
+.app-shell {
+  min-height: 100vh;
+  padding: 12px;
+  box-sizing: border-box;
+  background: #eef3f7;
+  color: #17202a;
+  font-family: "Segoe UI", Arial, sans-serif;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(520px, 1.25fr) minmax(440px, 0.75fr);
+  grid-template-rows: minmax(270px, 0.9fr) minmax(300px, 1.1fr);
+  gap: 12px;
+}
+
+.panel {
+  min-width: 0;
+  border: 1px solid #cad7e3;
+  border-radius: 8px;
+  background: #fff;
+  box-sizing: border-box;
+  padding: 10px;
+}
+
+.heatmap-panel {
+  grid-column: 1;
+  grid-row: 1 / 3;
+}
+
+.setup-panel {
+  grid-column: 2;
+  grid-row: 1;
+  max-height: 43vh;
+  overflow: auto;
+}
+
+.trend-panel {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.logs-panel {
+  margin-top: 12px;
+  min-height: 220px;
+  height: 24vh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.panel-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.setup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fff;
+  padding-bottom: 6px;
+}
+
+.setup-header h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.state-chip {
+  border: 1px solid #8fb1d6;
+  background: #f4f9ff;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.setup-section {
+  padding: 8px 0;
+  border-top: 1px solid #edf2f7;
+}
+
+.setup-section h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: #334e68;
+}
+
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 6px;
+}
+
+.button-row,
+.logs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.input {
+  min-height: 34px;
+  min-width: 0;
+  border: 1px solid #bfccd9;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+
+.wide {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.button {
+  min-height: 32px;
+  border-radius: 6px;
+  padding: 0 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.button.primary {
+  color: white;
+  background: #0f766e;
+  border: 1px solid #0f766e;
+}
+
+.button.secondary {
+  color: #17202a;
+  background: #fff;
+  border: 1px solid #8aa2b7;
+}
+
+.button.quiet {
+  color: #475569;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+}
+
+.segmented label {
+  margin-right: 8px;
+  white-space: nowrap;
+}
+
+.heatmap-graph {
+  height: calc(100vh - 90px);
+  min-height: 620px;
+}
+
+.trend-graph {
+  height: 42vh;
+  min-height: 285px;
+}
+
+.small-text {
+  color: #52606d;
+  font-size: 12px;
+  line-height: 1.35;
+  margin-top: 4px;
+}
+
+.metric {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.diagnostics,
+.raw-log-terminal {
+  margin: 0;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+
+.raw-log-terminal {
+  overflow: auto;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 6px;
+  padding: 8px;
+}
+
+@media (max-width: 980px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .heatmap-panel,
+  .setup-panel,
+  .trend-panel {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .setup-panel {
+    max-height: none;
+  }
+
+  .heatmap-graph {
+    height: 70vh;
+    min-height: 420px;
+  }
+}

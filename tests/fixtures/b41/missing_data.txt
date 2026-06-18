@@ -1,0 +1,2 @@
+C,seq=12,ts=12000,rows=2,cells=16,gen=12,rid=9,rf=03,pf=03,sf=03,bad=0/0/0,fmt=pf6,n=16
+K,seq=12,gen=12,rid=9,crc=89F0F1A8
