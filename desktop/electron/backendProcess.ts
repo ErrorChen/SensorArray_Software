@@ -1,4 +1,5 @@
-import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -7,7 +8,19 @@ export type BackendProcess = {
   child: ChildProcessWithoutNullStreams;
   port: number;
   url: string;
+  stdout: string[];
   stderr: string[];
+  exited: boolean;
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  spawnError: Error | null;
+};
+
+export type BackendStartOptions = {
+  projectRoot: string;
+  port: number;
+  isPackaged: boolean;
+  resourcesPath: string;
 };
 
 export async function findAvailablePort(startPort: number): Promise<number> {
@@ -19,38 +32,52 @@ export async function findAvailablePort(startPort: number): Promise<number> {
   throw new Error(`No available backend port from ${startPort}`);
 }
 
-export function startBackend(projectRoot: string, port: number): BackendProcess {
-  const python = resolvePython(projectRoot);
-  const args = ["-m", "sensorarray_backend", "--host", "127.0.0.1", "--port", String(port)];
-  const child = spawn(python, args, {
-    cwd: projectRoot,
+export function startBackend(options: BackendStartOptions): BackendProcess {
+  const command = resolveBackendCommand(options);
+  const child = spawn(command.executable, command.args, {
+    cwd: command.cwd,
     windowsHide: true,
-    env: {
-      ...process.env,
-      PYTHONPATH: path.join(projectRoot, "src")
-    }
+    env: command.env
   });
+  const stdout: string[] = [];
   const stderr: string[] = [];
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderr.push(chunk.toString("utf8"));
-    while (stderr.length > 120) {
-      stderr.shift();
-    }
-  });
-  return {
+  const backend: BackendProcess = {
     child,
-    port,
-    url: `http://127.0.0.1:${port}`,
-    stderr
+    port: options.port,
+    url: `http://127.0.0.1:${options.port}`,
+    stdout,
+    stderr,
+    exited: false,
+    exitCode: null,
+    exitSignal: null,
+    spawnError: null
   };
+  child.stdout.on("data", (chunk: Buffer) => appendProcessLog(stdout, chunk.toString("utf8")));
+  child.stderr.on("data", (chunk: Buffer) => appendProcessLog(stderr, chunk.toString("utf8")));
+  child.once("error", (error) => {
+    backend.spawnError = error;
+    appendProcessLog(stderr, `${error.message}\n`);
+  });
+  child.once("exit", (code, signal) => {
+    backend.exited = true;
+    backend.exitCode = code;
+    backend.exitSignal = signal;
+  });
+  return backend;
 }
 
-export async function waitForHealth(url: string, timeoutMs = 15000): Promise<void> {
+export async function waitForHealth(processInfo: BackendProcess, timeoutMs = 15000): Promise<void> {
   const stopTime = Date.now() + timeoutMs;
   let lastError = "";
   while (Date.now() < stopTime) {
+    if (processInfo.spawnError) {
+      throw new Error(`Backend failed to start: ${processInfo.spawnError.message}`);
+    }
+    if (processInfo.exited) {
+      throw new Error(formatBackendExit(processInfo));
+    }
     try {
-      const response = await fetch(`${url}/health`);
+      const response = await fetch(`${processInfo.url}/health`);
       if (response.ok) {
         return;
       }
@@ -64,10 +91,46 @@ export async function waitForHealth(url: string, timeoutMs = 15000): Promise<voi
 }
 
 export function stopBackend(processInfo: BackendProcess | null): void {
-  if (!processInfo || processInfo.child.killed) {
+  if (!processInfo || processInfo.exited || processInfo.child.killed) {
     return;
   }
-  processInfo.child.kill();
+  try {
+    processInfo.child.kill();
+  } catch {
+    // The process may have exited between the state check and kill request.
+  }
+}
+
+type BackendCommand = {
+  executable: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+};
+
+function resolveBackendCommand(options: BackendStartOptions): BackendCommand {
+  const args = ["--host", "127.0.0.1", "--port", String(options.port)];
+  if (options.isPackaged) {
+    const backendExe = path.join(options.resourcesPath, "backend", "SensorArrayBackend.exe");
+    if (!existsSync(backendExe)) {
+      throw new Error(`Packaged backend executable was not found: ${backendExe}`);
+    }
+    return {
+      executable: backendExe,
+      args,
+      cwd: path.dirname(backendExe),
+      env: { ...process.env }
+    };
+  }
+  return {
+    executable: resolvePython(options.projectRoot),
+    args: ["-m", "sensorarray_backend", ...args],
+    cwd: options.projectRoot,
+    env: {
+      ...process.env,
+      PYTHONPATH: buildPythonPath(options.projectRoot)
+    }
+  };
 }
 
 function resolvePython(projectRoot: string): string {
@@ -76,6 +139,24 @@ function resolvePython(projectRoot: string): string {
     return localPython;
   }
   return "python";
+}
+
+function buildPythonPath(projectRoot: string): string {
+  const srcPath = path.join(projectRoot, "src");
+  return process.env.PYTHONPATH ? `${srcPath}${path.delimiter}${process.env.PYTHONPATH}` : srcPath;
+}
+
+function appendProcessLog(log: string[], value: string): void {
+  log.push(value);
+  while (log.length > 160) {
+    log.shift();
+  }
+}
+
+function formatBackendExit(processInfo: BackendProcess): string {
+  const code = processInfo.exitCode === null ? "null" : String(processInfo.exitCode);
+  const signal = processInfo.exitSignal ?? "null";
+  return `Backend exited before becoming healthy (code=${code}, signal=${signal})`;
 }
 
 function canListen(port: number): Promise<boolean> {

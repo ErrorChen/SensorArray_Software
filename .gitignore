@@ -19,6 +19,8 @@ env/
 # Runtime outputs
 exports/
 artifacts/
+build/
+dist-backend/
 *.log
 *.tmp
 
@@ -26,6 +28,7 @@ artifacts/
 /desktop/node_modules/
 /desktop/dist/
 /desktop/dist-electron/
+/desktop/release/
 /desktop/.vite/
 /desktop/.eslintcache
 /desktop/.vitest/

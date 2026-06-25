@@ -10,7 +10,7 @@ const nodeRequire = createRequire(import.meta.url);
 const { app, BrowserWindow, dialog, ipcMain } = nodeRequire("electron") as typeof import("electron");
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const projectRoot = path.resolve(__dirname, "..", "..");
+const repoRoot = path.resolve(__dirname, "..", "..");
 const appId = "au.edu.sydney.sensorarray";
 
 let backend: BackendProcess | null = null;
@@ -37,9 +37,14 @@ ipcMain.handle("dialog:selectReplayFile", async () => {
 
 async function createWindow(): Promise<void> {
   const port = await findAvailablePort(8765);
-  backend = startBackend(projectRoot, port);
   try {
-    await waitForHealth(backend.url);
+    backend = startBackend({
+      projectRoot: repoRoot,
+      port,
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath
+    });
+    await waitForHealth(backend);
   } catch (error) {
     await showBackendError(error);
     return;
@@ -60,26 +65,37 @@ async function createWindow(): Promise<void> {
     }
   });
 
-  const devUrl = process.env.SENSORARRAY_FRONTEND_URL;
-  if (devUrl) {
-    await mainWindow.loadURL(`${devUrl}?backendUrl=${encodeURIComponent(backend.url)}`);
-  } else {
-    await mainWindow.loadFile(path.join(projectRoot, "desktop", "dist", "index.html"), {
-      query: { backendUrl: backend.url }
-    });
+  const devUrl = app.isPackaged ? undefined : process.env.SENSORARRAY_FRONTEND_URL;
+  try {
+    if (devUrl) {
+      await mainWindow.loadURL(`${devUrl}?backendUrl=${encodeURIComponent(backend.url)}`);
+    } else {
+      const indexPath = resolveRendererIndexPath();
+      if (!fs.existsSync(indexPath)) {
+        throw new Error(`Renderer index.html was not found: ${indexPath}`);
+      }
+      await mainWindow.loadFile(indexPath, {
+        query: { backendUrl: backend.url }
+      });
+    }
+  } catch (error) {
+    stopBackend(backend);
+    backend = null;
+    throw error;
   }
 }
 
 async function showBackendError(error: unknown): Promise<void> {
   const detail = error instanceof Error ? error.message : String(error);
   const stderr = backend?.stderr.join("").slice(-4000) ?? "";
+  const stdout = backend?.stdout.join("").slice(-2000) ?? "";
   mainWindow = new BrowserWindow({
     width: 900,
     height: 560,
     title: "SensorArray backend error",
     icon: resolveIconPath()
   });
-  const body = escapeHtml(`${detail}\n\n${stderr}`);
+  const body = escapeHtml(`${detail}\n\nSTDERR:\n${stderr || "(empty)"}\n\nSTDOUT:\n${stdout || "(empty)"}`);
   await mainWindow.loadURL(
     `data:text/html;charset=utf-8,${encodeURIComponent(`<pre style="white-space:pre-wrap;font:13px Consolas;padding:24px">${body}</pre>`)}`
   );
@@ -92,6 +108,13 @@ function escapeHtml(value: string): string {
   });
 }
 
+function resolveRendererIndexPath(): string {
+  if (app.isPackaged) {
+    return path.join(app.getAppPath(), "dist", "index.html");
+  }
+  return path.join(repoRoot, "desktop", "dist", "index.html");
+}
+
 function resolveIconPath(): string | undefined {
   const candidates = app.isPackaged
     ? [
@@ -99,8 +122,8 @@ function resolveIconPath(): string | undefined {
         path.join(process.resourcesPath, "sensorarray-icon.ico")
       ]
     : [
-        path.join(projectRoot, "desktop", "assets", "icons", "sensorarray-icon.ico"),
-        path.join(projectRoot, "desktop", "public", "favicon.ico")
+        path.join(repoRoot, "desktop", "assets", "icons", "sensorarray-icon.ico"),
+        path.join(repoRoot, "desktop", "public", "favicon.ico")
       ];
   return candidates.find((candidate) => fs.existsSync(candidate));
 }

@@ -12,7 +12,9 @@
     "electron:dev": "npm run build:electron && cross-env SENSORARRAY_FRONTEND_URL=http://127.0.0.1:5173 electron dist-electron/main.js",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "package:dir": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win dir --x64",
+    "package:win": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win nsis --x64"
   },
   "dependencies": {
     "echarts": "^5.5.1",
@@ -29,12 +31,60 @@
     "concurrently": "^8.2.2",
     "cross-env": "^7.0.3",
     "electron": "^31.3.1",
+    "electron-builder": "^24.13.3",
     "eslint": "^9.8.0",
     "typescript": "^5.5.4",
     "typescript-eslint": "^8.0.0",
     "vite": "^5.4.0",
     "vitest": "^2.0.5",
     "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "au.edu.sydney.sensorarray",
+    "productName": "SensorArray",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist-backend/SensorArrayBackend",
+        "to": "backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "assets/icons",
+        "to": "assets/icons",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "assets/icons/sensorarray-icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${os}-${arch}-nsis.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SensorArray"
+    }
   }
 }
-

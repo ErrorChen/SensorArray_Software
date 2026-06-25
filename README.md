@@ -61,6 +61,61 @@ resource locations when packaged. Windows may cache old taskbar/window icons;
 restart Electron or clear the Windows icon cache if the generated icon does not
 appear immediately.
 
+## Packaging Windows Installer
+
+Packaging is intended to run on Windows from the repository root.
+
+Prerequisites for maintainers:
+
+- Windows.
+- Python 3.11 or newer.
+- Node.js LTS.
+- npm.
+
+Build the Python backend sidecar, Electron app, `win-unpacked` smoke target, and
+NSIS installer with one command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package_windows.ps1
+```
+
+Outputs are written under:
+
+```text
+desktop/release/
+```
+
+The distributable installer is the `*-nsis.exe` file in `desktop/release/`.
+End users do not need Python, Node.js, npm, Git, the source tree, or `.venv`.
+The installer contains the Electron frontend and the PyInstaller-built Python
+backend sidecar. For internal validation, run
+`desktop/release/win-unpacked/SensorArray.exe` first. For normal distribution,
+use the NSIS installer, for example:
+
+```text
+desktop/release/SensorArray-0.3.0-win-x64-nsis.exe
+```
+
+The packaged app starts the backend from
+`process.resourcesPath\backend\SensorArrayBackend.exe` and loads the bundled
+`dist/index.html`; it does not use the Vite dev server or the repository
+`.venv`.
+
+Common issues:
+
+- Windows SmartScreen may warn because the installer is unsigned. Use the
+  publisher signing flow before broad distribution.
+- Antivirus software may flag unsigned Electron or PyInstaller binaries. Verify
+  the build machine and submit the installer for vendor review if needed.
+- BLE failures are usually Windows permission, adapter, or driver issues. Check
+  that Bluetooth is enabled and the adapter supports BLE.
+- Serial connection failures often mean the COM port is already open in another
+  tool. Close serial monitors before connecting.
+- If the app shows "backend failed to start", the error window includes recent
+  backend stderr/stdout. For installer builds, reproduce with
+  `desktop/release/win-unpacked/SensorArray.exe` to inspect the bundled
+  sidecar path before installing.
+
 ## Architecture
 
 ```text
