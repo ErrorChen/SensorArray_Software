@@ -37,7 +37,10 @@ class ReplayTransport:
             self._thread.join(timeout=2.0)
 
     def send_command(self, command: str) -> None:
-        self._put_state("INFO", f"replay ignored command {command.strip()}")
+        raise NotImplementedError("replay transport does not support write")
+
+    def write(self, data: bytes) -> int:
+        raise NotImplementedError("replay transport does not support write")
 
     def _run(self) -> None:
         self._put_state("STREAMING", str(self.path))

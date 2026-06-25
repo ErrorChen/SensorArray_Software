@@ -25,7 +25,7 @@ class MeasurementDomain(str, Enum):
 @dataclass(frozen=True)
 class TransportEnvelope:
     source: TransportSource
-    channel: TransportChannel
+    channel: str
     deviceId: str
     sessionGeneration: int
     receivedMonotonicNs: int

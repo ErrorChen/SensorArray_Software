@@ -16,11 +16,11 @@ export function StatusBar({ snapshot, socketState }: Props): JSX.Element {
       <div className="brand">SensorArray</div>
       <div className="statusItems">
         <span className="statusItem">
-          <RadioTower size={16} /> {connection?.mode ?? "serial"} · {connection?.state ?? "disconnected"}
+          <RadioTower size={16} /> {connection?.mode ?? "serial"} / {connection?.state ?? "disconnected"}
         </span>
         <span className="statusItem">{connection?.deviceLabel || "No device"}</span>
         <span className="statusItem">
-          <Activity size={16} /> seq {frame?.seq ?? "-"} · {frame?.fps?.toFixed(1) ?? "0.0"} fps
+          <Activity size={16} /> seq {frame?.seq ?? "-"} / {frame?.fps?.toFixed(1) ?? "0.0"} fps
         </span>
         <span className={`socketState ${socketState}`}>{socketState}</span>
       </div>
@@ -32,4 +32,3 @@ export function StatusBar({ snapshot, socketState }: Props): JSX.Element {
     </header>
   );
 }
-

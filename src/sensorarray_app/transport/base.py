@@ -16,3 +16,6 @@ class Transport(ABC):
 
     def send_command(self, command: str) -> None:
         raise NotImplementedError
+
+    def write(self, data: bytes) -> int:
+        raise NotImplementedError

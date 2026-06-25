@@ -18,12 +18,14 @@ def snapshot_payload(runtime) -> dict[str, Any]:
     matrix = runtime.matrixStore.snapshot()
     selection = runtime.current_selection_payload(matrix.activeRows)
     display_matrix = _display_matrix(runtime, matrix)
-    color_min, color_max = runtime.color_range(display_matrix)
+    color_min, color_max = runtime.color_range(display_matrix, matrix.valid)
     transport = dict(runtime.transport.status)
+    active_mode = str(transport.get("transport", "none") or "none")
+    connection_mode = runtime.selectedMode if active_mode == "none" else active_mode
     diagnostics = runtime.stats.snapshot(0.0)
     return {
         "connection": {
-            "mode": runtime.selectedMode,
+            "mode": connection_mode,
             "state": str(transport.get("state", "DISCONNECTED")).lower(),
             "deviceLabel": transport.get("device", ""),
             "generation": int(transport.get("sessionGeneration", 0) or 0),

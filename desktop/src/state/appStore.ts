@@ -2,7 +2,7 @@ import type { BackendSnapshotPayload, SelectionSnapshot } from "../api/types";
 
 export function selectionTitle(selection: Partial<SelectionSnapshot> | undefined): string {
   if (!selection) {
-    return "S1 · Primary FDC · D1-D4";
+    return "S1 Primary FDC D1-D4";
   }
   if (selection.title) {
     return selection.title;
@@ -12,7 +12,7 @@ export function selectionTitle(selection: Partial<SelectionSnapshot> | undefined
   const label = group === "primary" ? "Primary FDC" : "Secondary FDC";
   const start = selection.detectorStart ?? (group === "primary" ? 1 : 5);
   const end = selection.detectorEnd ?? (group === "primary" ? 4 : 8);
-  return `${rowLabel} · ${label} · D${start}-D${end}`;
+  return `${rowLabel} ${label} D${start}-D${end}`;
 }
 
 export function cellLabel(rowIndex: number, colIndex: number): string {
@@ -38,4 +38,3 @@ export function snapshotForDisplay(
   }
   return incoming;
 }
-

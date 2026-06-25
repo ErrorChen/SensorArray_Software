@@ -10,14 +10,16 @@ type Props = {
 export function TrendGrid({ history }: Props): JSX.Element {
   const series = history?.series ?? [];
   const padded = [0, 1, 2, 3].map((index) => series[index] ?? { cell: "-", points: [] });
+  const hasData = series.some((item) => item.points.some((point) => point.value !== null));
   return (
     <section className="trendPanel">
-      <div className="panelHeader">{history?.title ?? "S1 · Primary FDC · D1-D4"}</div>
+      <div className="panelHeader">{history?.title ?? "S1 Primary FDC D1-D4"}</div>
       <div className="trendGrid">
         {padded.map((item, index) => (
           <TrendChart key={`${item.cell}-${index}`} series={item} unit={history?.unit ?? "pF"} />
         ))}
       </div>
+      {hasData ? null : <div className="trendEmpty">No data yet</div>}
     </section>
   );
 }
@@ -31,10 +33,10 @@ function TrendChart({ series, unit }: { series: HistorySeries; unit: string }): 
       return;
     }
     chartRef.current = echarts.init(hostRef.current, undefined, { renderer: "canvas" });
-    const resize = () => chartRef.current?.resize();
-    window.addEventListener("resize", resize);
+    const observer = new ResizeObserver(() => chartRef.current?.resize());
+    observer.observe(hostRef.current);
     return () => {
-      window.removeEventListener("resize", resize);
+      observer.disconnect();
       chartRef.current?.dispose();
       chartRef.current = null;
     };

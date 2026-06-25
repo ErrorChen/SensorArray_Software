@@ -16,7 +16,7 @@ class FourPointSelection:
     @property
     def title(self) -> str:
         label = "Primary FDC" if self.fdcGroup == "primary" else "Secondary FDC"
-        return f"{self.rowLabel} 路 {label} 路 D{self.detectorStart}-D{self.detectorEnd}"
+        return f"{self.rowLabel} {label} D{self.detectorStart}-D{self.detectorEnd}"
 
     def to_payload(self) -> dict:
         return {
@@ -78,5 +78,4 @@ def fallback_title(selection: dict) -> str:
     label = "Primary FDC" if group == "primary" else "Secondary FDC"
     start = int(selection.get("detectorStart") or (1 if group == "primary" else 5))
     end = int(selection.get("detectorEnd") or (4 if group == "primary" else 8))
-    return f"{row_label} 路 {label} 路 D{start}-D{end}"
-
+    return f"{row_label} {label} D{start}-D{end}"

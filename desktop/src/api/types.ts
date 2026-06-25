@@ -1,5 +1,6 @@
 export type TransportMode = "serial" | "ble" | "wifi" | "replay";
 export type DisplayMode = "absolute_pf" | "delta_percent";
+export type CommandLineEnding = "lf" | "crlf" | "none";
 
 export type ConnectionSnapshot = {
   mode: TransportMode;
@@ -169,6 +170,20 @@ export type HistoryMessage = {
 
 export type WebSocketMessage = SnapshotMessage | LogMessage | ErrorMessage | DiscoveryMessage | HistoryMessage;
 
+export type WriteCommandRequest = {
+  text: string;
+  lineEnding: CommandLineEnding;
+  encoding: "utf-8";
+  mode: "text";
+};
+
+export type WriteCommandResponse = {
+  ok: boolean;
+  transport?: TransportMode | string;
+  bytesWritten?: number;
+  error?: string;
+};
+
 export type SerialPort = {
   device: string;
   name: string;
@@ -188,4 +203,3 @@ declare global {
     sensorarrayDesktop?: DesktopBridge;
   }
 }
-

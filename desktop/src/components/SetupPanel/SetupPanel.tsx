@@ -1,14 +1,18 @@
-import { Bluetooth, FileUp, Pause, Play, RefreshCw, Rows3, Unplug, Wifi, Zap } from "lucide-react";
+import { Bluetooth, FileUp, RefreshCw, Rows3, Wifi, Zap } from "lucide-react";
 import { useEffect, useMemo, useState as useSlot } from "react";
 
 import type { BackendHttpClient } from "../../api/httpClient";
 import type { BackendSnapshotPayload, BleDevice, SerialPort, TransportMode, WifiDevice } from "../../api/types";
+import { isBleScanDisabled } from "../../state/transportUi";
 
 type Props = {
   client: BackendHttpClient | null;
   snapshot: BackendSnapshotPayload | null;
   onError: (message: string) => void;
 };
+
+const connectedStates = new Set(["connected", "streaming"]);
+const busyStates = new Set(["connecting", "disconnecting", "reconnecting"]);
 
 export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
   const [mode, setMode] = useSlot<TransportMode>("serial");
@@ -24,12 +28,25 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
   const [replayPath, setReplayPath] = useSlot("");
   const [replaySpeed, setReplaySpeed] = useSlot(1);
   const [rows, setRows] = useSlot(8);
+  const [busyAction, setBusyAction] = useSlot<string | null>(null);
+
+  const connection = snapshot?.connection;
+  const connectionMode = connection?.mode;
+  const connectionState = connection?.state ?? "disconnected";
+  const currentModeConnected = connectionMode === mode && connectedStates.has(connectionState);
+  const currentModeBusy = connectionMode === mode && busyStates.has(connectionState);
+  const bleScanDisabled = isBleScanDisabled(connectionMode, connectionState);
 
   useEffect(() => {
     if (!client) {
       return;
     }
-    void handleModeChange(mode);
+    void run("Loading...", async () => {
+      await client.setMode(mode);
+      if (mode === "serial") {
+        await refreshSerialPorts();
+      }
+    });
   }, [client]);
 
   const visibleBleDevices = useMemo(
@@ -37,11 +54,14 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
     [bleDevices, showAdvancedBle]
   );
 
-  async function run(action: () => Promise<void>): Promise<void> {
+  async function run(label: string, action: () => Promise<void>): Promise<void> {
     try {
+      setBusyAction(label);
       await action();
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusyAction(null);
     }
   }
 
@@ -52,24 +72,80 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
     }
     await client.setMode(nextMode);
     if (nextMode === "serial") {
-      const ports = await client.listSerialPorts();
-      setSerialPorts(ports);
-      if (ports.length === 1) {
-        setSelectedPort(ports[0].device);
-      }
+      await refreshSerialPorts();
     }
-    if (nextMode === "ble") {
-      const devices = await client.scanBle();
-      setBleDevices(devices);
-      const firstVerified = devices.find((device) => device.verified || !device.advanced);
-      setSelectedBle(firstVerified?.address ?? "");
+  }
+
+  async function refreshSerialPorts(): Promise<void> {
+    if (!client) {
+      return;
     }
-    if (nextMode === "wifi") {
-      const devices = await client.discoverWifi();
-      setWifiDevices(devices);
-      const firstConfirmed = devices.find((device) => device.confirmed) ?? devices[0];
-      setSelectedWifi(firstConfirmed?.host ?? "");
+    const ports = await client.listSerialPorts();
+    setSerialPorts(ports);
+    if (!selectedPort && ports.length === 1) {
+      setSelectedPort(ports[0].device);
     }
+  }
+
+  async function scanBle(): Promise<void> {
+    if (!client || bleScanDisabled) {
+      return;
+    }
+    const devices = await client.scanBle();
+    setBleDevices(devices);
+    const firstVerified = devices.find((device) => device.verified || !device.advanced);
+    setSelectedBle((current) => current || firstVerified?.address || "");
+  }
+
+  async function discoverWifi(): Promise<void> {
+    if (!client) {
+      return;
+    }
+    const devices = await client.discoverWifi();
+    setWifiDevices(devices);
+    const firstConfirmed = devices.find((device) => device.confirmed) ?? devices[0];
+    setSelectedWifi((current) => current || firstConfirmed?.host || "");
+  }
+
+  async function primaryAction(): Promise<void> {
+    if (!client) {
+      return;
+    }
+    if (currentModeConnected) {
+      await run("Disconnecting...", () => client.disconnect());
+      return;
+    }
+    if (mode === "serial") {
+      await run("Connecting...", () => client.connectSerial(selectedPort, baud));
+    } else if (mode === "ble") {
+      await run("Connecting...", () => client.connectBle(selectedBle, selectedBle));
+    } else if (mode === "wifi") {
+      await run("Connecting...", () => client.connectWifi(selectedWifi || fallbackHost));
+    } else {
+      await run("Connecting...", async () => {
+        await client.openReplay(replayPath, replaySpeed);
+        await client.startReplay();
+      });
+    }
+  }
+
+  function primaryDisabled(): boolean {
+    if (!client || busyAction !== null || currentModeBusy) {
+      return true;
+    }
+    if (currentModeConnected) {
+      return false;
+    }
+    if (mode === "serial") {
+      return !selectedPort;
+    }
+    if (mode === "ble") {
+      return !selectedBle || bleScanDisabled;
+    }
+    if (mode === "wifi") {
+      return !(selectedWifi || fallbackHost);
+    }
+    return !replayPath;
   }
 
   return (
@@ -77,7 +153,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
       <div className="panelHeader">Setup</div>
       <div className="segmented">
         {(["serial", "ble", "wifi", "replay"] as TransportMode[]).map((item) => (
-          <button key={item} className={mode === item ? "active" : ""} onClick={() => void run(() => handleModeChange(item))}>
+          <button key={item} className={mode === item ? "active" : ""} onClick={() => void run("Loading...", () => handleModeChange(item))}>
             {item === "ble" ? "Bluetooth LE" : item === "wifi" ? "Wi-Fi UDP" : item[0].toUpperCase() + item.slice(1)}
           </button>
         ))}
@@ -95,15 +171,12 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
                 </option>
               ))}
             </select>
-            <button title="Refresh ports" onClick={() => void run(async () => setSerialPorts(await client!.listSerialPorts()))}>
+            <button title="Refresh ports" onClick={() => void run("Scanning...", refreshSerialPorts)}>
               <RefreshCw size={16} />
             </button>
           </div>
           <label>Baud</label>
           <input value={baud} type="number" min={1} onChange={(event) => setBaud(Number(event.target.value))} />
-          <button className="primary" onClick={() => void run(() => client!.connectSerial(selectedPort, baud))}>
-            <Zap size={16} /> Connect
-          </button>
         </div>
       ) : null}
 
@@ -114,7 +187,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             <option value="">Select scanned BLE device</option>
             {visibleBleDevices.map((device) => (
               <option key={device.address} value={device.address}>
-                {(device.name || "Unnamed")} · {device.address} · {device.rssi ?? "?"} dBm
+                {device.name || "Unnamed"} - {device.address} - {device.rssi ?? "?"} dBm
               </option>
             ))}
           </select>
@@ -122,15 +195,10 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             <input type="checkbox" checked={showAdvancedBle} onChange={(event) => setShowAdvancedBle(event.target.checked)} />
             Advanced devices
           </label>
-          <div className="scanState">{snapshot?.discovery.bleState ?? "idle"}</div>
-          <div className="buttonRow">
-            <button onClick={() => void run(async () => setBleDevices(await client!.scanBle()))}>
-              <Bluetooth size={16} /> Scan
-            </button>
-            <button className="primary" onClick={() => void run(() => client!.connectBle(selectedBle, selectedBle))}>
-              <Zap size={16} /> Connect
-            </button>
-          </div>
+          <div className="scanState">{bleScanDisabled ? "BLE scan disabled while connected" : snapshot?.discovery.bleState ?? "idle"}</div>
+          <button disabled={bleScanDisabled || busyAction !== null} onClick={() => void run("Scanning...", scanBle)}>
+            <Bluetooth size={16} /> {busyAction === "Scanning..." ? "Scanning..." : "Scan"}
+          </button>
         </div>
       ) : null}
 
@@ -141,20 +209,15 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             <option value="">Select discovered host</option>
             {wifiDevices.map((device) => (
               <option key={`${device.host}-${device.method}`} value={device.host}>
-                {device.host} · {device.method} · {device.confirmed ? "confirmed" : "unconfirmed"}
+                {device.host} - {device.method} - {device.confirmed ? "confirmed" : "unconfirmed"}
               </option>
             ))}
           </select>
           <label>Fallback host</label>
           <input value={fallbackHost} onChange={(event) => setFallbackHost(event.target.value)} />
-          <div className="buttonRow">
-            <button onClick={() => void run(async () => setWifiDevices(await client!.discoverWifi()))}>
-              <Wifi size={16} /> Discover
-            </button>
-            <button className="primary" onClick={() => void run(() => client!.connectWifi(selectedWifi || fallbackHost))}>
-              <Zap size={16} /> Connect
-            </button>
-          </div>
+          <button onClick={() => void run("Discovering...", discoverWifi)}>
+            <Wifi size={16} /> {busyAction === "Discovering..." ? "Discovering..." : "Discover"}
+          </button>
         </div>
       ) : null}
 
@@ -166,7 +229,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             <button
               title="Choose replay file"
               onClick={() =>
-                void run(async () => {
+                void run("Loading...", async () => {
                   const path = await window.sensorarrayDesktop?.selectReplayFile();
                   if (path) setReplayPath(path);
                 })
@@ -177,24 +240,12 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           </div>
           <label>Speed</label>
           <input type="number" min={0.01} step={0.25} value={replaySpeed} onChange={(event) => setReplaySpeed(Number(event.target.value))} />
-          <div className="buttonRow">
-            <button
-              className="primary"
-              onClick={() =>
-                void run(async () => {
-                  await client!.openReplay(replayPath, replaySpeed);
-                  await client!.startReplay();
-                })
-              }
-            >
-              <Play size={16} /> Start
-            </button>
-            <button onClick={() => void run(() => client!.stopReplay())}>
-              <Pause size={16} /> Stop
-            </button>
-          </div>
         </div>
       ) : null}
+
+      <button className="primary modePrimary" disabled={primaryDisabled()} onClick={() => void primaryAction()}>
+        <Zap size={16} /> {busyAction ?? (currentModeConnected ? "Disconnect" : "Connect")}
+      </button>
 
       <div className="controlGroup">
         <div className="panelHeader small">Rows</div>
@@ -206,7 +257,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
               </option>
             ))}
           </select>
-          <button onClick={() => void run(() => client!.setRows(rows))}>
+          <button onClick={() => void run("Sending...", () => client!.setRows(rows))}>
             <Rows3 size={16} /> Apply
           </button>
         </div>
@@ -217,7 +268,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
         <label>Mode</label>
         <select
           value={snapshot?.display.displayMode ?? "absolute_pf"}
-          onChange={(event) => void run(() => client!.setDisplaySettings({ displayMode: event.target.value as "absolute_pf" | "delta_percent" }))}
+          onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ displayMode: event.target.value as "absolute_pf" | "delta_percent" }))}
         >
           <option value="absolute_pf">Absolute C</option>
           <option value="delta_percent">Delta C/C0 %</option>
@@ -226,7 +277,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.showCellText ?? true}
-            onChange={(event) => void run(() => client!.setDisplaySettings({ showCellText: event.target.checked }))}
+            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ showCellText: event.target.checked }))}
           />
           Cell text
         </label>
@@ -234,7 +285,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.pauseDisplay ?? false}
-            onChange={(event) => void run(() => client!.setDisplaySettings({ pauseDisplay: event.target.checked }))}
+            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ pauseDisplay: event.target.checked }))}
           />
           Pause display
         </label>
@@ -242,19 +293,15 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.freezeColor ?? false}
-            onChange={(event) => void run(() => client!.setDisplaySettings({ freezeColor: event.target.checked }))}
+            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ freezeColor: event.target.checked }))}
           />
           Freeze colour
         </label>
         <div className="buttonRow">
-          <button onClick={() => void run(() => client!.baseline("capture"))}>Set baseline</button>
-          <button onClick={() => void run(() => client!.baseline("reset"))}>Reset</button>
+          <button onClick={() => void run("Saving...", () => client!.baseline("capture"))}>Set baseline</button>
+          <button onClick={() => void run("Saving...", () => client!.baseline("reset"))}>Reset</button>
         </div>
       </div>
-
-      <button className="disconnect" onClick={() => void run(() => client!.disconnect())}>
-        <Unplug size={16} /> Disconnect
-      </button>
     </section>
   );
 }

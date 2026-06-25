@@ -14,6 +14,8 @@ from sensorarray_app.domain.models import DisplayMode
 from sensorarray_app.services.discovery_service import scan_ble, scan_wifi
 from sensorarray_app.transport.serial_transport import SerialTransport
 
+_LINE_ENDINGS = {"lf": "\n", "crlf": "\r\n", "none": ""}
+
 
 class BackendRuntime(SensorArrayRuntime):
     def __init__(self, config: AppConfiguration):
@@ -143,6 +145,11 @@ class BackendRuntime(SensorArrayRuntime):
         }
 
     def scan_ble_once(self, timeout_seconds: float = 10.0) -> list[dict[str, Any]]:
+        if self._ble_scan_disabled():
+            message = "BLE scan is disabled while connected; disconnect first."
+            self._discovery_state["ble"] = message
+            self._host_log("Discovery", "warning", message)
+            raise RuntimeError(message)
         self._discovery_state["ble"] = "scanning"
         try:
             self._ble_scan_results = [asdict(item) for item in scan_ble(timeout_seconds)]
@@ -153,6 +160,26 @@ class BackendRuntime(SensorArrayRuntime):
             self._discovery_state["ble"] = f"failed: {exc}"
             self._host_log("Discovery", "error", f"BLE scan failed: {exc}")
             raise
+
+    def write_to_active_transport(
+        self,
+        text: str,
+        line_ending: str = "lf",
+        encoding: str = "utf-8",
+        mode: str = "text",
+        hex_text: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            payload = self._encode_write_payload(text, line_ending, encoding, mode, hex_text)
+            result = self.transport.write(payload)
+            transport = str(result.get("transport", "unknown"))
+            bytes_written = int(result.get("bytesWritten", 0))
+            self._host_log("Commands", "info", f"CMD_TX,mode={transport},bytes={bytes_written},ending={line_ending}")
+            return {"ok": True, "transport": transport, "bytesWritten": bytes_written}
+        except Exception as exc:
+            transport = str(self.transport.status.get("transport", "none"))
+            self._host_log("Commands", "error", f"CMD_TX_FAIL,mode={transport},error={_truncate(str(exc), 120)}")
+            return {"ok": False, "error": str(exc), "transport": transport, "bytesWritten": 0}
 
     def scan_wifi_once(self, subnet: str | None = None) -> list[dict[str, Any]]:
         self._discovery_state["wifi"] = "discovering"
@@ -188,14 +215,28 @@ class BackendRuntime(SensorArrayRuntime):
             "circuitOffsetPf": self.ui.circuitOffsetPf,
         }
 
-    def color_range(self, matrix: np.ndarray) -> tuple[float | None, float | None]:
+    def color_range(self, matrix: np.ndarray, valid_mask: np.ndarray | None = None) -> tuple[float | None, float | None]:
         if self.ui.freezeColor and self._lastColorRange != (None, None):
             return self._lastColorRange
-        finite = matrix[np.isfinite(matrix)]
+        valid = np.isfinite(matrix)
+        if valid_mask is not None:
+            valid &= np.asarray(valid_mask, dtype=bool)
+        finite = matrix[valid]
         if finite.size == 0:
             self._lastColorRange = (None, None)
         else:
-            self._lastColorRange = (float(np.nanmin(finite)), float(np.nanmax(finite)))
+            minimum = float(np.nanmin(finite))
+            maximum = float(np.nanmax(finite))
+            if self.ui.displayMode == DisplayMode.DELTA_PERCENT:
+                extent = max(abs(minimum), abs(maximum), 0.5)
+                self._lastColorRange = (-extent, extent)
+            else:
+                span = maximum - minimum
+                if span == 0:
+                    padding = max(abs(minimum) * 0.02, 0.5)
+                else:
+                    padding = span * 0.02
+                self._lastColorRange = (minimum - padding, maximum + padding)
         return self._lastColorRange
 
     def _correct_selection_locked(self, active_rows: int):
@@ -206,3 +247,37 @@ class BackendRuntime(SensorArrayRuntime):
             self.ui.selection = selection
             self.ui.selectionRevision = selection.selectionRevision
         return selection, corrected
+
+    def _ble_scan_disabled(self) -> bool:
+        status = self.transport.status
+        state = str(status.get("state", "DISCONNECTED")).upper()
+        return status.get("transport") == "ble" and state in {"CONNECTING", "CONNECTED", "STREAMING", "RECONNECTING"}
+
+    def _encode_write_payload(
+        self,
+        text: str,
+        line_ending: str,
+        encoding: str,
+        mode: str,
+        hex_text: str | None,
+    ) -> bytes:
+        selected_mode = str(mode or "text").lower()
+        if selected_mode == "hex":
+            source = hex_text if hex_text is not None else text
+            try:
+                return bytes.fromhex(source)
+            except ValueError as exc:
+                raise ValueError("invalid hex command bytes") from exc
+        if selected_mode != "text":
+            raise ValueError("mode must be text or hex")
+        ending = _LINE_ENDINGS.get(str(line_ending or "lf").lower())
+        if ending is None:
+            raise ValueError("lineEnding must be lf, crlf, or none")
+        try:
+            return (str(text) + ending).encode(encoding or "utf-8", errors="strict")
+        except LookupError as exc:
+            raise ValueError(f"unknown encoding: {encoding}") from exc
+
+
+def _truncate(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[:limit] + "..."

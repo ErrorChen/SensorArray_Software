@@ -71,6 +71,17 @@ class TransportManager:
             raise RuntimeError("no transport connected")
         self.current.send_command(command)
 
+    def write(self, data: bytes) -> dict[str, int | str | bool]:
+        if self.current is None:
+            raise RuntimeError("not connected")
+        transport = str(self.status.get("transport") or getattr(self.current, "source", "unknown"))
+        if transport in {"none", ""}:
+            raise RuntimeError("not connected")
+        if not hasattr(self.current, "write"):
+            raise NotImplementedError(f"{transport} transport does not support write")
+        bytes_written = int(self.current.write(bytes(data)))
+        return {"ok": True, "transport": transport, "bytesWritten": bytes_written}
+
     def apply_state_event(self, event: TransportStateEvent) -> None:
         if event.sessionGeneration != self.status.get("sessionGeneration"):
             return

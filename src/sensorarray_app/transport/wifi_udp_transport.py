@@ -37,8 +37,12 @@ class WifiUdpTransport:
             thread.join(timeout=1.5)
 
     def send_command(self, command: str) -> None:
+        self.write((command.rstrip() + "\n").encode("ascii", errors="strict"))
+
+    def write(self, data: bytes) -> int:
         sock = self._ctrl_socket or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.sendto((command.rstrip() + "\n").encode("ascii", errors="strict"), (self.host, WIFI_CTRL_PORT))
+        payload = bytes(data)
+        return int(sock.sendto(payload, (self.host, WIFI_CTRL_PORT)))
 
     def _listen(self, channel: str, port: int) -> None:
         try:

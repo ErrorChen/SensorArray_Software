@@ -18,7 +18,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -36,9 +37,14 @@ button {
   cursor: pointer;
 }
 
-button:hover {
+button:hover:not(:disabled) {
   border-color: #8191a5;
   background: #f8fafc;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 button.primary {
@@ -47,13 +53,16 @@ button.primary {
   color: #ffffff;
 }
 
-button.disconnect {
-  width: 100%;
-  margin-top: 10px;
+button.active,
+.segmented button.active {
+  border-color: #274c77;
+  background: #274c77;
+  color: #ffffff;
 }
 
 input,
-select {
+select,
+textarea {
   min-height: 34px;
   width: 100%;
   border: 1px solid #cbd5df;
@@ -61,6 +70,10 @@ select {
   color: #17202a;
   border-radius: 6px;
   padding: 6px 8px;
+}
+
+textarea {
+  resize: none;
 }
 
 label {
@@ -129,18 +142,75 @@ label {
 
 .mainGrid {
   flex: 1;
-  display: grid;
-  grid-template-columns: minmax(620px, 1fr) 430px;
-  grid-template-rows: minmax(520px, 1fr) 180px;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   padding: 12px;
   min-height: 0;
 }
 
+.workspaceSplit,
+.bottomSplit {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspaceSplit {
+  flex: 1 1 auto;
+}
+
+.bottomSplit {
+  flex: 0 0 190px;
+}
+
+.heatmapPane,
+.commandPane {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.rightPane,
+.logPane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.rightPane {
+  display: grid;
+  grid-template-rows: minmax(300px, 0.58fr) minmax(220px, 0.42fr);
+  gap: 12px;
+}
+
+.splitHandle {
+  flex: 0 0 12px;
+  cursor: col-resize;
+  position: relative;
+  touch-action: none;
+}
+
+.splitHandle::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 5px;
+  width: 2px;
+  border-radius: 2px;
+  background: #c6d0dc;
+}
+
+.splitHandle:hover::after {
+  background: #6b7f96;
+}
+
 .heatmapPanel,
 .setupPanel,
 .trendPanel,
-.logPanel {
+.logPanel,
+.commandPanel {
   background: #ffffff;
   border: 1px solid #d9e0e8;
   border-radius: 8px;
@@ -148,21 +218,27 @@ label {
   min-height: 0;
 }
 
-.heatmapPanel {
+.heatmapPanel,
+.trendPanel,
+.logPanel,
+.commandPanel {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+}
+
+.heatmapPanel {
+  position: relative;
+  height: 100%;
+}
+
+.trendPanel {
+  position: relative;
 }
 
 .heatmapCanvas {
   flex: 1;
-  min-height: 460px;
-}
-
-.rightColumn {
-  display: grid;
-  grid-template-rows: 360px minmax(240px, 1fr);
-  gap: 12px;
-  min-height: 0;
+  min-height: 360px;
 }
 
 .setupPanel {
@@ -171,7 +247,7 @@ label {
 }
 
 .panelHeader {
-  height: 32px;
+  min-height: 32px;
   padding: 8px 10px 0;
   font-size: 13px;
   font-weight: 700;
@@ -180,7 +256,26 @@ label {
 
 .panelHeader.small {
   padding: 0;
-  height: 24px;
+  min-height: 24px;
+}
+
+.panelHeaderWithActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+}
+
+.headerActions {
+  display: flex;
+  gap: 6px;
+}
+
+.headerActions button {
+  min-height: 28px;
+  font-size: 12px;
+  padding: 4px 8px;
 }
 
 .segmented {
@@ -196,12 +291,6 @@ label {
   padding: 5px 6px;
 }
 
-.segmented button.active {
-  border-color: #274c77;
-  background: #274c77;
-  color: #ffffff;
-}
-
 .modePanel,
 .controlGroup {
   display: grid;
@@ -211,15 +300,22 @@ label {
   border-bottom: 1px solid #e6ebf0;
 }
 
+.modePrimary {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
 .inputRow,
-.buttonRow {
+.buttonRow,
+.commandControls {
   display: flex;
   gap: 6px;
   align-items: center;
 }
 
 .inputRow select,
-.inputRow input {
+.inputRow input,
+.commandControls select {
   flex: 1;
 }
 
@@ -241,15 +337,11 @@ label {
   min-height: 15px;
 }
 
-.scanState {
+.scanState,
+.commandMeta {
   min-height: 18px;
   font-size: 12px;
   color: #526070;
-}
-
-.trendPanel {
-  display: flex;
-  flex-direction: column;
 }
 
 .trendGrid {
@@ -263,29 +355,54 @@ label {
 }
 
 .trendCanvas {
-  min-height: 112px;
+  min-height: 92px;
   border: 1px solid #e1e7ee;
   border-radius: 6px;
 }
 
+.trendEmpty,
+.emptyOverlay {
+  color: #526070;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.trendEmpty {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.emptyOverlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid #d9e0e8;
+}
+
 .logPanel {
-  grid-column: 1 / span 2;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+  height: 100%;
 }
 
 .inlineError {
   margin: 0 10px 6px;
-  padding: 6px 8px;
+  padding: 5px 8px;
   border: 1px solid #fecaca;
   border-radius: 6px;
   background: #fff1f2;
   color: #991b1b;
   font-size: 12px;
+  max-height: 48px;
+  overflow: hidden;
 }
 
-.logTerminal {
+.logTerminal,
+.commandRecords {
   flex: 1;
   margin: 0;
   padding: 8px 10px 10px;
@@ -296,19 +413,54 @@ label {
   line-height: 1.45;
 }
 
+.commandPanel {
+  height: 100%;
+  padding-bottom: 0;
+}
+
+.commandPanel .panelHeader {
+  flex: 0 0 auto;
+}
+
+.commandMeta,
+.commandControls,
+.commandPanel .buttonRow {
+  margin: 0 10px 8px;
+}
+
+.commandInput {
+  flex: 0 0 62px;
+  min-height: 62px;
+  margin: 0 10px 8px;
+  width: calc(100% - 20px);
+  font: 12px Consolas, "SFMono-Regular", monospace;
+}
+
+.commandRecords {
+  min-height: 42px;
+}
+
 @media (max-width: 900px) {
   body {
     min-width: 0;
   }
 
-  .mainGrid {
-    grid-template-columns: 1fr;
-    grid-template-rows: 420px auto 180px;
+  .workspaceSplit,
+  .bottomSplit {
+    flex-direction: column;
   }
 
-  .rightColumn,
-  .logPanel {
-    grid-column: 1;
+  .splitHandle {
+    flex-basis: 10px;
+    cursor: row-resize;
+  }
+
+  .splitHandle::after {
+    top: 4px;
+    bottom: auto;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    height: 2px;
   }
 }
-

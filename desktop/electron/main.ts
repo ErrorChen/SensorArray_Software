@@ -1,5 +1,6 @@
 import type { BrowserWindow as BrowserWindowType, OpenDialogOptions } from "electron";
 import { createRequire } from "node:module";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,9 +11,12 @@ const { app, BrowserWindow, dialog, ipcMain } = nodeRequire("electron") as typeo
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, "..", "..");
+const appId = "au.edu.sydney.sensorarray";
 
 let backend: BackendProcess | null = null;
 let mainWindow: BrowserWindowType | null = null;
+
+app.setAppUserModelId(appId);
 
 ipcMain.handle("backend:url", () => backend?.url ?? "http://127.0.0.1:8765");
 ipcMain.handle("dialog:selectReplayFile", async () => {
@@ -47,6 +51,7 @@ async function createWindow(): Promise<void> {
     minWidth: 1180,
     minHeight: 760,
     title: "SensorArray",
+    icon: resolveIconPath(),
     backgroundColor: "#f7f8fa",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -71,7 +76,8 @@ async function showBackendError(error: unknown): Promise<void> {
   mainWindow = new BrowserWindow({
     width: 900,
     height: 560,
-    title: "SensorArray backend error"
+    title: "SensorArray backend error",
+    icon: resolveIconPath()
   });
   const body = escapeHtml(`${detail}\n\n${stderr}`);
   await mainWindow.loadURL(
@@ -84,6 +90,19 @@ function escapeHtml(value: string): string {
     const map: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     return map[char];
   });
+}
+
+function resolveIconPath(): string | undefined {
+  const candidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, "assets", "icons", "sensorarray-icon.ico"),
+        path.join(process.resourcesPath, "sensorarray-icon.ico")
+      ]
+    : [
+        path.join(projectRoot, "desktop", "assets", "icons", "sensorarray-icon.ico"),
+        path.join(projectRoot, "desktop", "public", "favicon.ico")
+      ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
 app.whenReady().then(createWindow).catch((error) => {

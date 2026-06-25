@@ -1,4 +1,4 @@
-import type { BleDevice, DisplayMode, SerialPort, TransportMode, WifiDevice } from "./types";
+import type { BleDevice, DisplayMode, SerialPort, TransportMode, WifiDevice, WriteCommandRequest, WriteCommandResponse } from "./types";
 
 export class BackendHttpClient {
   constructor(private readonly baseUrl: string) {}
@@ -36,6 +36,10 @@ export class BackendHttpClient {
 
   async disconnect(): Promise<void> {
     await this.post("/api/transport/disconnect", {});
+  }
+
+  async writeCommand(request: WriteCommandRequest): Promise<WriteCommandResponse> {
+    return this.post<WriteCommandResponse>("/api/transport/write", request);
   }
 
   async openReplay(path: string, speed: number): Promise<void> {
@@ -96,4 +100,3 @@ export class BackendHttpClient {
     return (await response.json()) as T;
   }
 }
-

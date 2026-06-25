@@ -3,13 +3,15 @@ import { useEffect, useMemo, useRef } from "react";
 
 import type { BackendSnapshotPayload } from "../../api/types";
 import { cellLabel, selectedCells } from "../../state/appStore";
+import { resolveColourRange, type HeatmapDatum } from "../../state/heatmap";
 
 type Props = {
   snapshot: BackendSnapshotPayload | null;
   onSelectCell: (cell: string) => void;
+  onSetFreezeColor: (freeze: boolean) => void;
 };
 
-export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
+export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   const selected = useMemo(() => selectedCells(snapshot?.selection), [snapshot?.selection]);
@@ -19,8 +21,8 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
       return;
     }
     chartRef.current = echarts.init(hostRef.current, undefined, { renderer: "canvas" });
-    const resize = () => chartRef.current?.resize();
-    window.addEventListener("resize", resize);
+    const observer = new ResizeObserver(() => chartRef.current?.resize());
+    observer.observe(hostRef.current);
     chartRef.current.on("click", (params) => {
       const value = params.value as [number, number, number | null] | undefined;
       if (!value) {
@@ -29,7 +31,7 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
       onSelectCell(cellLabel(value[1], value[0]));
     });
     return () => {
-      window.removeEventListener("resize", resize);
+      observer.disconnect();
       chartRef.current?.dispose();
       chartRef.current = null;
     };
@@ -41,18 +43,18 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
       return;
     }
     const matrix = snapshot.matrix.displayValues;
-    const data: Array<[number, number, number | null, string, boolean]> = [];
+    const data: HeatmapDatum[] = [];
     for (let row = 0; row < 8; row += 1) {
       for (let col = 0; col < 8; col += 1) {
         const label = cellLabel(row, col);
-        data.push([col, row, matrix[row]?.[col] ?? null, label, snapshot.matrix.validMask[row]?.[col] ?? false]);
+        const value = matrix[row]?.[col];
+        const valid = Boolean(snapshot.matrix.validMask[row]?.[col]) && typeof value === "number" && Number.isFinite(value);
+        data.push([col, row, valid ? value : null, label, valid]);
       }
     }
-    const finiteValues = data.map((item) => item[2]).filter((value): value is number => typeof value === "number");
-    const range = snapshot.display.colorRange;
-    const min = range.min ?? (finiteValues.length ? Math.min(...finiteValues) : 0);
-    const max = range.max ?? (finiteValues.length ? Math.max(...finiteValues) : 1);
-    chart.setOption({
+    const [min, max] = resolveColourRange(data, snapshot);
+    chart.setOption(
+      {
       animation: false,
       grid: { left: 64, right: 28, top: 28, bottom: 52 },
       tooltip: {
@@ -72,7 +74,8 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
             `raw pF: ${formatValue(rawPf)}`,
             `rawFixed: ${formatValue(rawFixed, 0)}`,
             `seq: ${snapshot.frame.seq ?? "-"}`,
-            `valid: ${valid ? "yes" : "no"}`
+            `valid: ${valid ? "yes" : "no"}`,
+            `source: ${snapshot.connection.mode}`
           ].join("<br/>");
         }
       },
@@ -91,8 +94,9 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
       },
       visualMap: {
         min,
-        max: max === min ? min + 1 : max,
-        calculable: true,
+        max,
+        dimension: 2,
+        calculable: false,
         orient: "horizontal",
         left: "center",
         bottom: 8,
@@ -103,6 +107,7 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
         {
           type: "heatmap",
           data,
+          encode: { x: 0, y: 1, value: 2 },
           label: {
             show: snapshot.display.showCellText,
             formatter: (params: { value: [number, number, number | null] }) => formatValue(params.value[2], snapshot.matrix.unit === "%" ? 2 : 2)
@@ -127,13 +132,26 @@ export function Heatmap({ snapshot, onSelectCell }: Props): JSX.Element {
           silent: true
         }
       ]
-    });
+      },
+      { notMerge: false, lazyUpdate: true }
+    );
   }, [snapshot, selected]);
 
   return (
     <section className="heatmapPanel">
-      <div className="panelHeader">8x8 Heatmap</div>
+      <div className="panelHeader panelHeaderWithActions">
+        <span>8x8 Heatmap</span>
+        <div className="headerActions">
+          <button className={!snapshot?.display.freezeColor ? "active" : ""} onClick={() => onSetFreezeColor(false)}>
+            Auto colour
+          </button>
+          <button className={snapshot?.display.freezeColor ? "active" : ""} onClick={() => onSetFreezeColor(true)}>
+            Freeze colour
+          </button>
+        </div>
+      </div>
       <div ref={hostRef} className="heatmapCanvas" />
+      {snapshot?.frame.valid ? null : <div className="emptyOverlay">No data yet</div>}
     </section>
   );
 }
@@ -144,4 +162,3 @@ function formatValue(value: number | null | undefined, digits = 3): string {
   }
   return value.toFixed(digits);
 }
-

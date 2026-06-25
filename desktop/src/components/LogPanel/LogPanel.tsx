@@ -14,10 +14,13 @@ export function LogPanel({ logs, error }: Props): JSX.Element {
       <pre className="logTerminal">
         {rows
           .slice(-220)
-          .map((row) => `[${row.severity}] ${row.source}/${row.channel} ${row.tag}: ${row.rawText}`)
+          .map((row) => `[${row.severity}] ${row.source}/${row.channel} ${row.tag}: ${truncate(row.rawText, 240)}`)
           .join("\n")}
       </pre>
     </section>
   );
 }
 
+function truncate(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)}...`;
+}

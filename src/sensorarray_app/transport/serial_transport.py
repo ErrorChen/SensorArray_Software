@@ -39,6 +39,7 @@ class SerialTransport:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._handle: Any | None = None
+        self._write_lock = threading.Lock()
         self.bytesReceived = 0
         self.packetsReceived = 0
         self.lastError = ""
@@ -54,11 +55,16 @@ class SerialTransport:
             self._thread.join(timeout=2.0)
 
     def send_command(self, command: str) -> None:
+        self.write((command.rstrip() + "\n").encode("ascii", errors="strict"))
+
+    def write(self, data: bytes) -> int:
         handle = self._handle
         if handle is None:
             raise RuntimeError("serial is not connected")
-        payload = (command.rstrip() + "\n").encode("ascii", errors="strict")
-        handle.write(payload)
+        payload = bytes(data)
+        with self._write_lock:
+            written = handle.write(payload)
+        return int(written if written is not None else len(payload))
 
     @staticmethod
     def list_ports() -> list[dict[str, str]]:

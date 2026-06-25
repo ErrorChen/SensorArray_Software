@@ -32,6 +32,14 @@ class WifiConnectRequest(BaseModel):
     host: str = Field(min_length=1)
 
 
+class TransportWriteRequest(BaseModel):
+    text: str = ""
+    lineEnding: str = "lf"
+    encoding: str = "utf-8"
+    mode: str = "text"
+    hex: str | None = None
+
+
 @router.post("/mode")
 def set_mode(body: ModeRequest, runtime: BackendRuntime = Depends(get_runtime)) -> dict:
     try:
@@ -59,6 +67,8 @@ async def ble_scan(timeout: float = 10.0, runtime: BackendRuntime = Depends(get_
     try:
         devices = await asyncio.to_thread(runtime.scan_ble_once, timeout)
         return {"devices": devices, "state": runtime.discovery_payload()["bleState"]}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -95,3 +105,13 @@ def disconnect(runtime: BackendRuntime = Depends(get_runtime)) -> dict:
     runtime.disconnect()
     return {"ok": True}
 
+
+@router.post("/write")
+def write_transport(body: TransportWriteRequest, runtime: BackendRuntime = Depends(get_runtime)) -> dict[str, Any]:
+    return runtime.write_to_active_transport(
+        text=body.text,
+        line_ending=body.lineEnding,
+        encoding=body.encoding,
+        mode=body.mode,
+        hex_text=body.hex,
+    )
