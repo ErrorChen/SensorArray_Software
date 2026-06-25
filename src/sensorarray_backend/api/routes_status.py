@@ -9,6 +9,21 @@ from sensorarray_backend.core.snapshot import snapshot_payload
 router = APIRouter()
 
 
+@router.get("/")
+def root() -> dict:
+    return {
+        "ok": True,
+        "service": "sensorarray_backend",
+        "message": "SensorArray backend is running. Use the Electron desktop app for the GUI.",
+        "endpoints": {
+            "health": "/health",
+            "status": "/api/status",
+            "websocket": "/ws",
+            "docs": "/docs",
+        },
+    }
+
+
 @router.get("/health")
 def health() -> dict:
     return {"ok": True, "service": "sensorarray_backend"}
@@ -17,4 +32,3 @@ def health() -> dict:
 @router.get("/api/status")
 def status(runtime: BackendRuntime = Depends(get_runtime)) -> dict:
     return snapshot_payload(runtime)
-

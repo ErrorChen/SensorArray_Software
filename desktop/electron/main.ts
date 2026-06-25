@@ -1,26 +1,30 @@
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import type { BrowserWindow as BrowserWindowType, OpenDialogOptions } from "electron";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BackendProcess, findAvailablePort, startBackend, stopBackend, waitForHealth } from "./backendProcess.js";
 
+const nodeRequire = createRequire(import.meta.url);
+const { app, BrowserWindow, dialog, ipcMain } = nodeRequire("electron") as typeof import("electron");
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, "..", "..");
 
 let backend: BackendProcess | null = null;
-let mainWindow: BrowserWindow | null = null;
+let mainWindow: BrowserWindowType | null = null;
 
 ipcMain.handle("backend:url", () => backend?.url ?? "http://127.0.0.1:8765");
 ipcMain.handle("dialog:selectReplayFile", async () => {
-  const result = await dialog.showOpenDialog(mainWindow ?? undefined, {
+  const options: OpenDialogOptions = {
     title: "Open replay file",
     properties: ["openFile"],
     filters: [
       { name: "SensorArray logs", extensions: ["txt", "log", "json", "bin"] },
       { name: "All files", extensions: ["*"] }
     ]
-  });
+  };
+  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
   if (result.canceled || result.filePaths.length === 0) {
     return null;
   }

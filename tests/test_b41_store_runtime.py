@@ -33,8 +33,11 @@ def test_matrix_store_expands_inactive_rows_to_nan():
 def test_fastapi_status_schema_contains_required_snapshot_fields():
     app = create_app(AppConfiguration())
     with TestClient(app) as client:
+        root = client.get("/").json()
         assert client.get("/health").json()["ok"] is True
         payload = client.get("/api/status").json()
+    assert root["ok"] is True
+    assert root["endpoints"]["status"] == "/api/status"
     assert payload["connection"]["mode"] == "serial"
     assert payload["frame"]["rows"] == 8
     assert len(payload["matrix"]["correctedPf"]) == 8

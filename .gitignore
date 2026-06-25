@@ -22,6 +22,14 @@ artifacts/
 *.log
 *.tmp
 
+# Desktop frontend dependencies and build outputs
+/desktop/node_modules/
+/desktop/dist/
+/desktop/dist-electron/
+/desktop/.vite/
+/desktop/.eslintcache
+/desktop/.vitest/
+
 # Editable/install metadata
 *.egg-info/
 
