@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 from pathlib import Path
 
-from sensorarray_app.constants import DEFAULT_SERIAL_BAUD, DEFAULT_SERIAL_PORT
+from sensorarray_app.constants import DEFAULT_SERIAL_BAUD
 from sensorarray_app.domain.models import TransportEnvelope, TransportStateEvent
 from sensorarray_app.transport.ble_transport import BleTransport
 from sensorarray_app.transport.replay_transport import ReplayTransport
@@ -32,7 +32,9 @@ class TransportManager:
         generation = self.sessions.next_generation()
         self.status.update({"transport": "none", "state": "DISCONNECTED", "sessionGeneration": generation})
 
-    def connect_serial(self, port: str = DEFAULT_SERIAL_PORT, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = False) -> int:
+    def connect_serial(self, port: str, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = False) -> int:
+        if not str(port or "").strip():
+            raise ValueError("serial port is required")
         self.disconnect()
         generation = self.sessions.generation
         self.current = SerialTransport(self.outputQueue, generation, port, baud, auto_reconnect=auto_reconnect)

@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Any
 
-from sensorarray_app.constants import DEFAULT_SERIAL_BAUD, DEFAULT_SERIAL_PORT
+from sensorarray_app.constants import DEFAULT_SERIAL_BAUD
 from sensorarray_app.domain.models import TransportEnvelope, TransportStateEvent
 
 try:
@@ -23,14 +23,16 @@ class SerialTransport:
         self,
         output_queue: "queue.Queue[TransportEnvelope | TransportStateEvent]",
         session_generation: int,
-        port: str = DEFAULT_SERIAL_PORT,
+        port: str,
         baud: int = DEFAULT_SERIAL_BAUD,
         read_size: int = 4096,
         auto_reconnect: bool = False,
     ):
         self.outputQueue = output_queue
         self.sessionGeneration = int(session_generation)
-        self.port = port or DEFAULT_SERIAL_PORT
+        if not str(port or "").strip():
+            raise ValueError("serial port is required")
+        self.port = str(port).strip()
         self.baud = int(baud or DEFAULT_SERIAL_BAUD)
         self.readSize = max(256, int(read_size))
         self.autoReconnect = bool(auto_reconnect)
@@ -62,7 +64,19 @@ class SerialTransport:
     def list_ports() -> list[dict[str, str]]:
         if list_ports is None:
             return []
-        return [{"label": f"{item.device} - {item.description}", "value": item.device} for item in list_ports.comports()]
+        ports: list[dict[str, str]] = []
+        for item in list_ports.comports():
+            ports.append(
+                {
+                    "device": item.device,
+                    "name": item.name or item.device,
+                    "description": item.description or "",
+                    "hwid": item.hwid or "",
+                    "label": f"{item.device} - {item.description}" if item.description else item.device,
+                    "value": item.device,
+                }
+            )
+        return ports
 
     def _run(self) -> None:
         self._put_state("CONNECTING", f"opening {self.port} at {self.baud}")

@@ -11,7 +11,7 @@ TransportChannel = Literal["data", "log", "ctrl", "host"]
 
 
 class DisplayMode(str, Enum):
-    ABSOLUTE_C = "absolute_c"
+    ABSOLUTE_C = "absolute_pf"
     DELTA_PERCENT = "delta_percent"
 
 

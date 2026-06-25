@@ -1,0 +1,2 @@
+"""SensorArray FastAPI backend package."""
+

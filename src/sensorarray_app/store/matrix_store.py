@@ -18,6 +18,8 @@ class MatrixSnapshot:
     seq: int | None
     timestampUs: int | None
     matrix: np.ndarray
+    rawPf: np.ndarray
+    rawFixed: np.ndarray
     valid: np.ndarray
     unit: str
     sessionGeneration: int
@@ -39,10 +41,17 @@ class MatrixStore:
 
     def add_capacitance(self, frame: CapacitanceFrame) -> None:
         values64 = np.full(64, np.nan, dtype=np.float64)
+        raw_pf64 = np.full(64, np.nan, dtype=np.float64)
+        raw_fixed64 = np.full(64, np.nan, dtype=np.float64)
         valid64 = np.zeros(64, dtype=bool)
         values64[: frame.cells] = frame.correctedPfValues
+        raw_pf64[: frame.cells] = frame.rawPfValues
         valid64[: frame.cells] = frame.validMask
+        raw_fixed_values = np.asarray(frame.rawFixedValues, dtype=np.float64)
+        raw_fixed64[: frame.cells] = np.where(frame.validMask, raw_fixed_values, np.nan)
         matrix = expand_rows_to_matrix(values64, frame.rows)
+        raw_pf_matrix = expand_rows_to_matrix(raw_pf64, frame.rows)
+        raw_fixed_matrix = expand_rows_to_matrix(raw_fixed64, frame.rows)
         valid_matrix = np.zeros((8, 8), dtype=bool)
         valid_matrix[: frame.rows, :] = valid64[: frame.cells].reshape(frame.rows, 8)
         with self._lock:
@@ -55,6 +64,8 @@ class MatrixStore:
                 seq=frame.seq,
                 timestampUs=frame.timestampUs,
                 matrix=matrix,
+                rawPf=raw_pf_matrix,
+                rawFixed=raw_fixed_matrix,
                 valid=valid_matrix,
                 unit="pF",
                 sessionGeneration=frame.sessionGeneration,
@@ -83,6 +94,8 @@ class MatrixStore:
                     seq=self._latest.seq,
                     timestampUs=self._latest.timestampUs,
                     matrix=self._latest.matrix.copy(),
+                    rawPf=self._latest.rawPf.copy(),
+                    rawFixed=self._latest.rawFixed.copy(),
                     valid=self._latest.valid.copy(),
                     unit=self._latest.unit,
                     sessionGeneration=self._latest.sessionGeneration,
@@ -96,6 +109,8 @@ class MatrixStore:
                 seq=None,
                 timestampUs=None,
                 matrix=np.full((8, 8), np.nan, dtype=np.float64),
+                rawPf=np.full((8, 8), np.nan, dtype=np.float64),
+                rawFixed=np.full((8, 8), np.nan, dtype=np.float64),
                 valid=np.zeros((8, 8), dtype=bool),
                 unit="pF",
                 sessionGeneration=0,
@@ -108,6 +123,13 @@ class MatrixStore:
             self._revision += 1
             self._latest = None
             self._history.clear()
+
+    def set_active_rows_for_display(self, rows: int) -> None:
+        if not (1 <= int(rows) <= 8):
+            raise ValueError("rows must be 1..8")
+        with self._lock:
+            self._active_rows = int(rows)
+            self._revision += 1
 
     def _add_flat(
         self,
@@ -123,6 +145,8 @@ class MatrixStore:
         request_id: int | None,
     ) -> None:
         matrix = values.reshape(8, 8).copy()
+        raw_pf = np.full((8, 8), np.nan, dtype=np.float64)
+        raw_fixed = np.full((8, 8), np.nan, dtype=np.float64)
         valid_matrix = valid.reshape(8, 8).copy()
         with self._lock:
             self._revision += 1
@@ -133,6 +157,8 @@ class MatrixStore:
                 seq=seq,
                 timestampUs=timestamp_us,
                 matrix=matrix,
+                rawPf=raw_pf,
+                rawFixed=raw_fixed,
                 valid=valid_matrix,
                 unit=unit,
                 sessionGeneration=session_generation,

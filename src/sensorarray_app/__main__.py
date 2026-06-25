@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from .app.bootstrap import main
+from sensorarray_backend.main import main
 
 
 if __name__ == "__main__":

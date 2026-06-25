@@ -4,6 +4,7 @@ import asyncio
 import queue
 import threading
 import time
+from collections.abc import Iterable
 
 from sensorarray_app.constants import BLE_CTRL_RX_UUID, BLE_CTRL_TX_UUID, BLE_DATA_TX_UUID, BLE_LOG_TX_UUID
 from sensorarray_app.domain.models import TransportEnvelope, TransportStateEvent
@@ -53,9 +54,10 @@ class BleTransport:
             async with BleakClient(self.address) as client:
                 self._client = client
                 self._put_state("CONNECTED", self.address)
-                await client.start_notify(BLE_DATA_TX_UUID, lambda _, data: self._notify("data", bytes(data)))
-                await client.start_notify(BLE_LOG_TX_UUID, lambda _, data: self._notify("log", bytes(data)))
-                await client.start_notify(BLE_CTRL_TX_UUID, lambda _, data: self._notify("ctrl", bytes(data)))
+                notify_map = self._resolve_notify_characteristics(client.services)
+                self._put_state("GATT", f"notify={notify_map}")
+                for channel, uuid in notify_map.items():
+                    await client.start_notify(uuid, lambda _, data, ch=channel: self._notify(ch, bytes(data)))
                 self._put_state("STREAMING", self.address)
                 while client.is_connected:
                     await asyncio.sleep(0.5)
@@ -87,3 +89,32 @@ class BleTransport:
             self.outputQueue.put_nowait(TransportStateEvent("ble", state, self.sessionGeneration, message))
         except queue.Full:
             pass
+
+    def _resolve_notify_characteristics(self, services) -> dict[str, str]:
+        notify_chars: list[tuple[str, set[str]]] = []
+        for service in services:
+            for char in service.characteristics:
+                props = {str(item).lower() for item in getattr(char, "properties", [])}
+                if "notify" in props or "indicate" in props:
+                    notify_chars.append((char.uuid, props))
+        all_notify = [uuid for uuid, _props in notify_chars]
+        mapping: dict[str, str] = {}
+        for channel, expected in (("data", BLE_DATA_TX_UUID), ("log", BLE_LOG_TX_UUID), ("ctrl", BLE_CTRL_TX_UUID)):
+            match = _match_uuid(expected, all_notify)
+            if match:
+                mapping[channel] = match
+        if "data" not in mapping and all_notify:
+            mapping["data"] = all_notify[0]
+        if not mapping:
+            raise RuntimeError("no notify or indicate BLE characteristics found")
+        return mapping
+
+
+def _match_uuid(expected: str, values: Iterable[str]) -> str | None:
+    expected_lower = expected.lower()
+    short = expected_lower[4:8] if expected_lower.startswith("0000") else expected_lower
+    for value in values:
+        lower = value.lower()
+        if lower == expected_lower or lower.startswith(f"0000{short}-"):
+            return value
+    return None

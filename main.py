@@ -10,7 +10,7 @@ def main() -> int:
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 
-    from sensorarray_app.__main__ import main as app_main
+    from sensorarray_backend.main import main as app_main
 
     return app_main(sys.argv[1:])
 

@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sensorarray-app"
-version = "0.2.0"
-description = "SensorArray b41 real-time matrix host application"
+name = "sensorarray-software"
+version = "0.3.0"
+description = "SensorArray FastAPI backend and Electron desktop host"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "dash>=2.14",
-  "plotly>=5.18",
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
   "numpy>=1.24",
   "pandas>=2.0",
   "pyserial>=3.5",
@@ -21,27 +21,25 @@ dependencies = [
 dev = [
   "pytest>=8.0",
   "ruff>=0.5",
+  "httpx2>=0.28",
 ]
 
 [project.scripts]
-sensorarray-app = "sensorarray_app.__main__:main"
+sensorarray-backend = "sensorarray_backend.main:main"
+sensorarray-app = "sensorarray_backend.main:main"
 
 [tool.setuptools.packages.find]
-where = ["src", "matrix_log_viewer"]
-include = ["sensorarray_app*", "matrix_log_viewer*"]
-
-[tool.setuptools.package-data]
-sensorarray_app = ["ui/assets/*.css", "ui/assets/*.js"]
+where = ["src"]
+include = ["sensorarray_backend*", "sensorarray_app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "matrix_log_viewer"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-src = ["src", "tests", "matrix_log_viewer"]
-extend-exclude = ["cap_percent_heatmap.py"]
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F"]

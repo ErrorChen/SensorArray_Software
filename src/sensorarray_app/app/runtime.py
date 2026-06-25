@@ -7,7 +7,7 @@ from dataclasses import asdict
 from typing import Any
 
 from sensorarray_app.app.configuration import AppConfiguration
-from sensorarray_app.app.state import UiState
+from sensorarray_app.app.state import UiState as UiModel
 from sensorarray_app.constants import RAW_INPUT_QUEUE_SIZE
 from sensorarray_app.domain.baseline import BaselineSession
 from sensorarray_app.domain.models import (
@@ -45,7 +45,7 @@ class SensorArrayRuntime:
         self.stats = StatisticsStore()
         self.transport = TransportManager(self.inputQueue)
         self.commands = CommandService()
-        self.ui = UiState()
+        self.ui = UiModel()
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run_parser, name="SensorArrayParserWorker", daemon=True)

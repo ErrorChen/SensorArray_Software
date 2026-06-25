@@ -42,8 +42,12 @@ def test_engineering_units_thresholds_and_shared_unit():
 
 
 def test_selection_primary_secondary_and_inactive():
-    assert select_group(3, 2, 8).cells == ("S3D1", "S3D2", "S3D3", "S3D4")
-    assert select_group(5, 7, 8).cells == ("S5D5", "S5D6", "S5D7", "S5D8")
+    primary = select_group(3, 2, 8)
+    secondary = select_group(5, 7, 8)
+    assert primary.cells == ("S3D1", "S3D2", "S3D3", "S3D4")
+    assert primary.title == "S3 路 Primary FDC 路 D1-D4"
+    assert secondary.cells == ("S5D5", "S5D6", "S5D7", "S5D8")
+    assert secondary.title == "S5 路 Secondary FDC 路 D5-D8"
     try:
         select_group(5, 7, 4)
     except ValueError as exc:
