@@ -331,7 +331,7 @@ async function captureScreenshot(): Promise<{ ok: boolean; path?: string; error?
 
 async function nextScreenshotPath(directory: string): Promise<string> {
   const now = new Date();
-  const baseName = `Screenshot_SensorArray_${timestampForScreenshot(now)}`;
+  const baseName = `Screenshot_CscArray__${timestampForScreenshot(now)}`;
   const firstPath = path.join(directory, `${baseName}.png`);
   if (!fs.existsSync(firstPath)) {
     return firstPath;

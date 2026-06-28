@@ -1,9 +1,7 @@
-const defaultBackendHost = "127.0.0.1";
-const defaultBackendPort = 8888;
-const backendFallbackCount = 100;
+import { buildBackendPortCandidates, defaultBackendHost } from "../../electron/backendPortPolicy";
 
-export function buildBackendUrlCandidates(startPort = defaultBackendPort, fallbackCount = backendFallbackCount): string[] {
-  return Array.from({ length: fallbackCount + 1 }, (_, index) => `http://${defaultBackendHost}:${startPort + index}`);
+export function buildBackendUrlCandidates(): string[] {
+  return buildBackendPortCandidates().map((port) => `http://${defaultBackendHost}:${port}`);
 }
 
 export async function resolveBackendUrl(): Promise<string> {

@@ -294,12 +294,10 @@ export type DesktopBridge = {
   onExportSessionData: (callback: () => void) => () => void;
   onImportSetupProfile: (callback: () => void) => () => void;
   onExportSetupProfile: (callback: () => void) => () => void;
-  onCaptureScreenshot: (callback: () => void) => () => void;
   onMenuImportSetup: (callback: () => void) => () => void;
   onMenuExportSetup: (callback: () => void) => () => void;
   onMenuImportData: (callback: () => void) => () => void;
   onMenuExportData: (callback: () => void) => () => void;
-  onMenuCaptureScreenshot: (callback: () => void) => () => void;
   onScreenshotResult: (callback: (result: DesktopActionResult) => void) => () => void;
   chooseSessionExportPath: (defaultName: string) => Promise<DesktopActionResult>;
   saveExportedSession: (defaultName: string, data: ArrayBuffer | Uint8Array | string) => Promise<DesktopActionResult>;

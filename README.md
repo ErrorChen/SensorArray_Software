@@ -270,7 +270,7 @@ The Electron File menu contains:
 There is also a top-level `Screenshot / Capture` menu with the screenshot
 shortcut. The Electron main process captures the current window and writes a
 PNG to the default save directory. Screenshot filenames use
-`Screenshot_SensorArray_YYYYMMDD_HHMMSS.png`, with a numeric suffix if needed.
+`Screenshot_CscArray__YYYYMMDD_HHMMSS.png`, with a numeric suffix if needed.
 
 Advanced contains Default Save Directory. It defaults to the runtime directory
 and is used for session export, setup export, and screenshots. The directory is

@@ -274,20 +274,6 @@ export function App(): JSX.Element {
     }
   }
 
-  async function handleCaptureScreenshot(): Promise<void> {
-    try {
-      setError(null);
-      const result = await window.sensorarrayDesktop?.captureScreenshot();
-      if (!result?.ok) {
-        throw new Error(result?.error || "screenshot failed");
-      }
-      setNotice(`Screenshot saved: ${result.path}`);
-    } catch (screenshotError) {
-      setNotice(null);
-      setError(screenshotError instanceof Error ? screenshotError.message : String(screenshotError));
-    }
-  }
-
   function handleScreenshotResult(result: DesktopActionResult): void {
     if (result.ok) {
       setError(null);

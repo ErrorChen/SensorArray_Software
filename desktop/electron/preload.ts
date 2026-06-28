@@ -36,14 +36,10 @@ contextBridge.exposeInMainWorld("sensorarrayDesktop", {
   onExportSetupProfile: (callback: () => void) => {
     return onMenu("menu:exportSetupProfile", callback);
   },
-  onCaptureScreenshot: (callback: () => void) => {
-    return onMenu("menu:captureScreenshot", callback);
-  },
   onMenuImportSetup: (callback: () => void) => onMenu("menu:importSetupProfile", callback),
   onMenuExportSetup: (callback: () => void) => onMenu("menu:exportSetupProfile", callback),
   onMenuImportData: (callback: () => void) => onMenu("menu:importSessionData", callback),
   onMenuExportData: (callback: () => void) => onMenu("menu:exportSessionData", callback),
-  onMenuCaptureScreenshot: (callback: () => void) => onMenu("menu:captureScreenshot", callback),
   onScreenshotResult: (callback: (result: { ok: boolean; path?: string; error?: string; canceled?: boolean }) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, result: { ok: boolean; path?: string; error?: string; canceled?: boolean }) => callback(result);
     ipcRenderer.on("screenshot:result", listener);
