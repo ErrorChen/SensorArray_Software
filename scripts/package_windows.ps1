@@ -63,7 +63,7 @@ function Wait-BackendHealth {
 
         try {
             $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+            if ($response.StatusCode -eq 200) {
                 Write-Host "Backend health OK: $($response.Content)"
                 return
             }
@@ -76,6 +76,82 @@ function Wait-BackendHealth {
 
     $stderr = if (Test-Path -LiteralPath $StderrPath) { Get-Content -Raw -LiteralPath $StderrPath } else { "" }
     throw "Timed out waiting for backend health: $lastError`n$stderr"
+}
+
+function Get-BackendPortCandidates {
+    for ($port = $BackendSmokeStartPort; $port -le ($BackendSmokeStartPort + $BackendSmokeFallbackCount); $port += 1) {
+        $port
+    }
+}
+
+function Test-BackendPortBindable {
+    param(
+        [Parameter(Mandatory = $true)][string]$BindHost,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+
+    $listener = $null
+    try {
+        $ipAddress = [System.Net.IPAddress]::Parse($BindHost)
+        $listener = [System.Net.Sockets.TcpListener]::new($ipAddress, $Port)
+        $listener.Start()
+        return @{ Ok = $true; Reason = "" }
+    } catch {
+        return @{ Ok = $false; Reason = $_.Exception.Message }
+    } finally {
+        if ($listener) {
+            $listener.Stop()
+        }
+    }
+}
+
+function Stop-BackendSmokeProcess {
+    param($Process)
+
+    if ($Process -and -not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force
+        Wait-Process -Id $Process.Id -Timeout 5 -ErrorAction SilentlyContinue
+    }
+}
+
+function Start-BackendWithFirstHealthyPort {
+    param(
+        [Parameter(Mandatory = $true)][string]$BackendExe,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$StdoutPath,
+        [Parameter(Mandatory = $true)][string]$StderrPath
+    )
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($port in Get-BackendPortCandidates) {
+        $bindCheck = Test-BackendPortBindable -BindHost $BackendSmokeHost -Port $port
+        if (-not $bindCheck.Ok) {
+            $failures.Add("${port}: $($bindCheck.Reason)")
+            continue
+        }
+
+        if (Test-Path -LiteralPath $StdoutPath) { Remove-Item -LiteralPath $StdoutPath -Force }
+        if (Test-Path -LiteralPath $StderrPath) { Remove-Item -LiteralPath $StderrPath -Force }
+
+        $backendProcess = Start-Process -FilePath $BackendExe `
+            -ArgumentList @("--host", $BackendSmokeHost, "--port", "$port") `
+            -WorkingDirectory $WorkingDirectory `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $StdoutPath `
+            -RedirectStandardError $StderrPath `
+            -PassThru
+        $url = "http://${BackendSmokeHost}:${port}/health"
+        try {
+            Wait-BackendHealth -Url $url -Process $backendProcess -StderrPath $StderrPath
+            Write-Host "Selected backend smoke port: $port"
+            return @{ Process = $backendProcess; Port = $port; Url = $url }
+        } catch {
+            $failures.Add("${port}: $($_.Exception.Message)")
+            Stop-BackendSmokeProcess -Process $backendProcess
+        }
+    }
+
+    throw "No healthy backend smoke port found from $BackendSmokeStartPort through $($BackendSmokeStartPort + $BackendSmokeFallbackCount).`n$($failures -join "`n")"
 }
 
 function Initialize-ElectronBuilderCache {
@@ -123,6 +199,9 @@ function Initialize-ElectronBuilderCache {
 
 Set-Location -LiteralPath $RepoRoot
 $env:CSC_IDENTITY_AUTO_DISCOVERY = "false"
+$BackendSmokeHost = "127.0.0.1"
+$BackendSmokeStartPort = 8888
+$BackendSmokeFallbackCount = 100
 
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "pyproject.toml"))) {
     throw "pyproject.toml not found. Run this script from the SensorArray repository."
@@ -215,23 +294,15 @@ Invoke-Step "Build Python backend sidecar with PyInstaller" {
 Invoke-Step "Smoke test Python backend sidecar" {
     $stdoutPath = Join-Path $env:TEMP "sensorarray-backend-smoke.stdout.log"
     $stderrPath = Join-Path $env:TEMP "sensorarray-backend-smoke.stderr.log"
-    if (Test-Path -LiteralPath $stdoutPath) { Remove-Item -LiteralPath $stdoutPath -Force }
-    if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force }
-
-    $backendProcess = Start-Process -FilePath $BackendExe `
-        -ArgumentList @("--host", "127.0.0.1", "--port", "8888") `
+    $backendSmoke = Start-BackendWithFirstHealthyPort `
+        -BackendExe $BackendExe `
         -WorkingDirectory (Split-Path -Parent $BackendExe) `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath `
-        -PassThru
+        -StdoutPath $stdoutPath `
+        -StderrPath $stderrPath
     try {
-        Wait-BackendHealth -Url "http://127.0.0.1:8888/health" -Process $backendProcess -StderrPath $stderrPath
+        Write-Host "Backend sidecar smoke passed: $($backendSmoke.Url)"
     } finally {
-        if ($backendProcess -and -not $backendProcess.HasExited) {
-            Stop-Process -Id $backendProcess.Id -Force
-            Wait-Process -Id $backendProcess.Id -Timeout 5 -ErrorAction SilentlyContinue
-        }
+        Stop-BackendSmokeProcess -Process $backendSmoke.Process
     }
 }
 

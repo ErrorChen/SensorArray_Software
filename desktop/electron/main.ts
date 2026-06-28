@@ -420,7 +420,7 @@ function resolveRendererIndexPath(): string {
 }
 
 function resolvePreloadPath(): string {
-  return path.join(__dirname, "preload.js");
+  return path.join(__dirname, "preload.cjs");
 }
 
 function resolveIconPath(): string | undefined {

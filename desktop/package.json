@@ -6,8 +6,9 @@
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit -p tsconfig.json && vite build && tsc -p tsconfig.electron.json",
-    "build:electron": "tsc -p tsconfig.electron.json",
+    "build": "tsc --noEmit -p tsconfig.json && vite build && npm run build:electron",
+    "clean:electron": "node -e \"require('fs').rmSync('dist-electron', { recursive: true, force: true })\"",
+    "build:electron": "npm run clean:electron && tsc -p tsconfig.electron.json",
     "desktop": "concurrently -k -n vite,electron \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && npm run electron:dev\"",
     "electron:dev": "npm run build:electron && node electron/devLauncher.cjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",

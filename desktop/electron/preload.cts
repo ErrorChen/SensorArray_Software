@@ -1,6 +1,4 @@
-import electron from "electron";
-
-const { contextBridge, ipcRenderer } = electron;
+import { contextBridge, ipcRenderer } from "electron";
 
 function onMenu(channel: string, callback: () => void): () => void {
   const listener = () => callback();
