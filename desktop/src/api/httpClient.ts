@@ -2,12 +2,14 @@ import type {
   BaselineSnapshot,
   BleDevice,
   DisplayMode,
-  ExportSessionPayload,
   HistoryPayload,
   OffsetResponse,
   OffsetScope,
   RowsResponse,
   SerialPort,
+  SessionDataFormat,
+  SetupProfile,
+  SetupProfileApplyResponse,
   TransportMode,
   WifiDevice,
   WriteCommandRequest,
@@ -112,8 +114,25 @@ export class BackendHttpClient {
     return this.post<OffsetResponse>("/api/settings/offsets/zero-current", { scope, row, col });
   }
 
-  async exportSession(): Promise<ExportSessionPayload> {
-    return this.get<ExportSessionPayload>("/api/export/session");
+  async exportSession(format: SessionDataFormat): Promise<ArrayBuffer> {
+    const response = await fetch(`${this.baseUrl}/api/export/session?format=${encodeURIComponent(format)}`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || `HTTP ${response.status}`);
+    }
+    return response.arrayBuffer();
+  }
+
+  async importSession(path: string): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/import/session", { path });
+  }
+
+  async getSetupProfile(): Promise<SetupProfile> {
+    return this.get<SetupProfile>("/api/setup/profile");
+  }
+
+  async applySetupProfile(profile: SetupProfile): Promise<SetupProfileApplyResponse> {
+    return this.post<SetupProfileApplyResponse>("/api/setup/profile", profile);
   }
 
   private async get<T>(path: string): Promise<T> {

@@ -10,11 +10,12 @@ import numpy as np
 
 from sensorarray_app.app.configuration import AppConfiguration
 from sensorarray_app.app.runtime import SensorArrayRuntime
-from sensorarray_app.constants import DEFAULT_SERIAL_BAUD
+from sensorarray_app.constants import APP_VERSION, CAP_FIXED_SCALE, CAP_INVALID_SENTINEL, DEFAULT_SERIAL_BAUD, WIFI_DEFAULT_HOST
 from sensorarray_app.domain.models import DisplayMode
 from sensorarray_app.services.discovery_service import scan_ble, scan_wifi
 from sensorarray_app.transport.serial_transport import SerialTransport
 from sensorarray_backend.core.history import history_payload
+from sensorarray_backend.core.session_data import SessionFrame, export_session_bytes, load_session_frames
 from sensorarray_backend.core.snapshot import snapshot_payload
 
 _LINE_ENDINGS = {"lf": "\n", "crlf": "\r\n", "none": ""}
@@ -24,8 +25,16 @@ class BackendRuntime(SensorArrayRuntime):
     def __init__(self, config: AppConfiguration):
         super().__init__(config)
         self.selectedMode = "serial"
+        self.serialPort = ""
+        self.serialBaud = int(config.serialBaud or DEFAULT_SERIAL_BAUD)
+        self.bleAddress = ""
+        self.bleDeviceId = ""
+        self.wifiHost = WIFI_DEFAULT_HOST
+        self.wifiFallbackHost = WIFI_DEFAULT_HOST
         self.replayPath: str | None = None
         self.replaySpeed = 1.0
+        self.commandLineEnding = "lf"
+        self.defaultSaveDirectory = str(Path.cwd())
         self._lastColorRange: tuple[float | None, float | None] = (None, None)
 
     def set_transport_mode(self, mode: str) -> dict[str, str]:
@@ -41,19 +50,25 @@ class BackendRuntime(SensorArrayRuntime):
         if not str(port or "").strip():
             raise ValueError("serial port is required")
         self.selectedMode = "serial"
-        super().connect_serial(str(port).strip(), int(baud or DEFAULT_SERIAL_BAUD), bool(auto_reconnect))
+        self.serialPort = str(port).strip()
+        self.serialBaud = int(baud or DEFAULT_SERIAL_BAUD)
+        super().connect_serial(self.serialPort, self.serialBaud, bool(auto_reconnect))
 
     def connect_ble(self, address: str, device_id: str = "") -> None:
         if not str(address or "").strip():
             raise ValueError("BLE address is required")
         self.selectedMode = "ble"
-        super().connect_ble(str(address).strip(), device_id)
+        self.bleAddress = str(address).strip()
+        self.bleDeviceId = str(device_id or "")
+        super().connect_ble(self.bleAddress, self.bleDeviceId)
 
     def connect_wifi(self, host: str) -> None:
         if not str(host or "").strip():
             raise ValueError("Wi-Fi host is required")
         self.selectedMode = "wifi"
-        super().connect_wifi(str(host).strip())
+        self.wifiHost = str(host).strip()
+        self.wifiFallbackHost = self.wifiHost
+        super().connect_wifi(self.wifiHost)
 
     def open_replay(self, path: str, speed: float = 1.0) -> dict[str, Any]:
         replay_path = Path(path)
@@ -199,6 +214,7 @@ class BackendRuntime(SensorArrayRuntime):
             result = self.transport.write(payload)
             transport = str(result.get("transport", "unknown"))
             bytes_written = int(result.get("bytesWritten", 0))
+            self.commandLineEnding = str(line_ending or "lf")
             self._host_log("Commands", "info", f"CMD_TX,mode={transport},bytes={bytes_written},ending={line_ending}")
             return {"ok": True, "transport": transport, "bytesWritten": bytes_written}
         except Exception as exc:
@@ -332,7 +348,7 @@ class BackendRuntime(SensorArrayRuntime):
         logs = self.rawLogs.snapshot(show_data=True, limit=self.rawLogs.maxLines)
         return {
             "metadata": {
-                "appVersion": "0.3.0",
+                "appVersion": APP_VERSION,
                 "exportedAt": datetime.now(timezone.utc).isoformat(),
                 "sourceTransport": snap["connection"]["mode"],
                 "device": snap["connection"]["deviceLabel"],
@@ -350,6 +366,112 @@ class BackendRuntime(SensorArrayRuntime):
             "parsedStatus": [],
             "diagnostics": snap["diagnostics"],
         }
+
+    def export_session_file(self, fmt: str) -> tuple[bytes, str, str]:
+        return export_session_bytes(self.export_session_payload(), fmt)
+
+    def import_session_file(self, path: str) -> dict[str, Any]:
+        frames = load_session_frames(path)
+        self.matrixStore.clear()
+        for frame in frames:
+            self.matrixStore.add_capacitance(self._session_frame_to_capacitance(frame))
+        self.selectedMode = "replay"
+        self.replayPath = str(Path(path))
+        self._host_log("Replay", "info", f"Imported session data: {Path(path).name}")
+        return {"ok": True, "path": str(Path(path)), "frames": len(frames), "rows": frames[-1].rows}
+
+    def setup_profile_payload(self) -> dict[str, Any]:
+        snap = snapshot_payload(self)
+        return {
+            "schemaVersion": 1,
+            "appVersion": APP_VERSION,
+            "transport": {
+                "mode": self.selectedMode,
+                "serial": {"port": self.serialPort, "baud": self.serialBaud},
+                "wifi": {"host": self.wifiHost, "fallbackHost": self.wifiFallbackHost},
+                "ble": {"address": self.bleAddress, "deviceId": self.bleDeviceId},
+                "replay": {"path": self.replayPath or "", "speed": self.replaySpeed},
+            },
+            "acquisition": {"rows": snap["frame"]["rows"]},
+            "display": {
+                "displayMode": self.ui.displayMode.value,
+                "measurementDomain": self.ui.measurementDomain,
+                "showCellText": self.ui.cellText,
+                "pauseDisplay": self.ui.paused,
+                "freezeColor": self.ui.freezeColor,
+                "unitMode": self.ui.unitMode,
+                "circuitOffsetPf": self.ui.circuitOffsetPf,
+                "trendLatestN": self.ui.trendLatestN,
+            },
+            "offsetsPf": self.offsets_payload(),
+            "command": {"lineEnding": self.commandLineEnding},
+            "paths": {"defaultSaveDirectory": self.defaultSaveDirectory},
+        }
+
+    def apply_setup_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        warnings: list[str] = []
+        if int(payload.get("schemaVersion", 1)) != 1:
+            raise ValueError("unsupported setup profile schemaVersion")
+        transport = payload.get("transport") if isinstance(payload.get("transport"), dict) else {}
+        serial = transport.get("serial") if isinstance(transport.get("serial"), dict) else {}
+        wifi = transport.get("wifi") if isinstance(transport.get("wifi"), dict) else {}
+        ble = transport.get("ble") if isinstance(transport.get("ble"), dict) else {}
+        replay = transport.get("replay") if isinstance(transport.get("replay"), dict) else {}
+        if "mode" in transport and transport["mode"]:
+            self.set_transport_mode(str(transport["mode"]))
+        if "port" in serial:
+            self.serialPort = str(serial.get("port") or "")
+        if "baud" in serial:
+            baud = int(serial.get("baud") or 0)
+            if baud <= 0:
+                raise ValueError("transport.serial.baud must be positive")
+            self.serialBaud = baud
+        if "host" in wifi:
+            self.wifiHost = str(wifi.get("host") or "")
+        if "fallbackHost" in wifi:
+            self.wifiFallbackHost = str(wifi.get("fallbackHost") or "")
+        if "address" in ble:
+            self.bleAddress = str(ble.get("address") or "")
+        if "deviceId" in ble:
+            self.bleDeviceId = str(ble.get("deviceId") or "")
+        if "path" in replay:
+            self.replayPath = str(replay.get("path") or "") or None
+        if "speed" in replay:
+            self.replaySpeed = max(0.01, float(replay.get("speed") or 1.0))
+        display = payload.get("display") if isinstance(payload.get("display"), dict) else {}
+        if display:
+            self.update_display_settings(display)
+            if "trendLatestN" in display and display["trendLatestN"] is not None:
+                self.ui.trendLatestN = max(1, int(display["trendLatestN"]))
+        offsets = payload.get("offsetsPf")
+        if offsets is not None:
+            self.set_offsets_bulk(offsets)
+        command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
+        if "lineEnding" in command:
+            ending = str(command.get("lineEnding") or "lf")
+            if ending not in _LINE_ENDINGS:
+                raise ValueError("command.lineEnding must be lf, crlf, or none")
+            self.commandLineEnding = ending
+        paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
+        if "defaultSaveDirectory" in paths:
+            directory = str(paths.get("defaultSaveDirectory") or "").strip()
+            if not directory:
+                raise ValueError("paths.defaultSaveDirectory must not be empty")
+            self.defaultSaveDirectory = directory
+        acquisition = payload.get("acquisition") if isinstance(payload.get("acquisition"), dict) else {}
+        if "rows" in acquisition:
+            rows = int(acquisition.get("rows") or 0)
+            if not (1 <= rows <= 8):
+                raise ValueError("acquisition.rows must be 1..8")
+            try:
+                self.request_rows(rows)
+            except Exception as exc:
+                warnings.append(f"rows preference stored but not applied to hardware: {exc}")
+                self.matrixStore.set_active_rows_for_display(rows)
+                self.commands.requestedRows = rows
+                self.commands.activeRows = rows
+                self.commands.pendingRows = None
+        return {"ok": True, "profile": self.setup_profile_payload(), "warnings": warnings}
 
     def _commit_offsets(self, offsets: np.ndarray, reason: str) -> None:
         current = self.user_offsets_array()
@@ -375,6 +497,41 @@ class BackendRuntime(SensorArrayRuntime):
                 }
             )
         return frames
+
+    def _session_frame_to_capacitance(self, frame: SessionFrame):
+        from sensorarray_app.domain.models import CapacitanceFrame
+
+        rows = max(1, min(8, int(frame.rows)))
+        cells = rows * 8
+        values = np.asarray(frame.valuesPf, dtype=np.float64).reshape(64)
+        valid = np.asarray(frame.valid, dtype=bool).reshape(64) & np.isfinite(values)
+        corrected = values[:cells].copy()
+        corrected[~valid[:cells]] = np.nan
+        raw_pf = corrected + float(self.ui.circuitOffsetPf)
+        raw_fixed = np.full(cells, CAP_INVALID_SENTINEL, dtype=np.int64)
+        raw_fixed[valid[:cells]] = np.rint(raw_pf[valid[:cells]] * CAP_FIXED_SCALE).astype(np.int64)
+        return CapacitanceFrame(
+            seq=int(frame.seq),
+            timestampUs=int(float(frame.timeSeconds) * 1_000_000),
+            rows=rows,
+            cells=cells,
+            generation=1,
+            requestId=1,
+            rowFreshMask=(1 << rows) - 1,
+            primaryFreshMask=(1 << rows) - 1,
+            secondaryFreshMask=(1 << rows) - 1,
+            badStaleCount=0,
+            badMixedCount=0,
+            badInvalidCount=int((~valid[:cells]).sum()),
+            rawFixedValues=raw_fixed,
+            rawPfValues=raw_pf,
+            correctedPfValues=corrected,
+            validMask=valid[:cells],
+            sourceTransport="import",
+            sessionGeneration=0,
+            receivedTime=time.time(),
+            receivedMonotonicNs=time.monotonic_ns(),
+        )
 
     def _restore_exported_session_settings(self, replay_path: Path) -> bool:
         if replay_path.suffix.lower() != ".json":

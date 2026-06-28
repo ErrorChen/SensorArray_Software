@@ -2,19 +2,21 @@ import { Bluetooth, FileUp, RefreshCw, Rows3, Wifi, Zap } from "lucide-react";
 import { useEffect, useMemo, useState as useSlot } from "react";
 
 import type { BackendHttpClient } from "../../api/httpClient";
-import type { BackendSnapshotPayload, BleDevice, SerialPort, TransportMode, WifiDevice } from "../../api/types";
+import type { BackendSnapshotPayload, BleDevice, SerialPort, SetupProfile, TransportMode, WifiDevice } from "../../api/types";
 import { isBleScanDisabled } from "../../state/transportUi";
 
 type Props = {
   client: BackendHttpClient | null;
   snapshot: BackendSnapshotPayload | null;
+  setupProfile: SetupProfile;
+  onSetupProfileChange: (profile: SetupProfile) => void;
   onError: (message: string) => void;
 };
 
 const connectedStates = new Set(["connected", "streaming"]);
 const busyStates = new Set(["connecting", "disconnecting", "reconnecting"]);
 
-export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
+export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChange, onError }: Props): JSX.Element {
   const [mode, setMode] = useSlot<TransportMode>("serial");
   const [serialPorts, setSerialPorts] = useSlot<SerialPort[]>([]);
   const [selectedPort, setSelectedPort] = useSlot("");
@@ -37,6 +39,18 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
   const currentModeConnected = connectionMode === mode && connectedStates.has(connectionState);
   const currentModeBusy = connectionMode === mode && busyStates.has(connectionState);
   const bleScanDisabled = isBleScanDisabled(connectionMode, connectionState);
+
+  useEffect(() => {
+    setMode(setupProfile.transport.mode);
+    setSelectedPort(setupProfile.transport.serial.port || "");
+    setBaud(setupProfile.transport.serial.baud);
+    setSelectedBle(setupProfile.transport.ble.address || "");
+    setSelectedWifi(setupProfile.transport.wifi.host || "");
+    setFallbackHost(setupProfile.transport.wifi.fallbackHost || "");
+    setReplayPath(setupProfile.transport.replay.path || "");
+    setReplaySpeed(setupProfile.transport.replay.speed);
+    setRows(setupProfile.acquisition.rows);
+  }, [setupProfile]);
 
   useEffect(() => {
     if (!client) {
@@ -74,6 +88,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
 
   async function handleModeChange(nextMode: TransportMode): Promise<void> {
     setMode(nextMode);
+    updateTransportProfile({ mode: nextMode });
     if (!client) {
       return;
     }
@@ -101,7 +116,11 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
     const devices = await client.scanBle();
     setBleDevices(devices);
     const firstVerified = devices.find((device) => device.verified || !device.advanced);
-    setSelectedBle((current) => current || firstVerified?.address || "");
+    const address = selectedBle || firstVerified?.address || "";
+    setSelectedBle(address);
+    if (address) {
+      updateTransportProfile({ ble: { ...setupProfile.transport.ble, address, deviceId: address } });
+    }
   }
 
   async function discoverWifi(): Promise<void> {
@@ -111,7 +130,11 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
     const devices = await client.discoverWifi();
     setWifiDevices(devices);
     const firstConfirmed = devices.find((device) => device.confirmed) ?? devices[0];
-    setSelectedWifi((current) => current || firstConfirmed?.host || "");
+    const host = selectedWifi || firstConfirmed?.host || "";
+    setSelectedWifi(host);
+    if (host) {
+      updateTransportProfile({ wifi: { ...setupProfile.transport.wifi, host } });
+    }
   }
 
   async function primaryAction(): Promise<void> {
@@ -139,6 +162,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
   async function handleRowsChange(nextRows: number): Promise<void> {
     const previousRows = snapshot?.frame.rows ?? rows;
     setRows(nextRows);
+    onSetupProfileChange({ ...setupProfile, acquisition: { rows: nextRows } });
     if (!client || rowsPending) {
       return;
     }
@@ -147,6 +171,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
       await client.setRows(nextRows);
     } catch (error) {
       setRows(previousRows);
+      onSetupProfileChange({ ...setupProfile, acquisition: { rows: previousRows } });
       onError(error instanceof Error ? error.message : String(error));
     } finally {
       setRowsPending(false);
@@ -187,7 +212,14 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
         <div className="modePanel">
           <label>Port</label>
           <div className="inputRow">
-            <select value={selectedPort} onChange={(event) => setSelectedPort(event.target.value)}>
+            <select
+              value={selectedPort}
+              onChange={(event) => {
+                const port = event.target.value;
+                setSelectedPort(port);
+                updateTransportProfile({ serial: { ...setupProfile.transport.serial, port } });
+              }}
+            >
               <option value="">Select scanned port</option>
               {serialPorts.map((port) => (
                 <option key={port.device} value={port.device}>
@@ -200,14 +232,30 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             </button>
           </div>
           <label>Baud</label>
-          <input value={baud} type="number" min={1} onChange={(event) => setBaud(Number(event.target.value))} />
+          <input
+            value={baud}
+            type="number"
+            min={1}
+            onChange={(event) => {
+              const nextBaud = Number(event.target.value);
+              setBaud(nextBaud);
+              updateTransportProfile({ serial: { ...setupProfile.transport.serial, baud: nextBaud } });
+            }}
+          />
         </div>
       ) : null}
 
       {mode === "ble" ? (
         <div className="modePanel">
           <label>Device</label>
-          <select value={selectedBle} onChange={(event) => setSelectedBle(event.target.value)}>
+          <select
+            value={selectedBle}
+            onChange={(event) => {
+              const address = event.target.value;
+              setSelectedBle(address);
+              updateTransportProfile({ ble: { ...setupProfile.transport.ble, address, deviceId: address } });
+            }}
+          >
             <option value="">Select scanned BLE device</option>
             {visibleBleDevices.map((device) => (
               <option key={device.address} value={device.address}>
@@ -229,7 +277,14 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
       {mode === "wifi" ? (
         <div className="modePanel">
           <label>Discovered host</label>
-          <select value={selectedWifi} onChange={(event) => setSelectedWifi(event.target.value)}>
+          <select
+            value={selectedWifi}
+            onChange={(event) => {
+              const host = event.target.value;
+              setSelectedWifi(host);
+              updateTransportProfile({ wifi: { ...setupProfile.transport.wifi, host } });
+            }}
+          >
             <option value="">Select discovered host</option>
             {wifiDevices.map((device) => (
               <option key={`${device.host}-${device.method}`} value={device.host}>
@@ -238,7 +293,14 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             ))}
           </select>
           <label>Fallback host</label>
-          <input value={fallbackHost} onChange={(event) => setFallbackHost(event.target.value)} />
+          <input
+            value={fallbackHost}
+            onChange={(event) => {
+              const fallbackHost = event.target.value;
+              setFallbackHost(fallbackHost);
+              updateTransportProfile({ wifi: { ...setupProfile.transport.wifi, fallbackHost } });
+            }}
+          />
           <button onClick={() => void run("Discovering...", discoverWifi)}>
             <Wifi size={16} /> {busyAction === "Discovering..." ? "Discovering..." : "Discover"}
           </button>
@@ -249,13 +311,23 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
         <div className="modePanel">
           <label>Replay file</label>
           <div className="inputRow">
-            <input value={replayPath} onChange={(event) => setReplayPath(event.target.value)} />
+            <input
+              value={replayPath}
+              onChange={(event) => {
+                const path = event.target.value;
+                setReplayPath(path);
+                updateTransportProfile({ replay: { ...setupProfile.transport.replay, path } });
+              }}
+            />
             <button
               title="Choose replay file"
               onClick={() =>
                 void run("Loading...", async () => {
                   const path = await window.sensorarrayDesktop?.selectReplayFile();
-                  if (path) setReplayPath(path);
+                  if (path) {
+                    setReplayPath(path);
+                    updateTransportProfile({ replay: { ...setupProfile.transport.replay, path } });
+                  }
                 })
               }
             >
@@ -263,7 +335,17 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             </button>
           </div>
           <label>Speed</label>
-          <input type="number" min={0.01} step={0.25} value={replaySpeed} onChange={(event) => setReplaySpeed(Number(event.target.value))} />
+          <input
+            type="number"
+            min={0.01}
+            step={0.25}
+            value={replaySpeed}
+            onChange={(event) => {
+              const speed = Number(event.target.value);
+              setReplaySpeed(speed);
+              updateTransportProfile({ replay: { ...setupProfile.transport.replay, speed } });
+            }}
+          />
         </div>
       ) : null}
 
@@ -294,7 +376,11 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           disabled={!client}
           value={snapshot?.display.displayMode ?? "absolute_pf"}
           onChange={(event) =>
-            void run("Saving...", () => client!.setDisplaySettings({ displayMode: event.target.value as "absolute_pf" | "delta_percent" }).then(() => undefined))
+            void run("Saving...", async () => {
+              const displayMode = event.target.value as "absolute_pf" | "delta_percent";
+              onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, displayMode } });
+              await client!.setDisplaySettings({ displayMode });
+            })
           }
         >
           <option value="absolute_pf">Absolute C</option>
@@ -305,7 +391,13 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.showCellText ?? true}
-            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ showCellText: event.target.checked }).then(() => undefined))}
+            onChange={(event) =>
+              void run("Saving...", async () => {
+                const showCellText = event.target.checked;
+                onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, showCellText } });
+                await client!.setDisplaySettings({ showCellText });
+              })
+            }
           />
           Cell text
         </label>
@@ -313,7 +405,13 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.pauseDisplay ?? false}
-            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ pauseDisplay: event.target.checked }).then(() => undefined))}
+            onChange={(event) =>
+              void run("Saving...", async () => {
+                const pauseDisplay = event.target.checked;
+                onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, pauseDisplay } });
+                await client!.setDisplaySettings({ pauseDisplay });
+              })
+            }
           />
           Pause display
         </label>
@@ -321,7 +419,13 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.freezeColor ?? false}
-            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ freezeColor: event.target.checked }).then(() => undefined))}
+            onChange={(event) =>
+              void run("Saving...", async () => {
+                const freezeColor = event.target.checked;
+                onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, freezeColor } });
+                await client!.setDisplaySettings({ freezeColor });
+              })
+            }
           />
           Freeze colour
         </label>
@@ -336,6 +440,10 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
       </div>
     </section>
   );
+
+  function updateTransportProfile(partial: Partial<SetupProfile["transport"]>): void {
+    onSetupProfileChange({ ...setupProfile, transport: { ...setupProfile.transport, ...partial } });
+  }
 }
 
 function formatRssi(rssi: number | null): string {

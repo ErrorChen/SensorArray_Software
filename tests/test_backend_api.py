@@ -9,6 +9,7 @@ from sensorarray_app.app.configuration import AppConfiguration
 from sensorarray_app.domain.models import CapacitanceFrame
 from sensorarray_app.transport.serial_transport import SerialTransport
 from sensorarray_backend.app import create_app
+from sensorarray_backend.core.session_data import load_session_frames
 
 
 def test_serial_ports_are_discovered_not_defaulted(monkeypatch):
@@ -147,7 +148,7 @@ def test_offsets_apply_to_snapshot_history_and_export():
         offset = client.post("/api/settings/offsets/cell", json={"row": 1, "col": 1, "offsetPf": 10.0}).json()
         status = client.get("/api/status").json()
         history = client.get("/api/history?latest_n=300").json()
-        exported = client.get("/api/export/session").json()
+        exported = runtime.export_session_payload()
     assert offset["offsetsPf"][0][0] == 10.0
     assert status["matrix"]["correctedPf"][0][0] == 20.0
     assert status["matrix"]["displayValues"][0][0] == 10.0
@@ -155,6 +156,56 @@ def test_offsets_apply_to_snapshot_history_and_export():
     assert exported["offsetsPf"][0][0] == 10.0
     assert "metadata" in exported
     assert "historyFrames" in exported
+
+
+def test_session_export_formats_round_trip(tmp_path):
+    app = create_app(AppConfiguration())
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        runtime._handle_event(make_cap_frame(1, [20.0] * 64))
+        for fmt in ["csv", "xlsx", "mat", "h5"]:
+            response = client.get(f"/api/export/session?format={fmt}")
+            assert response.status_code == 200
+            path = tmp_path / f"session.{fmt}"
+            path.write_bytes(response.content)
+            frames = load_session_frames(path)
+            assert frames
+            assert frames[-1].values_matrix().shape == (8, 8)
+            assert frames[-1].values_matrix()[0, 0] == 20.0
+
+
+def test_import_session_data_route(tmp_path):
+    app = create_app(AppConfiguration())
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        runtime._handle_event(make_cap_frame(1, [22.0] * 64))
+        response = client.get("/api/export/session?format=csv")
+        path = tmp_path / "session.csv"
+        path.write_bytes(response.content)
+        imported = client.post("/api/import/session", json={"path": str(path)}).json()
+        status = client.get("/api/status").json()
+    assert imported["ok"] is True
+    assert imported["frames"] >= 1
+    assert status["matrix"]["correctedPf"][0][0] == 22.0
+
+
+def test_setup_profile_get_and_apply():
+    app = create_app(AppConfiguration())
+    with TestClient(app) as client:
+        profile = client.get("/api/setup/profile").json()
+        profile["transport"]["serial"]["baud"] = 230400
+        profile["acquisition"]["rows"] = 4
+        profile["offsetsPf"][0][0] = 7.5
+        profile["paths"]["defaultSaveDirectory"] = "C:/SensorArrayExports"
+        response = client.post("/api/setup/profile", json=profile)
+        payload = response.json()
+        status = client.get("/api/status").json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["profile"]["transport"]["serial"]["baud"] == 230400
+    assert payload["profile"]["offsetsPf"][0][0] == 7.5
+    assert payload["profile"]["paths"]["defaultSaveDirectory"] == "C:/SensorArrayExports"
+    assert status["frame"]["rows"] == 4
 
 
 def make_cap_frame(seq: int, values: list[float]) -> CapacitanceFrame:

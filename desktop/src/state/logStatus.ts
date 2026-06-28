@@ -1,25 +1,14 @@
 import type { LogRow } from "../api/types";
+import { logTagSchemas, type LogFieldValue, type LogTagSchema, type StatusCategory, type StatusSeverity } from "./logSchema";
 
-export type StatusSeverity = "ok" | "warn" | "error" | "info";
-
-export type StatusCategory =
-  | "Transport"
-  | "BLE"
-  | "Wi-Fi"
-  | "Serial"
-  | "Parser"
-  | "Rows"
-  | "Baseline"
-  | "Display"
-  | "Error"
-  | "Other";
+export type { StatusCategory, StatusSeverity } from "./logSchema";
 
 export interface StatusItem {
   category: StatusCategory;
   severity: StatusSeverity;
   title: string;
   explanation: string;
-  details: Record<string, string | number | boolean | null>;
+  details: Record<string, LogFieldValue | string>;
   lastSeen?: string;
 }
 
@@ -33,9 +22,9 @@ export function parseLogStatusRows(rows: LogRow[]): StatusItem[] {
   return Array.from(latest.values()).sort((left, right) => severityRank(right.severity) - severityRank(left.severity));
 }
 
-export function parseKeyValueText(rawText: string): Record<string, string | number | boolean | null> {
+export function parseKeyValueText(rawText: string): Record<string, LogFieldValue> {
   const parts = splitCsv(rawText);
-  const details: Record<string, string | number | boolean | null> = {};
+  const details: Record<string, LogFieldValue> = {};
   for (const part of parts.slice(1)) {
     const index = part.indexOf("=");
     if (index < 0) {
@@ -47,74 +36,16 @@ export function parseKeyValueText(rawText: string): Record<string, string | numb
 }
 
 function parseLogRow(row: LogRow): StatusItem {
-  const tag = (row.tag || row.rawText.split(",", 1)[0] || "UNKNOWN").trim();
+  const rowTag = (row.tag || "UNKNOWN").trim();
+  const rawTag = (row.rawText.split(",", 1)[0] || "").trim();
+  const tag = logTagSchemas[rowTag] ? rowTag : rawTag || rowTag;
   const details = { ...parseKeyValueText(row.rawText), ...row.parsedFields };
   const base = {
-    details,
     lastSeen: row.timestamp ? new Date(row.timestamp * 1000).toLocaleTimeString() : undefined
   };
-  if (tag === "CMD_TX") {
-    return {
-      ...base,
-      category: "Transport",
-      severity: "ok",
-      title: "Command sent",
-      explanation: "A command was written through the active backend transport."
-    };
-  }
-  if (tag === "CMD_TX_FAIL") {
-    return {
-      ...base,
-      category: "Error",
-      severity: "error",
-      title: "Command send failed",
-      explanation: "The active transport rejected or failed the write request."
-    };
-  }
-  if (tag === "BLE_RX50") {
-    return {
-      ...base,
-      category: "BLE",
-      severity: severityFromCounters(row, details),
-      title: "BLE notify receive statistics",
-      explanation: "Periodic BLE packet, byte, failure, and prefix counters."
-    };
-  }
-  if (tag === "BLE_FRAG50") {
-    return {
-      ...base,
-      category: "BLE",
-      severity: severityFromCounters(row, details),
-      title: "BLE fragment statistics",
-      explanation: "BLE fragment reassembly counters including duplicate, missing, timeout, CRC, and length failures."
-    };
-  }
-  if (tag === "PROTO50") {
-    return {
-      ...base,
-      category: "Parser",
-      severity: severityFromCounters(row, details),
-      title: "Protocol parser statistics",
-      explanation: "Content router counters for capacitance frames, text logs, rejects, and accepted frames."
-    };
-  }
-  if (tag === "RCMD") {
-    return {
-      ...base,
-      category: "Rows",
-      severity: "ok",
-      title: "Rows command accepted",
-      explanation: "Firmware accepted a ROWS request; application still waits for the frame-boundary apply event."
-    };
-  }
-  if (tag === "RAPP") {
-    return {
-      ...base,
-      category: "Rows",
-      severity: "ok",
-      title: "Rows applied",
-      explanation: "Firmware applied the requested row count at a frame boundary."
-    };
+  const schema = logTagSchemas[tag];
+  if (schema) {
+    return buildStatusItemFromSchema(row, tag, schema, details);
   }
   if (tag === "PARSER" || containsAny(row.rawText, ["crc", "length", "reject", "malformed", "strict_ascii"])) {
     return {
@@ -122,7 +53,8 @@ function parseLogRow(row: LogRow): StatusItem {
       category: "Parser",
       severity: row.severity === "error" ? "error" : "warn",
       title: "Parser issue",
-      explanation: "The parser rejected or warned about malformed input."
+      explanation: "The parser rejected or warned about malformed input.",
+      details: labelDetails(details, {}, "Legacy/unknown field")
     };
   }
   if (containsAny(row.rawText, ["baseline", "Baseline"])) {
@@ -131,7 +63,8 @@ function parseLogRow(row: LogRow): StatusItem {
       category: "Baseline",
       severity: row.severity === "error" || containsAny(row.rawText, ["invalid", "Invalid", "No data"]) ? "warn" : "info",
       title: "Baseline state",
-      explanation: "Baseline capture, ready, reset, or invalidation state."
+      explanation: "Baseline capture, ready, reset, or invalidation state.",
+      details: labelDetails(details, {}, "Legacy/unknown field")
     };
   }
   if (containsAny(row.rawText, ["connected", "disconnected", "reconnecting", "CONNECTING", "STREAMING"])) {
@@ -140,25 +73,44 @@ function parseLogRow(row: LogRow): StatusItem {
       category: transportCategory(row.source),
       severity: row.severity === "error" ? "error" : "info",
       title: "Transport state",
-      explanation: "Connection lifecycle state reported by the backend transport manager."
+      explanation: "Connection lifecycle state reported by the backend transport manager.",
+      details: labelDetails(details, {}, "Legacy/unknown field")
     };
   }
   return {
     ...base,
     category: "Other",
     severity: normaliseSeverity(row.severity),
-    title: tag || "Unknown log",
-    explanation: Object.keys(details).length ? "Unrecognised log with parsed key/value fields." : "Unrecognised log line.",
-    details
+    title: `Unknown firmware log (${tag || "UNKNOWN"})`,
+    explanation: Object.keys(details).length ? "Unknown firmware log with parsed key/value fields." : "Unknown firmware log line.",
+    details: labelDetails(details, {}, "Unknown firmware field")
   };
 }
 
-function severityFromCounters(row: LogRow, details: Record<string, string | number | boolean | null>): StatusSeverity {
-  if (row.severity === "error") {
-    return "error";
+function buildStatusItemFromSchema(row: LogRow, tag: string, schema: LogTagSchema, details: Record<string, LogFieldValue>): StatusItem {
+  const severity = typeof schema.severity === "function" ? schema.severity(row, details) : schema.severity ?? normaliseSeverity(row.severity);
+  return {
+    category: schema.category,
+    severity,
+    title: schema.title,
+    explanation: schema.explanation,
+    details: labelDetails(details, schema.fieldLabels, "Legacy/unknown field", schema.fieldFormatters),
+    lastSeen: row.timestamp ? new Date(row.timestamp * 1000).toLocaleTimeString() : undefined
+  };
+}
+
+function labelDetails(
+  details: Record<string, LogFieldValue>,
+  fieldLabels: Record<string, string>,
+  unknownPrefix: string,
+  fieldFormatters: Record<string, (value: LogFieldValue) => string> = {}
+): Record<string, LogFieldValue | string> {
+  const output: Record<string, LogFieldValue | string> = {};
+  for (const [key, value] of Object.entries(details)) {
+    const label = fieldLabels[key] ?? `${unknownPrefix} (${key})`;
+    output[label] = fieldFormatters[key] ? fieldFormatters[key](value) : value;
   }
-  const badKeys = ["fail", "reject", "missing", "timeout", "crc", "length"];
-  return badKeys.some((key) => Number(details[key] ?? 0) > 0) ? "warn" : "ok";
+  return output;
 }
 
 function normaliseSeverity(value: string): StatusSeverity {
@@ -211,7 +163,7 @@ function splitCsv(value: string): string[] {
   return out;
 }
 
-function coerceValue(value: string): string | number | boolean | null {
+function coerceValue(value: string): LogFieldValue {
   if (value === "") {
     return null;
   }

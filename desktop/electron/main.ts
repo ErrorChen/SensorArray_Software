@@ -1,4 +1,11 @@
-import type { BrowserWindow as BrowserWindowType, MenuItemConstructorOptions, OpenDialogOptions, SaveDialogOptions } from "electron";
+import type {
+  BrowserWindow as BrowserWindowType,
+  MenuItemConstructorOptions,
+  OpenDialogOptions,
+  OpenDialogReturnValue,
+  SaveDialogOptions,
+  SaveDialogReturnValue
+} from "electron";
 import electron from "electron";
 import fs from "node:fs";
 import path from "node:path";
@@ -11,13 +18,46 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
 const appId = "au.edu.sydney.sensorarray";
+const backendPortCandidates = [6666, 8888, ...Array.from({ length: 50 }, (_, index) => 8750 + index)];
 
 let backend: BackendProcess | null = null;
 let mainWindow: BrowserWindowType | null = null;
+let defaultSaveDirectory = resolveRuntimeDirectory();
 
 app.setAppUserModelId(appId);
+app.commandLine.appendSwitch("explicitly-allowed-ports", backendPortCandidates.join(","));
 
-ipcMain.handle("backend:url", () => backend?.url ?? "http://127.0.0.1:8765");
+ipcMain.handle("backend:url", () => backend?.url ?? "http://127.0.0.1:6666");
+ipcMain.handle("runtime:directory", () => resolveRuntimeDirectory());
+ipcMain.handle("paths:getDefaultSaveDirectory", () => defaultSaveDirectory);
+ipcMain.handle("paths:setDefaultSaveDirectory", async (_event, directory: string) => {
+  const check = await checkDirectoryWritable(directory);
+  defaultSaveDirectory = check.path || String(directory || "");
+  return check;
+});
+ipcMain.handle("paths:selectDefaultSaveDirectory", async () => {
+  const result = await showOpenDialog({
+    title: "Choose default save directory",
+    defaultPath: defaultSaveDirectory,
+    properties: ["openDirectory", "createDirectory"]
+  });
+  if (!result || result.canceled || result.filePaths.length === 0) {
+    return { ok: false, canceled: true };
+  }
+  const check = await checkDirectoryWritable(result.filePaths[0]);
+  if (check.ok) {
+    defaultSaveDirectory = check.path;
+  }
+  return check;
+});
+ipcMain.handle("paths:openDefaultSaveDirectory", async () => {
+  const check = await checkDirectoryWritable(defaultSaveDirectory);
+  if (!check.ok) {
+    return check;
+  }
+  const error = await electron.shell.openPath(check.path);
+  return error ? { ok: false, path: check.path, error } : { ok: true, path: check.path };
+});
 ipcMain.handle("dialog:selectReplayFile", async () => {
   const options: OpenDialogOptions = {
     title: "Open replay file",
@@ -27,22 +67,86 @@ ipcMain.handle("dialog:selectReplayFile", async () => {
       { name: "All files", extensions: ["*"] }
     ]
   };
-  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+  const result = await showOpenDialog(options);
   if (result.canceled || result.filePaths.length === 0) {
     return null;
   }
   return result.filePaths[0];
 });
-ipcMain.handle("dialog:saveExportedSession", async (_event, defaultName: string, data: string) => {
+ipcMain.handle("dialog:selectSessionDataFile", async () => {
+  const result = await showOpenDialog({
+    title: "Import session data",
+    defaultPath: defaultSaveDirectory,
+    properties: ["openFile"],
+    filters: [
+      { name: "SensorArray session data", extensions: ["csv", "xlsx", "mat", "h5"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  });
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+  return result.filePaths[0];
+});
+ipcMain.handle("dialog:saveExportedSession", async (_event, defaultName: string, data: ArrayBuffer | Uint8Array | string) => {
   const options: SaveDialogOptions = {
     title: "Export current session data",
-    defaultPath: defaultName,
+    defaultPath: path.join(defaultSaveDirectory, defaultName),
     filters: [
-      { name: "SensorArray session JSON", extensions: ["json"] },
+      { name: "SensorArray CSV", extensions: ["csv"] },
+      { name: "SensorArray Excel workbook", extensions: ["xlsx"] },
+      { name: "SensorArray MATLAB file", extensions: ["mat"] },
+      { name: "SensorArray HDF5 file", extensions: ["h5"] },
       { name: "All files", extensions: ["*"] }
     ]
   };
   const result = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+  if (result.canceled || !result.filePath) {
+    return { ok: false, canceled: true };
+  }
+  try {
+    const buffer = bufferFromIpcData(data);
+    await fs.promises.writeFile(result.filePath, buffer);
+    return { ok: true, path: result.filePath };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+ipcMain.handle("dialog:chooseSessionExportPath", async (_event, defaultName: string) => {
+  const result = await showSaveDialog({
+    title: "Export current session data",
+    defaultPath: path.join(defaultSaveDirectory, defaultName),
+    filters: [
+      { name: "SensorArray CSV", extensions: ["csv"] },
+      { name: "SensorArray Excel workbook", extensions: ["xlsx"] },
+      { name: "SensorArray MATLAB file", extensions: ["mat"] },
+      { name: "SensorArray HDF5 file", extensions: ["h5"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  });
+  if (result.canceled || !result.filePath) {
+    return { ok: false, canceled: true };
+  }
+  return { ok: true, path: result.filePath };
+});
+ipcMain.handle("file:writeBinary", async (_event, filePath: string, data: ArrayBuffer | Uint8Array | string) => {
+  try {
+    const buffer = bufferFromIpcData(data);
+    await fs.promises.writeFile(filePath, buffer);
+    return { ok: true, path: filePath };
+  } catch (error) {
+    return { ok: false, path: filePath, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+ipcMain.handle("dialog:saveSetupProfile", async (_event, defaultName: string, data: string) => {
+  const result = await showSaveDialog({
+    title: "Export setup profile",
+    defaultPath: path.join(defaultSaveDirectory, defaultName),
+    filters: [
+      { name: "SensorArray setup JSON", extensions: ["json"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  });
   if (result.canceled || !result.filePath) {
     return { ok: false, canceled: true };
   }
@@ -53,9 +157,26 @@ ipcMain.handle("dialog:saveExportedSession", async (_event, defaultName: string,
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
+ipcMain.handle("dialog:selectSetupProfile", async () => {
+  const result = await showOpenDialog({
+    title: "Import setup profile",
+    defaultPath: defaultSaveDirectory,
+    properties: ["openFile"],
+    filters: [
+      { name: "SensorArray setup JSON", extensions: ["json"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  });
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+  return result.filePaths[0];
+});
+ipcMain.handle("file:readText", async (_event, filePath: string) => fs.promises.readFile(filePath, "utf-8"));
+ipcMain.handle("screenshot:capture", async () => captureScreenshot());
 
 async function createWindow(): Promise<void> {
-  const port = await findAvailablePort(8765);
+  const port = await findAvailablePort(backendPortCandidates);
   try {
     backend = startBackend({
       projectRoot: repoRoot,
@@ -115,11 +236,40 @@ function installApplicationMenu(): void {
           click: () => void importReplayDataFromMenu()
         },
         {
+          label: "Import Session Data...",
+          accelerator: "CmdOrCtrl+I",
+          click: () => mainWindow?.webContents.send("menu:importSessionData")
+        },
+        {
           label: "Export Current Session Data...",
+          accelerator: "CmdOrCtrl+E",
           click: () => mainWindow?.webContents.send("menu:exportSessionData")
+        },
+        {
+          label: "Import Setup...",
+          click: () => mainWindow?.webContents.send("menu:importSetupProfile")
+        },
+        {
+          label: "Export Setup...",
+          click: () => mainWindow?.webContents.send("menu:exportSetupProfile")
+        },
+        { type: "separator" },
+        {
+          label: "Screenshot / Capture",
+          click: () => mainWindow?.webContents.send("menu:captureScreenshot")
         },
         { type: "separator" },
         process.platform === "darwin" ? { role: "close" } : { role: "quit", label: "Exit" }
+      ]
+    },
+    {
+      label: "Screenshot / Capture",
+      submenu: [
+        {
+          label: "Capture Screenshot",
+          accelerator: "CmdOrCtrl+Shift+S",
+          click: () => mainWindow?.webContents.send("menu:captureScreenshot")
+        }
       ]
     }
   ];
@@ -135,10 +285,92 @@ async function importReplayDataFromMenu(): Promise<void> {
       { name: "All files", extensions: ["*"] }
     ]
   };
-  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+  const result = await showOpenDialog(options);
   if (!result.canceled && result.filePaths[0]) {
     mainWindow?.webContents.send("menu:importReplayData", result.filePaths[0]);
   }
+}
+
+async function captureScreenshot(): Promise<{ ok: boolean; path?: string; error?: string }> {
+  if (!mainWindow) {
+    return { ok: false, error: "No application window is available" };
+  }
+  const directory = await checkDirectoryWritable(defaultSaveDirectory);
+  if (!directory.ok) {
+    return { ok: false, error: directory.error };
+  }
+  try {
+    const image = await mainWindow.webContents.capturePage();
+    const filePath = await nextScreenshotPath(directory.path);
+    await fs.promises.writeFile(filePath, image.toPNG());
+    return { ok: true, path: filePath };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function nextScreenshotPath(directory: string): Promise<string> {
+  const now = new Date();
+  const candidates = [
+    `Screenshot_CscArray_${hourDayMonth(now)}.png`,
+    `Screenshot_CscArray_${hourDayMonthMinute(now)}.png`,
+    `Screenshot_CscArray_${hourDayMonthMinuteSecond(now)}.png`
+  ];
+  for (const candidate of candidates) {
+    const filePath = path.join(directory, candidate);
+    if (!fs.existsSync(filePath)) {
+      return filePath;
+    }
+  }
+  for (let index = 1; index < 1000; index += 1) {
+    const filePath = path.join(directory, `Screenshot_CscArray_${hourDayMonthMinuteSecond(now)}_${String(index).padStart(3, "0")}.png`);
+    if (!fs.existsSync(filePath)) {
+      return filePath;
+    }
+  }
+  throw new Error("Could not allocate a screenshot filename");
+}
+
+function hourDayMonth(date: Date): string {
+  return `${pad2(date.getHours())}${pad2(date.getDate())}${pad2(date.getMonth() + 1)}`;
+}
+
+function hourDayMonthMinute(date: Date): string {
+  return `${hourDayMonth(date)}${pad2(date.getMinutes())}`;
+}
+
+function hourDayMonthMinuteSecond(date: Date): string {
+  return `${hourDayMonthMinute(date)}${pad2(date.getSeconds())}`;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function resolveRuntimeDirectory(): string {
+  return app.isPackaged ? path.dirname(process.execPath) : repoRoot;
+}
+
+async function checkDirectoryWritable(directory: string): Promise<{ ok: true; path: string } | { ok: false; path: string; error: string }> {
+  const target = path.resolve(String(directory || resolveRuntimeDirectory()));
+  try {
+    const stat = await fs.promises.stat(target);
+    if (!stat.isDirectory()) {
+      return { ok: false, path: target, error: "Path is not a directory" };
+    }
+    await fs.promises.access(target, fs.constants.W_OK);
+    return { ok: true, path: target };
+  } catch (error) {
+    return { ok: false, path: target, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function showOpenDialog(options: OpenDialogOptions): Promise<OpenDialogReturnValue> {
+  return mainWindow ? dialog.showOpenDialog(mainWindow, options) : dialog.showOpenDialog(options);
+}
+
+async function showSaveDialog(options: SaveDialogOptions): Promise<SaveDialogReturnValue> {
+  return mainWindow ? dialog.showSaveDialog(mainWindow, options) : dialog.showSaveDialog(options);
 }
 
 async function showBackendError(error: unknown): Promise<void> {
@@ -162,6 +394,16 @@ function escapeHtml(value: string): string {
     const map: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     return map[char];
   });
+}
+
+function bufferFromIpcData(data: ArrayBuffer | Uint8Array | string): Buffer {
+  if (typeof data === "string") {
+    return Buffer.from(data, "utf-8");
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(new Uint8Array(data));
+  }
+  return Buffer.from(data);
 }
 
 function resolveRendererIndexPath(): string {

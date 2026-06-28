@@ -13,6 +13,9 @@ import { StatusBar } from "./components/StatusBar/StatusBar";
 import { TrendGrid } from "./components/TrendGrid/TrendGrid";
 import { snapshotForDisplay } from "./state/appStore";
 import { clampSplitRatio, type SplitLimits } from "./state/layout";
+import { defaultSetupProfile, normaliseSetupProfile, setupProfileFromSnapshot } from "./state/setupProfile";
+import { readStoredSetupProfile, writeStoredSetupProfile } from "./state/setupProfileStorage";
+import type { SessionDataFormat, SetupProfile } from "./api/types";
 
 const mainSplitKey = "sensorarray.layout.mainSplitRatio";
 const bottomSplitKey = "sensorarray.layout.bottomSplitRatio";
@@ -23,6 +26,8 @@ export function App(): JSX.Element {
   const [visualSnapshot, setVisualSnapshot] = useSlot<BackendSnapshotPayload | null>(null);
   const [history, setHistory] = useSlot<HistoryPayload | null>(null);
   const [optimisticSelection, setOptimisticSelection] = useSlot<SelectionSnapshot | null>(null);
+  const [runtimeDirectory, setRuntimeDirectory] = useSlot(".");
+  const [setupProfile, setSetupProfile] = useSlot<SetupProfile>(() => defaultSetupProfile("."));
   const [configMode, setConfigMode] = useSlot<"setup" | "advanced">("setup");
   const [socketState, setSocketState] = useSlot("disconnected");
   const [error, setError] = useSlot<string | null>(null);
@@ -31,21 +36,56 @@ export function App(): JSX.Element {
   const [bottomSplitRatio, setBottomSplitRatio] = usePersistentRatio(bottomSplitKey, 0.5);
   const mainSplitRef = useRef<HTMLDivElement | null>(null);
   const bottomSplitRef = useRef<HTMLDivElement | null>(null);
+  const clientRef = useRef<BackendHttpClient | null>(null);
+  const setupProfileRef = useRef<SetupProfile>(setupProfile);
+  const snapshotRef = useRef<BackendSnapshotPayload | null>(snapshot);
+  const runtimeDirectoryRef = useRef(runtimeDirectory);
+  const latestSelectionRef = useRef<SelectionSnapshot | undefined>(undefined);
+  const selectionRequestSeqRef = useRef(0);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const queryUrl = params.get("backendUrl");
     if (queryUrl) {
       setBackendUrl(queryUrl);
-      return;
+    } else if (window.sensorarrayDesktop) {
+      void window.sensorarrayDesktop.getBackendUrl().then((url) => setBackendUrl(url));
+    } else {
+      setBackendUrl("http://127.0.0.1:6666");
     }
-    void window.sensorarrayDesktop?.getBackendUrl().then((url) => setBackendUrl(url));
-    if (!window.sensorarrayDesktop) {
-      setBackendUrl("http://127.0.0.1:8765");
-    }
+    void (async () => {
+      const runtime = (await window.sensorarrayDesktop?.getRuntimeDirectory()) || ".";
+      setRuntimeDirectory(runtime);
+      runtimeDirectoryRef.current = runtime;
+      const storedProfile = readStoredSetupProfile(runtime);
+      const desktopDirectory = await window.sensorarrayDesktop?.getDefaultSaveDirectory();
+      const initialProfile = {
+        ...storedProfile,
+        paths: { ...storedProfile.paths, defaultSaveDirectory: storedProfile.paths.defaultSaveDirectory || desktopDirectory || runtime }
+      };
+      setSetupProfile(initialProfile);
+      writeStoredSetupProfile(initialProfile);
+      void window.sensorarrayDesktop?.setDefaultSaveDirectory(initialProfile.paths.defaultSaveDirectory);
+    })();
   }, []);
 
   const client = useMemo(() => (backendUrl ? new BackendHttpClient(backendUrl) : null), [backendUrl]);
+
+  useEffect(() => {
+    clientRef.current = client;
+  }, [client]);
+
+  useEffect(() => {
+    setupProfileRef.current = setupProfile;
+  }, [setupProfile]);
+
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
+
+  useEffect(() => {
+    runtimeDirectoryRef.current = runtimeDirectory;
+  }, [runtimeDirectory]);
 
   const handleMessage = useCallback(
     (message: WebSocketMessage) => {
@@ -82,6 +122,17 @@ export function App(): JSX.Element {
     return () => socket.stop();
   }, [backendUrl, handleMessage]);
 
+  const handleSetupProfileChange = useCallback((profile: SetupProfile) => {
+    setupProfileRef.current = profile;
+    setSetupProfile((current) => {
+      if (current.paths.defaultSaveDirectory !== profile.paths.defaultSaveDirectory) {
+        void window.sensorarrayDesktop?.setDefaultSaveDirectory(profile.paths.defaultSaveDirectory);
+      }
+      writeStoredSetupProfile(profile);
+      return profile;
+    });
+  }, []);
+
   useEffect(() => {
     if (!client) {
       return;
@@ -100,54 +151,151 @@ export function App(): JSX.Element {
         }
       })();
     });
-    const removeExport = window.sensorarrayDesktop?.onExportSessionData(() => {
-      void (async () => {
-        try {
-          setError(null);
-          const payload = await client.exportSession();
-          const defaultName = `sensorarray-session-${timestampForFilename(new Date())}.json`;
-          const result = await window.sensorarrayDesktop?.saveExportedSession(defaultName, JSON.stringify(payload, null, 2));
-          if (!result || result.canceled) {
-            return;
-          }
-          if (!result.ok) {
-            throw new Error(result.error || "export failed");
-          }
-          setNotice(`Exported session data: ${result.path}`);
-        } catch (exportError) {
-          setNotice(null);
-          setError(exportError instanceof Error ? exportError.message : String(exportError));
-        }
-      })();
-    });
+    const exportSessionData = () => void handleExportSessionData(client);
+    const importSessionData = () => void handleImportSessionData(client);
+    const exportSetupProfile = () => void handleExportSetupProfile();
+    const importSetupProfile = () => void handleImportSetupProfile(client);
+    const captureScreenshot = () => void handleCaptureScreenshot();
+    const removeImportSession = window.sensorarrayDesktop?.onImportSessionData(importSessionData);
+    const removeExport = window.sensorarrayDesktop?.onExportSessionData(exportSessionData);
+    const removeImportSetup = window.sensorarrayDesktop?.onImportSetupProfile(importSetupProfile);
+    const removeExportSetup = window.sensorarrayDesktop?.onExportSetupProfile(exportSetupProfile);
+    const removeScreenshot = window.sensorarrayDesktop?.onCaptureScreenshot(captureScreenshot);
     return () => {
       removeImport?.();
+      removeImportSession?.();
       removeExport?.();
+      removeImportSetup?.();
+      removeExportSetup?.();
+      removeScreenshot?.();
     };
   }, [client]);
 
-  const selectCell = useCallback(
-    async (cell: string) => {
-      setOptimisticSelection(selectionFromCell(cell, snapshot?.selection));
-      try {
-        await client?.selectCell(cell);
-      } catch (selectError) {
+  const selectCell = useCallback(async (cell: string) => {
+    const requestSeq = selectionRequestSeqRef.current + 1;
+    selectionRequestSeqRef.current = requestSeq;
+    const optimistic = selectionFromCell(cell, latestSelectionRef.current);
+    latestSelectionRef.current = optimistic;
+    setOptimisticSelection(optimistic);
+    try {
+      await clientRef.current?.selectCell(cell);
+      if (selectionRequestSeqRef.current !== requestSeq) {
+        return;
+      }
+    } catch (selectError) {
+      if (selectionRequestSeqRef.current === requestSeq) {
         setOptimisticSelection(null);
         setError(selectError instanceof Error ? selectError.message : String(selectError));
       }
-    },
-    [client, setOptimisticSelection, snapshot?.selection]
-  );
+    }
+  }, []);
+
+  async function handleExportSessionData(activeClient: BackendHttpClient): Promise<void> {
+    try {
+      setError(null);
+      const defaultName = `sensorarray-session-${timestampForFilename(new Date())}.h5`;
+      const chosen = await window.sensorarrayDesktop?.chooseSessionExportPath(defaultName);
+      if (!chosen || chosen.canceled) {
+        return;
+      }
+      if (!chosen.ok || !chosen.path) {
+        throw new Error(chosen.error || "export path was not selected");
+      }
+      const format = sessionFormatFromPath(chosen.path);
+      const payload = await activeClient.exportSession(format);
+      const result = await window.sensorarrayDesktop?.writeBinaryFile(chosen.path, payload);
+      if (!result?.ok) {
+        throw new Error(result?.error || "export failed");
+      }
+      setNotice(`Exported session data: ${result.path}`);
+    } catch (exportError) {
+      setNotice(null);
+      setError(exportError instanceof Error ? exportError.message : String(exportError));
+    }
+  }
+
+  async function handleImportSessionData(activeClient: BackendHttpClient): Promise<void> {
+    try {
+      setError(null);
+      const path = await window.sensorarrayDesktop?.selectSessionDataFile();
+      if (!path) {
+        return;
+      }
+      await activeClient.importSession(path);
+      setNotice(`Imported session data: ${path}`);
+    } catch (importError) {
+      setNotice(null);
+      setError(importError instanceof Error ? importError.message : String(importError));
+    }
+  }
+
+  async function handleExportSetupProfile(): Promise<void> {
+    try {
+      setError(null);
+      const profile = setupProfileFromSnapshot(snapshotRef.current, setupProfileRef.current);
+      const defaultName = `sensorarray-setup-${timestampForFilename(new Date())}.json`;
+      const result = await window.sensorarrayDesktop?.saveSetupProfile(defaultName, JSON.stringify(profile, null, 2));
+      if (!result || result.canceled) {
+        return;
+      }
+      if (!result.ok) {
+        throw new Error(result.error || "setup export failed");
+      }
+      setNotice(`Exported setup profile: ${result.path}`);
+    } catch (exportError) {
+      setNotice(null);
+      setError(exportError instanceof Error ? exportError.message : String(exportError));
+    }
+  }
+
+  async function handleImportSetupProfile(activeClient: BackendHttpClient): Promise<void> {
+    try {
+      setError(null);
+      const path = await window.sensorarrayDesktop?.selectSetupProfile();
+      if (!path) {
+        return;
+      }
+      const text = await window.sensorarrayDesktop?.readTextFile(path);
+      const profile = normaliseSetupProfile(JSON.parse(text || "{}"), runtimeDirectoryRef.current);
+      handleSetupProfileChange(profile);
+      const directoryCheck = await window.sensorarrayDesktop?.setDefaultSaveDirectory(profile.paths.defaultSaveDirectory);
+      const response = await activeClient.applySetupProfile(profile);
+      const warnings = [...(response.warnings ?? [])];
+      if (directoryCheck && !directoryCheck.ok) {
+        warnings.push(directoryCheck.error || "Default save directory is not writable on this computer");
+      }
+      setNotice(warnings.length ? `Imported setup profile with warnings: ${warnings.join("; ")}` : `Imported setup profile: ${path}`);
+    } catch (importError) {
+      setNotice(null);
+      setError(importError instanceof Error ? importError.message : String(importError));
+    }
+  }
+
+  async function handleCaptureScreenshot(): Promise<void> {
+    try {
+      setError(null);
+      const result = await window.sensorarrayDesktop?.captureScreenshot();
+      if (!result?.ok) {
+        throw new Error(result?.error || "screenshot failed");
+      }
+      setNotice(`Screenshot saved: ${result.path}`);
+    } catch (screenshotError) {
+      setNotice(null);
+      setError(screenshotError instanceof Error ? screenshotError.message : String(screenshotError));
+    }
+  }
 
   const setFreezeColor = useCallback(
     async (freezeColor: boolean) => {
       try {
+        const currentProfile = setupProfileRef.current;
+        handleSetupProfileChange({ ...currentProfile, display: { ...currentProfile.display, freezeColor } });
         await client?.setDisplaySettings({ freezeColor });
       } catch (freezeError) {
         setError(freezeError instanceof Error ? freezeError.message : String(freezeError));
       }
     },
-    [client]
+    [client, handleSetupProfileChange]
   );
 
   const visualWithOptimisticSelection = useMemo(() => {
@@ -156,6 +304,18 @@ export function App(): JSX.Element {
     }
     return { ...visualSnapshot, selection: optimisticSelection };
   }, [optimisticSelection, visualSnapshot]);
+
+  useEffect(() => {
+    latestSelectionRef.current = visualWithOptimisticSelection?.selection ?? snapshot?.selection;
+  }, [snapshot?.selection, visualWithOptimisticSelection?.selection]);
+
+  const setLineEnding = useCallback(
+    (lineEnding: SetupProfile["command"]["lineEnding"]) => {
+      const currentProfile = setupProfileRef.current;
+      handleSetupProfileChange({ ...currentProfile, command: { ...currentProfile.command, lineEnding } });
+    },
+    [handleSetupProfileChange]
+  );
 
   return (
     <div className="appShell">
@@ -192,9 +352,17 @@ export function App(): JSX.Element {
                 </button>
               </div>
               {configMode === "setup" ? (
-                <SetupPanel client={client} snapshot={snapshot} onError={setError} />
+                <SetupPanel client={client} snapshot={snapshot} setupProfile={setupProfile} onSetupProfileChange={handleSetupProfileChange} onError={setError} />
               ) : (
-                <AdvancedPanel client={client} snapshot={snapshot} onError={setError} />
+                <AdvancedPanel
+                  client={client}
+                  snapshot={snapshot}
+                  setupProfile={setupProfile}
+                  runtimeDirectory={runtimeDirectory}
+                  onSetupProfileChange={handleSetupProfileChange}
+                  onError={setError}
+                  onNotice={setNotice}
+                />
               )}
             </section>
             <TrendGrid client={client} history={history} onHistory={setHistory} onError={setError} />
@@ -202,7 +370,7 @@ export function App(): JSX.Element {
         </div>
         <div ref={bottomSplitRef} className="bottomSplit">
           <div className="commandPane" style={{ flexBasis: `${bottomSplitRatio * 100}%` }}>
-            <CommandPanel client={client} snapshot={snapshot} onError={setError} />
+            <CommandPanel client={client} snapshot={snapshot} lineEnding={setupProfile.command.lineEnding} onLineEndingChange={setLineEnding} onError={setError} />
           </div>
           <div
             className="splitHandle bottom"
@@ -265,6 +433,14 @@ function timestampForFilename(date: Date): string {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(
     date.getSeconds()
   )}`;
+}
+
+function sessionFormatFromPath(filePath: string): SessionDataFormat {
+  const extension = filePath.split(".").pop()?.toLowerCase();
+  if (extension === "csv" || extension === "xlsx" || extension === "mat" || extension === "h5") {
+    return extension;
+  }
+  throw new Error("Session export file extension must be .csv, .xlsx, .mat, or .h5");
 }
 
 function usePersistentRatio(key: string, defaultValue: number): [number, (nextRatio: number) => void] {

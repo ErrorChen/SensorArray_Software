@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sensorarray-software"
-version = "0.3.0"
+version = "1.0.0"
 description = "SensorArray FastAPI backend and Electron desktop host"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,9 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "numpy>=1.24",
   "pandas>=2.0",
+  "openpyxl>=3.1",
+  "scipy>=1.11",
+  "h5py>=3.10",
   "pyserial>=3.5",
   "bleak>=0.22",
 ]

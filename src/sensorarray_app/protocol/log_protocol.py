@@ -28,6 +28,11 @@ KNOWN_LOG_TAGS = {
     "ADS",
     "RST",
     "ABAT",
+    "CMD_TX",
+    "CMD_TX_FAIL",
+    "BLE_RX50",
+    "BLE_FRAG50",
+    "PROTO50",
 }
 
 

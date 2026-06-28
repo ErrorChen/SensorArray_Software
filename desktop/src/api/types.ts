@@ -220,7 +220,39 @@ export type OffsetResponse = {
   changedCells?: number;
 };
 
-export type ExportSessionPayload = Record<string, unknown>;
+export type SessionDataFormat = "csv" | "xlsx" | "mat" | "h5";
+
+export type SetupProfile = {
+  schemaVersion: 1;
+  appVersion?: string;
+  transport: {
+    mode: TransportMode;
+    serial: { port?: string; baud: number };
+    wifi: { host?: string; fallbackHost?: string };
+    ble: { address?: string; deviceId?: string };
+    replay: { path?: string; speed: number };
+  };
+  acquisition: { rows: number };
+  display: {
+    displayMode: DisplayMode;
+    measurementDomain: string;
+    showCellText: boolean;
+    pauseDisplay: boolean;
+    freezeColor: boolean;
+    unitMode: string;
+    circuitOffsetPf: number;
+    trendLatestN?: number;
+  };
+  offsetsPf: number[][];
+  command: { lineEnding: CommandLineEnding };
+  paths: { defaultSaveDirectory: string };
+};
+
+export type SetupProfileApplyResponse = {
+  ok: boolean;
+  profile: SetupProfile;
+  warnings: string[];
+};
 
 export type SerialPort = {
   device: string;
@@ -233,10 +265,39 @@ export type SerialPort = {
 
 export type DesktopBridge = {
   getBackendUrl: () => Promise<string>;
+  getRuntimeDirectory: () => Promise<string>;
+  getDefaultSaveDirectory: () => Promise<string>;
+  setDefaultSaveDirectory: (directory: string) => Promise<PathCheckResult>;
+  selectDefaultSaveDirectory: () => Promise<PathCheckResult & { canceled?: boolean }>;
+  openDefaultSaveDirectory: () => Promise<PathCheckResult>;
   selectReplayFile: () => Promise<string | null>;
+  selectSessionDataFile: () => Promise<string | null>;
+  selectSetupProfile: () => Promise<string | null>;
+  readTextFile: (path: string) => Promise<string>;
   onImportReplayData: (callback: (path: string) => void) => () => void;
+  onImportSessionData: (callback: () => void) => () => void;
   onExportSessionData: (callback: () => void) => () => void;
-  saveExportedSession: (defaultName: string, data: string) => Promise<{ ok: boolean; path?: string; error?: string; canceled?: boolean }>;
+  onImportSetupProfile: (callback: () => void) => () => void;
+  onExportSetupProfile: (callback: () => void) => () => void;
+  onCaptureScreenshot: (callback: () => void) => () => void;
+  chooseSessionExportPath: (defaultName: string) => Promise<DesktopActionResult>;
+  saveExportedSession: (defaultName: string, data: ArrayBuffer | Uint8Array | string) => Promise<DesktopActionResult>;
+  writeBinaryFile: (path: string, data: ArrayBuffer | Uint8Array | string) => Promise<DesktopActionResult>;
+  saveSetupProfile: (defaultName: string, data: string) => Promise<DesktopActionResult>;
+  captureScreenshot: () => Promise<DesktopActionResult>;
+};
+
+export type DesktopActionResult = {
+  ok: boolean;
+  path?: string;
+  error?: string;
+  canceled?: boolean;
+};
+
+export type PathCheckResult = {
+  ok: boolean;
+  path: string;
+  error?: string;
 };
 
 declare global {

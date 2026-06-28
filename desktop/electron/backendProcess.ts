@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 
@@ -23,13 +24,13 @@ export type BackendStartOptions = {
   resourcesPath: string;
 };
 
-export async function findAvailablePort(startPort: number): Promise<number> {
-  for (let port = startPort; port < startPort + 50; port += 1) {
+export async function findAvailablePort(preferredPorts: number[] = [6666, 8888, ...Array.from({ length: 50 }, (_, index) => 8750 + index)]): Promise<number> {
+  for (const port of preferredPorts) {
     if (await canListen(port)) {
       return port;
     }
   }
-  throw new Error(`No available backend port from ${startPort}`);
+  throw new Error(`No available backend port from ${preferredPorts.join(", ")}`);
 }
 
 export function startBackend(options: BackendStartOptions): BackendProcess {
@@ -77,11 +78,11 @@ export async function waitForHealth(processInfo: BackendProcess, timeoutMs = 150
       throw new Error(formatBackendExit(processInfo));
     }
     try {
-      const response = await fetch(`${processInfo.url}/health`);
-      if (response.ok) {
+      const statusCode = await requestHealthStatus(`${processInfo.url}/health`);
+      if (statusCode >= 200 && statusCode < 300) {
         return;
       }
-      lastError = `HTTP ${response.status}`;
+      lastError = `HTTP ${statusCode}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
@@ -144,6 +145,17 @@ function resolvePython(projectRoot: string): string {
 function buildPythonPath(projectRoot: string): string {
   const srcPath = path.join(projectRoot, "src");
   return process.env.PYTHONPATH ? `${srcPath}${path.delimiter}${process.env.PYTHONPATH}` : srcPath;
+}
+
+function requestHealthStatus(url: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const request = http.get(url, { timeout: 1000 }, (response) => {
+      response.resume();
+      response.once("end", () => resolve(response.statusCode ?? 0));
+    });
+    request.once("timeout", () => request.destroy(new Error("health request timed out")));
+    request.once("error", reject);
+  });
 }
 
 function appendProcessLog(log: string[], value: string): void {

@@ -74,9 +74,15 @@ describe("log status parser", () => {
   it("parses command and BLE status rows", () => {
     const items = parseLogStatusRows([
       logRow("CMD_TX", "CMD_TX,mode=ble,bytes=8,ending=lf", "info"),
+      logRow("BL50", "BL50,conn=1,sub=1,mtu=247,phy=1/1,mq=12,xx=9", "info"),
       logRow("BLE_FRAG50", "BLE_FRAG50,reassembled=10,duplicate=0,missing=1,timeout=0,crc=0,length=0", "info")
     ]);
     expect(items.some((item) => item.title === "Command sent" && item.severity === "ok")).toBe(true);
+    const bluetooth = items.find((item) => item.title === "Bluetooth 50-frame summary");
+    expect(bluetooth?.details["Connection state (conn)"]).toBe(1);
+    expect(bluetooth?.details["Negotiated MTU bytes (mtu)"]).toBe(247);
+    expect(bluetooth?.details["Unknown firmware field (xx)"]).toBeUndefined();
+    expect(bluetooth?.details["Legacy/unknown field (xx)"]).toBe(9);
     expect(items.some((item) => item.title === "BLE fragment statistics" && item.severity === "warn")).toBe(true);
   });
 
@@ -84,6 +90,8 @@ describe("log status parser", () => {
     expect(parseKeyValueText("UNKNOWN,foo=1,bar=true,baz=text")).toEqual({ foo: 1, bar: true, baz: "text" });
     const [item] = parseLogStatusRows([logRow("UNKNOWN", "UNKNOWN,foo=1", "info")]);
     expect(item.category).toBe("Other");
+    expect(item.title).toBe("Unknown firmware log (UNKNOWN)");
+    expect(item.details["Unknown firmware field (foo)"]).toBe(1);
   });
 
   it("marks parser errors as error severity", () => {

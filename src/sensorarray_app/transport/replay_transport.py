@@ -12,6 +12,7 @@ import numpy as np
 from sensorarray_app.constants import CAP_FIXED_SCALE, CAP_INVALID_SENTINEL, FDC_CIRCUIT_OFFSET_PF
 from sensorarray_app.domain.models import TransportEnvelope, TransportStateEvent
 from sensorarray_app.protocol.crc import crc32_reflected
+from sensorarray_backend.core.session_data import frames_to_cap_ascii_bytes, load_session_frames
 
 
 class ReplayTransport:
@@ -51,7 +52,7 @@ class ReplayTransport:
     def _run(self) -> None:
         self._put_state("STREAMING", str(self.path))
         try:
-            payload = _exported_session_to_replay_bytes(self.path)
+            payload = _session_file_to_replay_bytes(self.path)
             if payload is not None:
                 self._stream_bytes(payload)
             else:
@@ -93,7 +94,9 @@ class ReplayTransport:
             pass
 
 
-def _exported_session_to_replay_bytes(path: Path) -> bytes | None:
+def _session_file_to_replay_bytes(path: Path) -> bytes | None:
+    if path.suffix.lower() in {".csv", ".xlsx", ".mat", ".h5", ".hdf5"}:
+        return frames_to_cap_ascii_bytes(load_session_frames(path))
     if path.suffix.lower() != ".json":
         return None
     try:

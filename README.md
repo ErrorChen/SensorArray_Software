@@ -41,8 +41,13 @@ npm run desktop
 Python backend sidecar. Backend-only development is still available:
 
 ```powershell
-.\.venv\Scripts\python.exe -m sensorarray_backend --host 127.0.0.1 --port 8765
+.\.venv\Scripts\python.exe -m sensorarray_backend --host 127.0.0.1 --port 6666
 ```
+
+The backend default port is `6666`. Electron tries `6666`, then `8888`, then
+the first available port from `8750` through `8799` when it starts the sidecar.
+Electron explicitly allows those ports before the renderer starts because
+Chromium otherwise treats `6666` as a restricted port.
 
 ## Icons
 
@@ -93,7 +98,7 @@ backend sidecar. For internal validation, run
 use the NSIS installer, for example:
 
 ```text
-desktop/release/SensorArray-0.3.0-win-x64-nsis.exe
+desktop/release/SensorArray-1.0.0-win-x64-nsis.exe
 ```
 
 The packaged app starts the backend from
@@ -177,10 +182,36 @@ POST /api/settings/offsets/bulk
 POST /api/settings/offsets/clear
 POST /api/settings/offsets/zero-current
 POST /api/selection
-GET  /api/export/session
+GET  /api/export/session?format=csv|xlsx|mat|h5
+POST /api/import/session
+GET  /api/setup/profile
+POST /api/setup/profile
 
 WS   /ws
 ```
+
+Session/Data export and import are intentionally symmetric and support only
+`.csv`, `.xlsx`, `.mat`, and `.h5`. Session/Data JSON export is not provided.
+Legacy replay/raw-log import still supports `.json`, `.jsonl`, `.log`, `.txt`,
+and legacy `.csv` replay files through the Replay flow.
+
+`POST /api/setup/profile` applies preferences without automatically connecting
+Serial, BLE, or Wi-Fi. Setup profiles are JSON only and include transport
+preferences, row count, display settings, command line ending, offsets, and
+`paths.defaultSaveDirectory`.
+
+SetupProfile top-level structure:
+
+- `transport.serial.baud` and optional serial port preference.
+- `transport.wifi.host` and `transport.wifi.fallbackHost`.
+- `transport.ble.address` and optional device ID.
+- `transport.replay.path` and `transport.replay.speed`.
+- `acquisition.rows`.
+- `display.displayMode`, measurement domain, cell text, pause, freeze colour,
+  unit mode, circuit offset, and trend window.
+- `offsetsPf` as an 8x8 finite pF matrix.
+- `command.lineEnding`.
+- `paths.defaultSaveDirectory`.
 
 `POST /api/transport/write` writes through the active transport abstraction:
 
@@ -222,14 +253,33 @@ The Electron File menu contains:
 
 - Import Replay Data: choose `.json`, `.jsonl`, `.log`, `.txt`, or `.csv`, then
   start the existing replay flow.
-- Export Current Session Data: save a JSON snapshot containing metadata,
-  display state, offsets, current matrix, selected history, raw logs, and
-  diagnostics.
+- Import Session Data: choose `.csv`, `.xlsx`, `.mat`, or `.h5` and load frames
+  back through the same matrix path.
+- Export Current Session Data: choose `.csv`, `.xlsx`, `.mat`, or `.h5`.
+- Import Setup / Export Setup: JSON profile only.
+- Screenshot / Capture: save a PNG directly to the default save directory.
 
-Exported session JSON can be imported again as replay data. The replay transport
-recognises this JSON shape and converts stored frames back into b41 `C/D/K`
-text so the existing parser, matrix store, snapshot builder, heatmap, trends,
-and logs are still used.
+There is also a top-level `Screenshot / Capture` menu with the screenshot
+shortcut. Screenshot filenames use `Screenshot_CscArray_HHDDMM.png`; if that
+exists, the app extends the name to minute and then second precision before
+adding a numeric suffix as a final fallback.
+
+Advanced contains Default Save Directory. It defaults to the runtime directory
+and is used for session export, setup export, and screenshots. The directory is
+stored in local setup profile state and synchronized to the Electron main
+process; non-writable paths show a UI error instead of failing silently.
+
+CSV files contain one row per frame/cell with columns `frameIndex`, `seq`,
+`timeSeconds`, `rows`, `cell`, `row`, `col`, `correctedPf`, `valid`, and
+`source`. XLSX exports include `metadata`, `frames`, `current_matrix`,
+`offsets`, and `raw_logs` sheets. MAT exports include `current_matrix_pf`,
+`current_valid_mask`, `offsets_pf`, `frames_values_pf`, `frames_valid_mask`,
+`frame_seq`, `frame_time_seconds`, and `frame_rows`. HDF5 exports include
+`/metadata` attributes plus `/current/matrix_pf`, `/current/valid_mask`,
+`/offsets/offsets_pf`, and `/frames/{values_pf,valid_mask,seq,time_seconds,rows}`.
+
+The `.xlsx`, `.mat`, and `.h5` paths use `openpyxl`, `scipy`, and `h5py`.
+Those packages increase packaged size; that is expected for these file formats.
 
 ## Heatmap And Trends
 
@@ -249,9 +299,10 @@ transport. Heatmap and trend charts use `ResizeObserver` with animation-frame
 resizes so they shrink and grow with their panes.
 
 Clicking D1-D4 selects that row's primary FDC group. Clicking D5-D8 selects that
-row's secondary FDC group. The heatmap keeps the ECharts series click handler
-and also uses a zrender pixel-to-cell fallback, so clicks on cell edges and null
-cells still select the corresponding trend group.
+row's secondary FDC group. The heatmap creates its ECharts instance only on
+mount, updates live data with fixed series IDs, and uses one zrender
+pixel-to-grid click path so cell edges, labels, selected rings, and null cells
+still select the corresponding trend group without rebuilding the chart.
 
 Trend charts use a relative visible x-axis. If timestamps are present, x is
 seconds since the first visible point; otherwise x is the visible sample index.
@@ -290,10 +341,12 @@ both the baseline and current value. Changing offsets invalidates any existing
 baseline with `Baseline invalid: cell offset changed`; capture a new baseline
 before using Delta again.
 
-Offset controls support setting one cell, zeroing the selected cell/current
-row/all cells from the current frame, and clearing selected/row/all offsets.
-Exported session JSON includes offsets and restores them when imported as
-replay data.
+Offset controls use the existing 8x8 grid. Single click selects a cell and
+updates the readout; double click opens the offset editor for that cell. The
+editor supports Save offset, Zero this cell to current corrected value, Clear
+this cell, Enter to save, and Esc to cancel. Live snapshot refreshes do not
+overwrite a dirty offset input. Batch actions still support zeroing or clearing
+the selected cell, current row, and all cells.
 
 ## Write / Command
 
@@ -325,10 +378,12 @@ The Log panel has Raw Log and Status tabs. Raw Log defaults to recent bounded
 rows, supports filtering, auto-scroll, and copy-visible. Status parses raw log
 rows into human-readable items without replacing the raw view.
 
-Recognised summaries include `CMD_TX`, `CMD_TX_FAIL`, `BLE_RX50`,
-`BLE_FRAG50`, `PROTO50`, `RCMD`, `RAPP`, baseline state, parser errors, and
-transport lifecycle logs. Unknown tags are still shown under Other, with any
-CSV key=value fields parsed into details.
+Recognised summaries include `BL50`, `I2C50`, `SF50`, `TR50`, `AB50`, `OT50`,
+`ROW50`, `FB50`, `P50`, `H50`, `HC`, `BATD`, `ARL`, `ADS`, `RST`, `ACK`,
+`ERR`, `CMD_TX`, `CMD_TX_FAIL`, `BLE_RX50`, `BLE_FRAG50`, `PROTO50`, `RCMD`,
+and `RAPP`. Status expands common firmware abbreviations such as `conn`, `sub`,
+`mtu`, `phy`, and `mq` into readable labels. Unknown tags are shown as
+`Unknown firmware log (TAG)` and unknown fields are labelled explicitly.
 
 ## Bluetooth LE
 
@@ -385,9 +440,9 @@ only and does not replace serial or BLE hardware validation.
 - Delta cannot switch: check baseline status. No data means no capacitance
   frame has arrived; Invalid means capture failed or offsets changed and a new
   Set baseline is required.
-- Replay import fails: confirm the file is a supported replay text/CSV/log file
-  or an exported SensorArray session JSON. Existing replay still streams bytes
-  through the parser.
+- Replay import fails: confirm the file is a supported legacy replay
+  text/CSV/log/JSON file. Session/Data files use Import Session Data instead.
+  Existing replay still streams bytes through the parser.
 - Offset after Delta looks wrong: offset changes invalidate the old baseline.
   Reset or Set baseline again before returning to Delta C/C0 %.
 

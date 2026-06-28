@@ -8,15 +8,16 @@ import { isCommandSendDisabled, updateCommandHistory } from "../../state/command
 type Props = {
   client: BackendHttpClient | null;
   snapshot: BackendSnapshotPayload | null;
+  lineEnding: CommandLineEnding;
+  onLineEndingChange: (lineEnding: CommandLineEnding) => void;
   onError: (message: string) => void;
 };
 
 const historyStorageKey = "sensorarray.command.history";
 const maxHistory = 20;
 
-export function CommandPanel({ client, snapshot, onError }: Props): JSX.Element {
+export function CommandPanel({ client, snapshot, lineEnding, onLineEndingChange, onError }: Props): JSX.Element {
   const [commandText, setCommandText] = useState("");
-  const [lineEnding, setLineEnding] = useState<CommandLineEnding>("lf");
   const [history, setHistory] = useState<string[]>(() => readHistory());
   const [records, setRecords] = useState<string[]>([]);
   const [pending, setPending] = useState(false);
@@ -105,7 +106,7 @@ export function CommandPanel({ client, snapshot, onError }: Props): JSX.Element 
         }}
       />
       <div className="commandControls">
-        <select value={lineEnding} onChange={(event) => setLineEnding(event.target.value as CommandLineEnding)}>
+        <select value={lineEnding} onChange={(event) => onLineEndingChange(event.target.value as CommandLineEnding)}>
           <option value="lf">Append LF</option>
           <option value="crlf">Append CRLF</option>
           <option value="none">No line ending</option>
