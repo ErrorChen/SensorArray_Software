@@ -12,8 +12,8 @@
 
 body {
   margin: 0;
-  min-width: 1120px;
-  min-height: 720px;
+  min-width: 1000px;
+  min-height: 680px;
 }
 
 button,
@@ -21,6 +21,7 @@ input,
 select,
 textarea {
   font: inherit;
+  min-width: 0;
 }
 
 button {
@@ -161,11 +162,17 @@ label {
 }
 
 .bottomSplit {
-  flex: 0 0 190px;
+  flex: 0 0 clamp(180px, 24vh, 320px);
 }
 
 .heatmapPane,
-.commandPane {
+.commandPane,
+.trendPanel,
+.setupPanel,
+.logPanel,
+.commandPanel,
+.trendGrid,
+.trendCanvas {
   flex: 0 1 auto;
   min-width: 0;
   min-height: 0;
@@ -180,7 +187,7 @@ label {
 
 .rightPane {
   display: grid;
-  grid-template-rows: minmax(300px, 0.58fr) minmax(220px, 0.42fr);
+  grid-template-rows: minmax(210px, 0.58fr) minmax(170px, 0.42fr);
   gap: 12px;
 }
 
@@ -208,6 +215,7 @@ label {
 
 .heatmapPanel,
 .setupPanel,
+.advancedPanel,
 .trendPanel,
 .logPanel,
 .commandPanel {
@@ -238,12 +246,33 @@ label {
 
 .heatmapCanvas {
   flex: 1;
+  width: 100%;
+  height: 100%;
   min-height: 360px;
 }
 
 .setupPanel {
   padding: 12px;
   overflow: auto;
+}
+
+.advancedPanel {
+  padding: 12px;
+  overflow: auto;
+}
+
+.configPane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.configPane > .setupPanel,
+.configPane > .advancedPanel {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .panelHeader {
@@ -269,6 +298,7 @@ label {
 
 .headerActions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -283,6 +313,17 @@ label {
   grid-template-columns: repeat(4, 1fr);
   gap: 6px;
   margin-bottom: 10px;
+}
+
+.topLevelTabs,
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.topLevelTabs {
+  flex: 0 0 auto;
 }
 
 .segmented button {
@@ -309,6 +350,7 @@ label {
 .buttonRow,
 .commandControls {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
 }
@@ -320,7 +362,8 @@ label {
 }
 
 .inputRow button,
-.buttonRow button {
+.buttonRow button,
+.offsetButtons button {
   flex: 0 0 auto;
 }
 
@@ -335,6 +378,10 @@ label {
 .checkLine input {
   width: 15px;
   min-height: 15px;
+}
+
+.checkLine.compact {
+  white-space: nowrap;
 }
 
 .scanState,
@@ -355,6 +402,8 @@ label {
 }
 
 .trendCanvas {
+  width: 100%;
+  height: 100%;
   min-height: 92px;
   border: 1px solid #e1e7ee;
   border-radius: 6px;
@@ -401,6 +450,18 @@ label {
   overflow: hidden;
 }
 
+.inlineNotice {
+  margin: 0 10px 6px;
+  padding: 5px 8px;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  background: #f0fdf4;
+  color: #166534;
+  font-size: 12px;
+  max-height: 48px;
+  overflow: hidden;
+}
+
 .logTerminal,
 .commandRecords {
   flex: 1;
@@ -414,8 +475,11 @@ label {
 }
 
 .commandPanel {
+  display: flex;
+  flex-direction: column;
   height: 100%;
   padding-bottom: 0;
+  overflow: hidden;
 }
 
 .commandPanel .panelHeader {
@@ -429,15 +493,217 @@ label {
 }
 
 .commandInput {
-  flex: 0 0 62px;
-  min-height: 62px;
+  flex: 0 1 clamp(44px, 22%, 84px);
+  min-height: 44px;
   margin: 0 10px 8px;
   width: calc(100% - 20px);
   font: 12px Consolas, "SFMono-Regular", monospace;
 }
 
 .commandRecords {
+  flex: 1 1 auto;
   min-height: 42px;
+  overflow: auto;
+}
+
+.rowsStatus,
+.baselineStatus {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  font-size: 12px;
+  color: #526070;
+  min-width: 0;
+}
+
+.compactField {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+
+.compactField select {
+  width: auto;
+  min-width: 128px;
+}
+
+.advancedGroup {
+  border-bottom: 0;
+}
+
+.offsetPanel {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(210px, 0.8fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.offsetGrid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 4px;
+  min-width: 0;
+}
+
+.offsetCell {
+  min-height: 40px;
+  padding: 3px;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 10px;
+  border-radius: 5px;
+}
+
+.offsetCell small {
+  font-size: 9px;
+  color: #526070;
+}
+
+.offsetControls,
+.offsetButtons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.offsetControls label {
+  flex: 1 1 82px;
+  display: grid;
+  gap: 4px;
+}
+
+.offsetButtons {
+  grid-column: 1 / -1;
+}
+
+.offsetPanel .inlineNotice {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.offsetReadout {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  min-width: 0;
+}
+
+.offsetReadout div {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) minmax(0, 1fr);
+  gap: 6px;
+  font-size: 12px;
+}
+
+.offsetReadout dt {
+  color: #526070;
+}
+
+.offsetReadout dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.logTools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.logTools input {
+  width: 170px;
+}
+
+.logTools select {
+  width: 120px;
+}
+
+.statusList {
+  flex: 1;
+  overflow: auto;
+  padding: 0 10px 10px;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.statusCard {
+  border: 1px solid #d9e0e8;
+  border-radius: 8px;
+  padding: 8px;
+  min-width: 0;
+}
+
+.statusCardHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.statusCardHeader time {
+  margin-left: auto;
+  color: #526070;
+}
+
+.statusCard p {
+  margin: 6px 0;
+  font-size: 12px;
+  color: #526070;
+}
+
+.statusCard dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 4px 10px;
+  margin: 0;
+}
+
+.statusCard dl div {
+  min-width: 0;
+}
+
+.statusCard dt {
+  font-size: 10px;
+  color: #526070;
+}
+
+.statusCard dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+
+.severityBadge {
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #ffffff;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.severityBadge.ok {
+  background: #0f766e;
+}
+
+.severityBadge.info {
+  background: #274c77;
+}
+
+.severityBadge.warn {
+  background: #b45309;
+}
+
+.severityBadge.error {
+  background: #b91c1c;
 }
 
 @media (max-width: 900px) {
@@ -462,5 +728,9 @@ label {
     right: 8px;
     width: auto;
     height: 2px;
+  }
+
+  .offsetPanel {
+    grid-template-columns: 1fr;
   }
 }

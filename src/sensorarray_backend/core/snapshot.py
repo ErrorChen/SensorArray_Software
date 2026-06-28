@@ -45,6 +45,7 @@ def snapshot_payload(runtime) -> dict[str, Any]:
             "correctedPf": _matrix_to_json(matrix.matrix),
             "rawPf": _matrix_to_json(matrix.rawPf),
             "rawFixed": _matrix_to_json(matrix.rawFixed),
+            "userOffsetPf": _matrix_to_json(runtime.user_offsets_array()),
             "displayValues": _matrix_to_json(display_matrix),
             "validMask": matrix.valid.astype(bool).tolist(),
             "unit": "%" if runtime.ui.displayMode == DisplayMode.DELTA_PERCENT else "pF",
@@ -53,12 +54,14 @@ def snapshot_payload(runtime) -> dict[str, Any]:
         "selection": selection,
         "display": {
             "displayMode": runtime.ui.displayMode.value,
+            "pendingDisplayMode": runtime.ui.pendingDisplayMode.value if runtime.ui.pendingDisplayMode else None,
             "measurementDomain": runtime.ui.measurementDomain,
             "showCellText": runtime.ui.cellText,
             "pauseDisplay": runtime.ui.paused,
             "freezeColor": runtime.ui.freezeColor,
             "unitMode": runtime.ui.unitMode,
             "circuitOffsetPf": runtime.ui.circuitOffsetPf,
+            "trendLatestN": runtime.ui.trendLatestN,
             "colorRange": {"min": color_min, "max": color_max, "frozen": runtime.ui.freezeColor},
         },
         "baseline": runtime.baseline_payload(),
@@ -70,10 +73,12 @@ def snapshot_payload(runtime) -> dict[str, Any]:
 
 
 def _display_matrix(runtime, matrix) -> np.ndarray:
+    corrected = np.asarray(matrix.matrix, dtype=np.float64).copy()
+    display = corrected - runtime.user_offsets_array()
     if runtime.ui.displayMode == DisplayMode.DELTA_PERCENT and runtime.ui.baseline is not None:
-        flat = delta_percent(matrix.matrix.reshape(64), runtime.ui.baseline)
+        flat = delta_percent(display.reshape(64), runtime.ui.baseline)
         return flat.reshape(8, 8)
-    return matrix.matrix.copy()
+    return display
 
 
 def _matrix_to_json(matrix: np.ndarray) -> list[list[float | None]]:

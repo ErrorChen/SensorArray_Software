@@ -25,6 +25,7 @@ export type MatrixSnapshot = {
   correctedPf: (number | null)[][];
   rawPf: (number | null)[][];
   rawFixed: (number | null)[][];
+  userOffsetPf: (number | null)[][];
   displayValues: (number | null)[][];
   validMask: boolean[][];
   unit: "pF" | "%";
@@ -44,17 +45,32 @@ export type SelectionSnapshot = {
 
 export type DisplaySnapshot = {
   displayMode: DisplayMode;
+  pendingDisplayMode?: DisplayMode | null;
   measurementDomain: string;
   showCellText: boolean;
   pauseDisplay: boolean;
   freezeColor: boolean;
   unitMode: string;
   circuitOffsetPf: number;
+  trendLatestN?: number;
   colorRange: {
     min: number | null;
     max: number | null;
     frozen: boolean;
   };
+};
+
+export type BaselineSnapshot = {
+  ok?: boolean;
+  status?: "idle" | "capturing" | "ready" | "invalid" | "no_data" | "reset" | string;
+  label?: string;
+  invalidReason?: string;
+  progress?: number;
+  ready?: boolean;
+  validCells?: number;
+  frameCount?: number;
+  rejectedFrameCount?: number;
+  pendingDisplayMode?: DisplayMode | null;
 };
 
 export type LogRow = {
@@ -111,7 +127,7 @@ export type BackendSnapshotPayload = {
   matrix: MatrixSnapshot;
   selection: SelectionSnapshot;
   display: DisplaySnapshot;
-  baseline: Record<string, unknown>;
+  baseline: BaselineSnapshot;
   commands: Record<string, unknown>;
   logs: LogsSnapshot;
   discovery: DiscoverySnapshot;
@@ -134,6 +150,7 @@ export type HistoryPayload = {
   title: string;
   unit: string;
   revision: number;
+  latestN?: number;
   series: HistorySeries[];
 };
 
@@ -184,6 +201,27 @@ export type WriteCommandResponse = {
   error?: string;
 };
 
+export type RowsResponse = {
+  ok: boolean;
+  requestedRows: number;
+  appliedRows: number;
+  displayOnly: boolean;
+  activeTransport: string;
+  status: string;
+  rows: number;
+  applied: boolean;
+};
+
+export type OffsetScope = "cell" | "row" | "all";
+
+export type OffsetResponse = {
+  ok: boolean;
+  offsetsPf: number[][];
+  changedCells?: number;
+};
+
+export type ExportSessionPayload = Record<string, unknown>;
+
 export type SerialPort = {
   device: string;
   name: string;
@@ -196,6 +234,9 @@ export type SerialPort = {
 export type DesktopBridge = {
   getBackendUrl: () => Promise<string>;
   selectReplayFile: () => Promise<string | null>;
+  onImportReplayData: (callback: (path: string) => void) => () => void;
+  onExportSessionData: (callback: () => void) => () => void;
+  saveExportedSession: (defaultName: string, data: string) => Promise<{ ok: boolean; path?: string; error?: string; canceled?: boolean }>;
 };
 
 declare global {

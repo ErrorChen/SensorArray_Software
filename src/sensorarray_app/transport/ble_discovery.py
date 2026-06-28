@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
+from typing import Any
 
 from sensorarray_app.constants import (
     BLE_CTRL_RX_UUID,
@@ -45,7 +47,7 @@ async def scan_ble_candidates(timeout_seconds: float = 10.0) -> list[BleCandidat
                 BleCandidate(
                     name=name,
                     address=device.address,
-                    rssi=getattr(device, "rssi", None),
+                    rssi=resolve_ble_rssi(device, adv),
                     serviceUuids=uuids,
                     matchReason=match_reason or "unverified",
                     advanced=advanced,
@@ -114,11 +116,93 @@ def _sort_candidates(candidates: list[BleCandidate]) -> list[BleCandidate]:
         key=lambda item: (
             1 if item.verified else 0,
             1 if item.matchReason in {"service", "project_name"} else 0,
-            0 if item.advanced else 1,
+            1 if item.rssi is not None else 0,
             item.rssi if item.rssi is not None else -999,
+            0 if item.advanced else 1,
         ),
         reverse=True,
     )
+
+
+def resolve_ble_rssi(device: Any, adv: Any) -> int | None:
+    """Return the best RSSI from bleak device/ad data without trusting one backend shape."""
+    for source in (
+        device,
+        adv,
+        _safe_getattr(device, "details"),
+        _safe_getattr(adv, "platform_data"),
+    ):
+        value = _extract_rssi(source, seen=set(), depth=0, direct=False)
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_rssi(value: Any, seen: set[int], depth: int, direct: bool) -> int | None:
+    if value is None or depth > 5:
+        return None
+    object_id = id(value)
+    if object_id in seen:
+        return None
+    seen.add(object_id)
+    if direct:
+        parsed = _coerce_rssi(value)
+        if parsed is not None:
+            return parsed
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if "rssi" in str(key).lower():
+                parsed = _coerce_rssi(child)
+                if parsed is not None:
+                    return parsed
+        for child in value.values():
+            parsed = _extract_rssi(child, seen, depth + 1, direct=False)
+            if parsed is not None:
+                return parsed
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        sequence = list(value)
+        for index in range(0, max(0, len(sequence) - 1)):
+            if "rssi" in str(sequence[index]).lower():
+                parsed = _coerce_rssi(sequence[index + 1])
+                if parsed is not None:
+                    return parsed
+        for child in sequence:
+            parsed = _extract_rssi(child, seen, depth + 1, direct=False)
+            if parsed is not None:
+                return parsed
+        return None
+    for attr_name in ("rssi", "RSSI"):
+        parsed = _coerce_rssi(_safe_getattr(value, attr_name))
+        if parsed is not None:
+            return parsed
+    for attr_name in ("details", "platform_data", "manufacturer_data", "service_data", "__dict__"):
+        parsed = _extract_rssi(_safe_getattr(value, attr_name), seen, depth + 1, direct=False)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _safe_getattr(value: Any, name: str) -> Any:
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _coerce_rssi(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(number):
+        return None
+    rounded = int(number)
+    if -140 <= rounded <= 30:
+        return rounded
+    return None
 
 
 def _replace(candidate: BleCandidate, **updates) -> BleCandidate:

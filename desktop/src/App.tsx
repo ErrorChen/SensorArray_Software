@@ -3,7 +3,8 @@ import type { PointerEvent as ReactPointerEvent, RefObject } from "react";
 
 import { BackendHttpClient } from "./api/httpClient";
 import { SnapshotWebSocket } from "./api/websocketClient";
-import type { BackendSnapshotPayload, HistoryPayload, WebSocketMessage } from "./api/types";
+import type { BackendSnapshotPayload, HistoryPayload, SelectionSnapshot, WebSocketMessage } from "./api/types";
+import { AdvancedPanel } from "./components/AdvancedPanel/AdvancedPanel";
 import { CommandPanel } from "./components/CommandPanel/CommandPanel";
 import { Heatmap } from "./components/Heatmap/Heatmap";
 import { LogPanel } from "./components/LogPanel/LogPanel";
@@ -21,8 +22,11 @@ export function App(): JSX.Element {
   const [snapshot, setSnapshot] = useSlot<BackendSnapshotPayload | null>(null);
   const [visualSnapshot, setVisualSnapshot] = useSlot<BackendSnapshotPayload | null>(null);
   const [history, setHistory] = useSlot<HistoryPayload | null>(null);
+  const [optimisticSelection, setOptimisticSelection] = useSlot<SelectionSnapshot | null>(null);
+  const [configMode, setConfigMode] = useSlot<"setup" | "advanced">("setup");
   const [socketState, setSocketState] = useSlot("disconnected");
   const [error, setError] = useSlot<string | null>(null);
+  const [notice, setNotice] = useSlot<string | null>(null);
   const [mainSplitRatio, setMainSplitRatio] = usePersistentRatio(mainSplitKey, 0.75);
   const [bottomSplitRatio, setBottomSplitRatio] = usePersistentRatio(bottomSplitKey, 0.5);
   const mainSplitRef = useRef<HTMLDivElement | null>(null);
@@ -60,6 +64,13 @@ export function App(): JSX.Element {
   );
 
   useEffect(() => {
+    if (!optimisticSelection || snapshot?.selection.title !== optimisticSelection.title) {
+      return;
+    }
+    setOptimisticSelection(null);
+  }, [optimisticSelection, setOptimisticSelection, snapshot?.selection.title]);
+
+  useEffect(() => {
     if (!backendUrl) {
       return;
     }
@@ -71,15 +82,61 @@ export function App(): JSX.Element {
     return () => socket.stop();
   }, [backendUrl, handleMessage]);
 
+  useEffect(() => {
+    if (!client) {
+      return;
+    }
+    const removeImport = window.sensorarrayDesktop?.onImportReplayData((path) => {
+      void (async () => {
+        try {
+          setError(null);
+          setNotice(`Importing replay data: ${path}`);
+          await client.openReplay(path, 1);
+          await client.startReplay();
+          setNotice(`Replay import started: ${path}`);
+        } catch (importError) {
+          setNotice(null);
+          setError(importError instanceof Error ? importError.message : String(importError));
+        }
+      })();
+    });
+    const removeExport = window.sensorarrayDesktop?.onExportSessionData(() => {
+      void (async () => {
+        try {
+          setError(null);
+          const payload = await client.exportSession();
+          const defaultName = `sensorarray-session-${timestampForFilename(new Date())}.json`;
+          const result = await window.sensorarrayDesktop?.saveExportedSession(defaultName, JSON.stringify(payload, null, 2));
+          if (!result || result.canceled) {
+            return;
+          }
+          if (!result.ok) {
+            throw new Error(result.error || "export failed");
+          }
+          setNotice(`Exported session data: ${result.path}`);
+        } catch (exportError) {
+          setNotice(null);
+          setError(exportError instanceof Error ? exportError.message : String(exportError));
+        }
+      })();
+    });
+    return () => {
+      removeImport?.();
+      removeExport?.();
+    };
+  }, [client]);
+
   const selectCell = useCallback(
     async (cell: string) => {
+      setOptimisticSelection(selectionFromCell(cell, snapshot?.selection));
       try {
         await client?.selectCell(cell);
       } catch (selectError) {
+        setOptimisticSelection(null);
         setError(selectError instanceof Error ? selectError.message : String(selectError));
       }
     },
-    [client]
+    [client, setOptimisticSelection, snapshot?.selection]
   );
 
   const setFreezeColor = useCallback(
@@ -93,13 +150,20 @@ export function App(): JSX.Element {
     [client]
   );
 
+  const visualWithOptimisticSelection = useMemo(() => {
+    if (!visualSnapshot || !optimisticSelection) {
+      return visualSnapshot;
+    }
+    return { ...visualSnapshot, selection: optimisticSelection };
+  }, [optimisticSelection, visualSnapshot]);
+
   return (
     <div className="appShell">
       <StatusBar snapshot={snapshot} socketState={socketState} />
       <main className="mainGrid">
         <div ref={mainSplitRef} className="workspaceSplit">
           <div className="heatmapPane" style={{ flexBasis: `${mainSplitRatio * 100}%` }}>
-            <Heatmap snapshot={visualSnapshot} onSelectCell={selectCell} onSetFreezeColor={(value) => void setFreezeColor(value)} />
+            <Heatmap snapshot={visualWithOptimisticSelection} onSelectCell={selectCell} onSetFreezeColor={(value) => void setFreezeColor(value)} />
           </div>
           <div
             className="splitHandle"
@@ -113,8 +177,27 @@ export function App(): JSX.Element {
             }
           />
           <div className="rightPane">
-            <SetupPanel client={client} snapshot={snapshot} onError={setError} />
-            <TrendGrid history={history} />
+            <section className="configPane">
+              <div className="topLevelTabs" role="tablist" aria-label="Configuration panels">
+                <button className={configMode === "setup" ? "active" : ""} role="tab" aria-selected={configMode === "setup"} onClick={() => setConfigMode("setup")}>
+                  Setup
+                </button>
+                <button
+                  className={configMode === "advanced" ? "active" : ""}
+                  role="tab"
+                  aria-selected={configMode === "advanced"}
+                  onClick={() => setConfigMode("advanced")}
+                >
+                  Advanced
+                </button>
+              </div>
+              {configMode === "setup" ? (
+                <SetupPanel client={client} snapshot={snapshot} onError={setError} />
+              ) : (
+                <AdvancedPanel client={client} snapshot={snapshot} onError={setError} />
+              )}
+            </section>
+            <TrendGrid client={client} history={history} onHistory={setHistory} onError={setError} />
           </div>
         </div>
         <div ref={bottomSplitRef} className="bottomSplit">
@@ -133,12 +216,55 @@ export function App(): JSX.Element {
             }
           />
           <div className="logPane">
-            <LogPanel logs={snapshot?.logs ?? null} error={error} />
+            <LogPanel logs={snapshot?.logs ?? null} error={error} notice={notice} />
           </div>
         </div>
       </main>
     </div>
   );
+}
+
+function selectionFromCell(cell: string, current: SelectionSnapshot | undefined): SelectionSnapshot {
+  const match = /^S(\d+)D(\d+)$/i.exec(cell);
+  if (!match) {
+    return (
+      current ?? {
+        rowIndex: 0,
+        rowLabel: "S1",
+        fdcGroup: "primary",
+        detectorStart: 1,
+        detectorEnd: 4,
+        cells: ["S1D1", "S1D2", "S1D3", "S1D4"],
+        title: "S1 Primary FDC D1-D4",
+        selectionRevision: 0
+      }
+    );
+  }
+  const row = Number(match[1]);
+  const detector = Number(match[2]);
+  const primary = detector <= 4;
+  const start = primary ? 1 : 5;
+  const end = primary ? 4 : 8;
+  const rowLabel = `S${row}`;
+  const cells = Array.from({ length: end - start + 1 }, (_, index) => `${rowLabel}D${start + index}`);
+  const title = `${rowLabel} ${primary ? "Primary" : "Secondary"} FDC D${start}-D${end}`;
+  return {
+    rowIndex: row - 1,
+    rowLabel,
+    fdcGroup: primary ? "primary" : "secondary",
+    detectorStart: start,
+    detectorEnd: end,
+    cells,
+    title,
+    selectionRevision: (current?.selectionRevision ?? 0) + 1
+  };
+}
+
+function timestampForFilename(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(
+    date.getSeconds()
+  )}`;
 }
 
 function usePersistentRatio(key: string, defaultValue: number): [number, (nextRatio: number) => void] {

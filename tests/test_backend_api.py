@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import time
+
+import numpy as np
 from fastapi.testclient import TestClient
 
 from sensorarray_app.app.configuration import AppConfiguration
+from sensorarray_app.domain.models import CapacitanceFrame
 from sensorarray_app.transport.serial_transport import SerialTransport
 from sensorarray_backend.app import create_app
 
@@ -103,3 +107,81 @@ def test_ble_scan_is_rejected_while_connected():
         response = client.get("/api/transport/ble/scan")
     assert response.status_code == 409
     assert "BLE scan is disabled while connected" in response.json()["detail"]
+
+
+def test_delta_request_without_frame_reports_no_data():
+    app = create_app(AppConfiguration())
+    with TestClient(app) as client:
+        payload = client.post("/api/settings/display", json={"displayMode": "delta_percent"}).json()
+    assert payload["displayMode"] == "absolute_pf"
+    assert payload["pendingDisplayMode"] is None
+    assert payload["baselineStatus"]["status"] == "no_data"
+
+
+def test_delta_request_with_frame_pending_then_auto_applies():
+    app = create_app(AppConfiguration())
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        runtime.matrixStore.add_capacitance(make_cap_frame(1, [10.0] * 64))
+        payload = client.post("/api/settings/display", json={"displayMode": "delta_percent"}).json()
+        assert payload["displayMode"] == "absolute_pf"
+        assert payload["pendingDisplayMode"] == "delta_percent"
+        assert payload["baselineStatus"]["status"] == "capturing"
+        for seq in [2, 3, 4]:
+            runtime._handle_event(make_cap_frame(seq, [10.0] * 64))
+        assert runtime._baseline_session is not None
+        runtime._baseline_session.durationSeconds = 0
+        runtime._complete_baseline_if_due()
+        status = client.get("/api/status").json()
+    assert status["display"]["displayMode"] == "delta_percent"
+    assert status["baseline"]["ready"] is True
+    assert status["baseline"]["pendingDisplayMode"] is None
+
+
+def test_offsets_apply_to_snapshot_history_and_export():
+    app = create_app(AppConfiguration())
+    with TestClient(app) as client:
+        runtime = app.state.runtime
+        for seq in [1, 2]:
+            runtime._handle_event(make_cap_frame(seq, [20.0] * 64))
+        offset = client.post("/api/settings/offsets/cell", json={"row": 1, "col": 1, "offsetPf": 10.0}).json()
+        status = client.get("/api/status").json()
+        history = client.get("/api/history?latest_n=300").json()
+        exported = client.get("/api/export/session").json()
+    assert offset["offsetsPf"][0][0] == 10.0
+    assert status["matrix"]["correctedPf"][0][0] == 20.0
+    assert status["matrix"]["displayValues"][0][0] == 10.0
+    assert history["series"][0]["points"][-1]["value"] == 10.0
+    assert exported["offsetsPf"][0][0] == 10.0
+    assert "metadata" in exported
+    assert "historyFrames" in exported
+
+
+def make_cap_frame(seq: int, values: list[float]) -> CapacitanceFrame:
+    corrected = np.asarray(values, dtype=np.float64)
+    raw_pf = corrected + 33.0
+    raw_fixed = np.rint(raw_pf * 1_000_000).astype(np.int64)
+    valid = np.ones(64, dtype=bool)
+    now_ns = time.monotonic_ns()
+    return CapacitanceFrame(
+        seq=seq,
+        timestampUs=seq * 1000,
+        rows=8,
+        cells=64,
+        generation=1,
+        requestId=1,
+        rowFreshMask=0xFF,
+        primaryFreshMask=0xFF,
+        secondaryFreshMask=0xFF,
+        badStaleCount=0,
+        badMixedCount=0,
+        badInvalidCount=0,
+        rawFixedValues=raw_fixed,
+        rawPfValues=raw_pf,
+        correctedPfValues=corrected,
+        validMask=valid,
+        sourceTransport="none",
+        sessionGeneration=0,
+        receivedTime=time.time(),
+        receivedMonotonicNs=now_ns,
+    )

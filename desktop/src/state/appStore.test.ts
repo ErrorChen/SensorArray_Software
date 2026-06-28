@@ -5,6 +5,7 @@ import { cellLabel, selectionTitle } from "./appStore";
 import { isCommandSendDisabled, updateCommandHistory } from "./commandPanel";
 import { resolveColourRange, type HeatmapDatum } from "./heatmap";
 import { clampSplitRatio } from "./layout";
+import { parseKeyValueText, parseLogStatusRows } from "./logStatus";
 import { isBleScanDisabled } from "./transportUi";
 
 describe("appStore helpers", () => {
@@ -69,6 +70,29 @@ describe("layout and command UI rules", () => {
   });
 });
 
+describe("log status parser", () => {
+  it("parses command and BLE status rows", () => {
+    const items = parseLogStatusRows([
+      logRow("CMD_TX", "CMD_TX,mode=ble,bytes=8,ending=lf", "info"),
+      logRow("BLE_FRAG50", "BLE_FRAG50,reassembled=10,duplicate=0,missing=1,timeout=0,crc=0,length=0", "info")
+    ]);
+    expect(items.some((item) => item.title === "Command sent" && item.severity === "ok")).toBe(true);
+    expect(items.some((item) => item.title === "BLE fragment statistics" && item.severity === "warn")).toBe(true);
+  });
+
+  it("keeps unknown key value logs readable", () => {
+    expect(parseKeyValueText("UNKNOWN,foo=1,bar=true,baz=text")).toEqual({ foo: 1, bar: true, baz: "text" });
+    const [item] = parseLogStatusRows([logRow("UNKNOWN", "UNKNOWN,foo=1", "info")]);
+    expect(item.category).toBe("Other");
+  });
+
+  it("marks parser errors as error severity", () => {
+    const [item] = parseLogStatusRows([logRow("PARSER", "crc: invalid", "error")]);
+    expect(item.category).toBe("Parser");
+    expect(item.severity).toBe("error");
+  });
+});
+
 function snapshot(unit: "pF" | "%"): BackendSnapshotPayload {
   return {
     connection: { mode: "serial", state: "disconnected", deviceLabel: "", generation: 0 },
@@ -79,6 +103,7 @@ function snapshot(unit: "pF" | "%"): BackendSnapshotPayload {
       correctedPf: [],
       rawPf: [],
       rawFixed: [],
+      userOffsetPf: [],
       displayValues: [],
       validMask: [],
       unit,
@@ -102,6 +127,7 @@ function snapshot(unit: "pF" | "%"): BackendSnapshotPayload {
       freezeColor: false,
       unitMode: "raw",
       circuitOffsetPf: 33,
+      trendLatestN: 600,
       colorRange: { min: null, max: null, frozen: false }
     },
     baseline: {},
@@ -109,5 +135,20 @@ function snapshot(unit: "pF" | "%"): BackendSnapshotPayload {
     logs: { revision: 0, totalRecords: 0, overwrites: 0, rows: [] },
     discovery: { bleState: "idle", bleResults: [], wifiState: "idle", wifiResults: [] },
     diagnostics: {}
+  };
+}
+
+function logRow(tag: string, rawText: string, severity: string) {
+  return {
+    timestamp: 1,
+    monotonicTime: 1,
+    source: "host",
+    channel: "host",
+    tag,
+    severity,
+    rawText,
+    parsedFields: {},
+    recognised: true,
+    sessionGeneration: 1
   };
 }

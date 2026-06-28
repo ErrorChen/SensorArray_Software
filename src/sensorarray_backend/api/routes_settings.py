@@ -49,7 +49,7 @@ def baseline(body: BaselineRequest, runtime: BackendRuntime = Depends(get_runtim
 def selection(body: SelectionRequest, runtime: BackendRuntime = Depends(get_runtime)) -> dict[str, Any]:
     try:
         runtime.set_selection_from_cell(body.cell)
-        return runtime.current_selection_payload()
+        payload = runtime.current_selection_payload()
+        return {"ok": True, **payload}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-

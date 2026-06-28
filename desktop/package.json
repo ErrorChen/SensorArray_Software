@@ -9,7 +9,7 @@
     "build": "tsc --noEmit -p tsconfig.json && vite build && tsc -p tsconfig.electron.json",
     "build:electron": "tsc -p tsconfig.electron.json",
     "desktop": "concurrently -k -n vite,electron \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && npm run electron:dev\"",
-    "electron:dev": "npm run build:electron && cross-env SENSORARRAY_FRONTEND_URL=http://127.0.0.1:5173 electron dist-electron/main.js",
+    "electron:dev": "npm run build:electron && node electron/devLauncher.cjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
     "lint": "eslint .",
     "test": "vitest run",

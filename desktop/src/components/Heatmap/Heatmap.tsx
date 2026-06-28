@@ -1,5 +1,5 @@
 import * as echarts from "echarts";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 
 import type { BackendSnapshotPayload } from "../../api/types";
 import { cellLabel, selectedCells } from "../../state/appStore";
@@ -14,25 +14,64 @@ type Props = {
 export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
+  const lastClickRef = useRef<{ cell: string; timeMs: number } | null>(null);
   const selected = useMemo(() => selectedCells(snapshot?.selection), [snapshot?.selection]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!hostRef.current) {
       return;
     }
-    chartRef.current = echarts.init(hostRef.current, undefined, { renderer: "canvas" });
-    const observer = new ResizeObserver(() => chartRef.current?.resize());
+    const chart = echarts.init(hostRef.current, undefined, { renderer: "canvas" });
+    chartRef.current = chart;
+    const selectCell = (row: number, col: number) => {
+      if (row < 0 || row >= 8 || col < 0 || col >= 8) {
+        return;
+      }
+      const cell = cellLabel(row, col);
+      const now = performance.now();
+      if (lastClickRef.current?.cell === cell && now - lastClickRef.current.timeMs < 80) {
+        return;
+      }
+      lastClickRef.current = { cell, timeMs: now };
+      onSelectCell(cell);
+    };
+    const observer = new ResizeObserver(() => {
+      requestAnimationFrame(() => chartRef.current?.resize());
+    });
     observer.observe(hostRef.current);
-    chartRef.current.on("click", (params) => {
+    const handleSeriesClick = (params: echarts.ECElementEvent) => {
       const value = params.value as [number, number, number | null] | undefined;
       if (!value) {
         return;
       }
-      onSelectCell(cellLabel(value[1], value[0]));
-    });
+      selectCell(value[1], value[0]);
+    };
+    const handleZrClick = (event: { offsetX: number; offsetY: number }) => {
+      const pixel: [number, number] = [event.offsetX, event.offsetY];
+      if (!chart.containPixel({ seriesIndex: 0 }, pixel)) {
+        return;
+      }
+      const dataCoord = chart.convertFromPixel({ seriesIndex: 0 }, pixel);
+      if (!Array.isArray(dataCoord) || dataCoord.length < 2) {
+        return;
+      }
+      const col = Math.round(Number(dataCoord[0]));
+      const row = Math.round(Number(dataCoord[1]));
+      selectCell(row, col);
+    };
+    const handleZrMouseMove = (event: { offsetX: number; offsetY: number }) => {
+      const overGrid = chart.containPixel({ seriesIndex: 0 }, [event.offsetX, event.offsetY]);
+      chart.getZr().setCursorStyle(overGrid ? "pointer" : "default");
+    };
+    chart.on("click", handleSeriesClick);
+    chart.getZr().on("click", handleZrClick);
+    chart.getZr().on("mousemove", handleZrMouseMove);
     return () => {
+      chart.off("click", handleSeriesClick);
+      chart.getZr().off("click", handleZrClick);
+      chart.getZr().off("mousemove", handleZrMouseMove);
       observer.disconnect();
-      chartRef.current?.dispose();
+      chart.dispose();
       chartRef.current = null;
     };
   }, [onSelectCell]);
@@ -68,10 +107,14 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
           const corrected = snapshot.matrix.correctedPf[row]?.[col];
           const rawPf = snapshot.matrix.rawPf[row]?.[col];
           const rawFixed = snapshot.matrix.rawFixed[row]?.[col];
+          const userOffset = snapshot.matrix.userOffsetPf[row]?.[col];
+          const displayed = snapshot.matrix.displayValues[row]?.[col];
           return [
             `<strong>${label}</strong>`,
-            `corrected pF: ${formatValue(corrected)}`,
             `raw pF: ${formatValue(rawPf)}`,
+            `corrected pF: ${formatValue(corrected)}`,
+            `user offset pF: ${formatValue(userOffset)}`,
+            `displayed ${snapshot.matrix.unit}: ${formatValue(displayed, snapshot.matrix.unit === "%" ? 2 : 3)}`,
             `rawFixed: ${formatValue(rawFixed, 0)}`,
             `seq: ${snapshot.frame.seq ?? "-"}`,
             `valid: ${valid ? "yes" : "no"}`,
@@ -107,6 +150,7 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
         {
           type: "heatmap",
           data,
+          cursor: "pointer",
           encode: { x: 0, y: 1, value: 2 },
           label: {
             show: snapshot.display.showCellText,
@@ -133,7 +177,7 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
         }
       ]
       },
-      { notMerge: false, lazyUpdate: true }
+      { notMerge: true, lazyUpdate: false }
     );
   }, [snapshot, selected]);
 

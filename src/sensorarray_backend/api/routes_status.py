@@ -32,3 +32,8 @@ def health() -> dict:
 @router.get("/api/status")
 def status(runtime: BackendRuntime = Depends(get_runtime)) -> dict:
     return snapshot_payload(runtime)
+
+
+@router.get("/api/history")
+def history(latest_n: int = 600, runtime: BackendRuntime = Depends(get_runtime)) -> dict:
+    return runtime.set_trend_latest_n(latest_n)

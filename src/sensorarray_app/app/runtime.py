@@ -6,6 +6,8 @@ import time
 from dataclasses import asdict
 from typing import Any
 
+import numpy as np
+
 from sensorarray_app.app.configuration import AppConfiguration
 from sensorarray_app.app.state import UiState as UiModel
 from sensorarray_app.constants import RAW_INPUT_QUEUE_SIZE
@@ -93,8 +95,17 @@ class SensorArrayRuntime:
     def capture_baseline(self) -> None:
         snap = self.matrixStore.snapshot()
         if snap.seq is None or snap.firmwareGeneration is None or snap.requestId is None:
-            self.ui.baselineStatus = "No capacitance frame yet"
+            self._baseline_session = None
+            self.ui.pendingDisplayMode = None
+            self.ui.baseline = None
+            self.ui.displayMode = DisplayMode.ABSOLUTE_C
+            self.ui.baselineStatus = "No data"
+            self.ui.baselineInvalidReason = "No capacitance frame yet"
             return
+        if self.ui.displayMode == DisplayMode.DELTA_PERCENT:
+            self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
+            self.ui.displayMode = DisplayMode.ABSOLUTE_C
+        self.ui.baseline = None
         self._baseline_session = BaselineSession(
             sessionGeneration=snap.sessionGeneration,
             transport=self.transport.status.get("transport", "none"),
@@ -105,12 +116,19 @@ class SensorArrayRuntime:
             measurementDomain="capacitance",
             circuitOffsetPf=self.registry.cap.circuit_offset_pf,
             startMonotonicNs=time.monotonic_ns(),
+            userOffsetsPf=self.user_offsets_array().reshape(64),
         )
-        self.ui.baselineStatus = "Calibrating Baseline"
+        self.ui.baselineStatus = "Capturing baseline..."
         self.ui.baselineInvalidReason = ""
 
     def reset_baseline(self) -> None:
-        self.invalidate_baseline("user reset")
+        with self._lock:
+            self._baseline_session = None
+            self.ui.baseline = None
+            self.ui.displayMode = DisplayMode.ABSOLUTE_C
+            self.ui.pendingDisplayMode = None
+            self.ui.baselineStatus = "Reset"
+            self.ui.baselineInvalidReason = ""
 
     def cancel_baseline(self) -> None:
         if self._baseline_session is not None:
@@ -123,14 +141,18 @@ class SensorArrayRuntime:
             self._baseline_session = None
             self.ui.baseline = None
             self.ui.displayMode = DisplayMode.ABSOLUTE_C
+            self.ui.pendingDisplayMode = None
             self.ui.baselineStatus = "Invalid"
             self.ui.baselineInvalidReason = reason
 
     def set_display_mode(self, mode: str) -> None:
         selected = DisplayMode(mode)
         if selected == DisplayMode.DELTA_PERCENT and self.ui.baseline is None:
+            self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
             self.capture_baseline()
-        self.ui.displayMode = selected if self.ui.baseline is not None or selected == DisplayMode.ABSOLUTE_C else DisplayMode.ABSOLUTE_C
+            return
+        self.ui.pendingDisplayMode = None
+        self.ui.displayMode = selected
 
     def set_selection_from_cell(self, cell_name: str) -> None:
         try:
@@ -142,6 +164,7 @@ class SensorArrayRuntime:
                 self.ui.selection = select_group(row, det, snap.activeRows, self.ui.selectionRevision)
         except Exception as exc:
             self._host_log("Selection", "warning", f"selection ignored: {exc}")
+            raise ValueError(f"selection failed for {cell_name}: {exc}") from exc
 
     def clear_all(self) -> None:
         self.matrixStore.clear()
@@ -186,20 +209,25 @@ class SensorArrayRuntime:
             "selection": asdict(selection),
             "ui": {
                 "displayMode": self.ui.displayMode.value,
+                "pendingDisplayMode": self.ui.pendingDisplayMode.value if self.ui.pendingDisplayMode else None,
                 "paused": self.ui.paused,
                 "followLatest": self.ui.followLatest,
                 "cellText": self.ui.cellText,
                 "freezeColor": self.ui.freezeColor,
                 "clearRevision": self.ui.clearRevision,
+                "trendLatestN": self.ui.trendLatestN,
+                "userOffsetsPf": self.offsets_payload(),
             },
             "baseline": {
-                "status": self.ui.baselineStatus,
+                "status": self.baseline_status_code(),
+                "label": self.ui.baselineStatus,
                 "invalidReason": self.ui.baselineInvalidReason,
                 "progress": baseline_progress,
                 "frameCount": baseline_session.frameCount if baseline_session else (self.ui.baseline.frameCount if self.ui.baseline else 0),
                 "rejectedFrameCount": baseline_session.rejectedFrameCount if baseline_session else (self.ui.baseline.rejectedFrameCount if self.ui.baseline else 0),
                 "ready": self.ui.baseline is not None,
                 "validCells": int(self.ui.baseline.validMask.sum()) if self.ui.baseline else 0,
+                "pendingDisplayMode": self.ui.pendingDisplayMode.value if self.ui.pendingDisplayMode else None,
             },
             "battery": self.telemetry.battery_snapshot(now),
             "commands": command_snapshot,
@@ -281,9 +309,40 @@ class SensorArrayRuntime:
         if now_ns < session.endMonotonicNs and not session.cancelled:
             return
         result = session.complete()
-        self.ui.baseline = result
-        self.ui.baselineStatus = "Baseline Ready" if int(result.validMask.sum()) else "Baseline Invalid"
+        valid_count = int(result.validMask.sum())
+        if valid_count:
+            self.ui.baseline = result
+            self.ui.baselineStatus = "Ready"
+            self.ui.baselineInvalidReason = ""
+            if self.ui.pendingDisplayMode == DisplayMode.DELTA_PERCENT:
+                self.ui.displayMode = DisplayMode.DELTA_PERCENT
+        else:
+            self.ui.baseline = None
+            self.ui.displayMode = DisplayMode.ABSOLUTE_C
+            reason = _baseline_invalid_reason(result.invalidReasons)
+            self.ui.baselineStatus = "Invalid"
+            self.ui.baselineInvalidReason = reason
+        self.ui.pendingDisplayMode = None
         self._baseline_session = None
+
+    def baseline_status_code(self) -> str:
+        if self._baseline_session is not None:
+            return "capturing"
+        if self.ui.baseline is not None:
+            return "ready"
+        if self.ui.baselineStatus.lower().startswith("no data"):
+            return "no_data"
+        if self.ui.baselineStatus.lower().startswith("reset"):
+            return "reset"
+        if self.ui.baselineStatus.lower().startswith("invalid"):
+            return "invalid"
+        return "idle"
+
+    def offsets_payload(self) -> list[list[float]]:
+        return [[float(value) for value in row] for row in self.ui.userOffsetsPf]
+
+    def user_offsets_array(self) -> np.ndarray:
+        return np.asarray(self.ui.userOffsetsPf, dtype=np.float64).reshape(8, 8)
 
     def _host_log(self, tag: str, severity: str, text: str) -> None:
         self.rawLogs.add(
@@ -312,3 +371,15 @@ class SensorArrayRuntime:
         self._wifi_scan_results = [asdict(item) for item in scan_wifi()]
         self._discovery_state["wifi"] = "done"
         self._host_log("Discovery", "info", f"Wi-Fi discovery found {len(self._wifi_scan_results)} candidates")
+
+
+def _baseline_invalid_reason(reasons: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for reason in reasons:
+        counts[reason] = counts.get(reason, 0) + 1
+    counts.pop("inactive", None)
+    counts.pop("valid", None)
+    if not counts:
+        return "no valid baseline cells"
+    reason, count = max(counts.items(), key=lambda item: item[1])
+    return f"{reason} ({count} cells)"

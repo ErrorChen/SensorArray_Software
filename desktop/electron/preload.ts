@@ -1,9 +1,19 @@
-import { createRequire } from "node:module";
+import electron from "electron";
 
-const nodeRequire = createRequire(import.meta.url);
-const { contextBridge, ipcRenderer } = nodeRequire("electron") as typeof import("electron");
+const { contextBridge, ipcRenderer } = electron;
 
 contextBridge.exposeInMainWorld("sensorarrayDesktop", {
   getBackendUrl: () => ipcRenderer.invoke("backend:url"),
-  selectReplayFile: () => ipcRenderer.invoke("dialog:selectReplayFile")
+  selectReplayFile: () => ipcRenderer.invoke("dialog:selectReplayFile"),
+  onImportReplayData: (callback: (path: string) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, path: string) => callback(path);
+    ipcRenderer.on("menu:importReplayData", listener);
+    return () => ipcRenderer.off("menu:importReplayData", listener);
+  },
+  onExportSessionData: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on("menu:exportSessionData", listener);
+    return () => ipcRenderer.off("menu:exportSessionData", listener);
+  },
+  saveExportedSession: (defaultName: string, data: string) => ipcRenderer.invoke("dialog:saveExportedSession", defaultName, data)
 });

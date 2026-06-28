@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ from sensorarray_app.constants import DEFAULT_SERIAL_BAUD
 from sensorarray_app.domain.models import DisplayMode
 from sensorarray_app.services.discovery_service import scan_ble, scan_wifi
 from sensorarray_app.transport.serial_transport import SerialTransport
+from sensorarray_backend.core.history import history_payload
+from sensorarray_backend.core.snapshot import snapshot_payload
 
 _LINE_ENDINGS = {"lf": "\n", "crlf": "\r\n", "none": ""}
 
@@ -59,7 +62,8 @@ class BackendRuntime(SensorArrayRuntime):
         self.replayPath = str(replay_path)
         self.replaySpeed = max(0.01, float(speed or 1.0))
         self.selectedMode = "replay"
-        return {"path": self.replayPath, "speed": self.replaySpeed}
+        imported_session = self._restore_exported_session_settings(replay_path)
+        return {"path": self.replayPath, "speed": self.replaySpeed, "importedSession": imported_session}
 
     def start_replay(self) -> None:
         if not self.replayPath:
@@ -82,9 +86,27 @@ class BackendRuntime(SensorArrayRuntime):
             self.commands.activeRows = rows
             self.commands.pendingRows = None
             self._host_log("Commands", "info", f"ROWS={rows} display-only ({transport})")
-            return {"rows": rows, "displayOnly": True, "applied": transport == "replay"}
+            return {
+                "ok": True,
+                "requestedRows": rows,
+                "appliedRows": rows,
+                "displayOnly": True,
+                "activeTransport": transport,
+                "status": "display_only",
+                "applied": True,
+                "rows": rows,
+            }
         super().request_rows(rows)
-        return {"rows": rows, "displayOnly": False, "applied": False}
+        return {
+            "ok": True,
+            "requestedRows": rows,
+            "appliedRows": self.commands.activeRows,
+            "displayOnly": False,
+            "activeTransport": transport,
+            "status": "sent",
+            "applied": False,
+            "rows": rows,
+        }
 
     def update_display_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         if "displayMode" in payload and payload["displayMode"] is not None:
@@ -113,7 +135,10 @@ class BackendRuntime(SensorArrayRuntime):
     def set_display_mode(self, mode: str) -> None:
         selected = DisplayMode(mode)
         if selected == DisplayMode.DELTA_PERCENT and self.ui.baseline is None:
+            self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
             self.capture_baseline()
+            return
+        self.ui.pendingDisplayMode = None
         self.ui.displayMode = selected if self.ui.baseline is not None or selected == DisplayMode.ABSOLUTE_C else DisplayMode.ABSOLUTE_C
 
     def baseline_action(self, action: str) -> dict[str, Any]:
@@ -197,23 +222,180 @@ class BackendRuntime(SensorArrayRuntime):
         session = self._baseline_session
         now_ns = time.monotonic_ns()
         return {
-            "status": self.ui.baselineStatus,
+            "ok": True,
+            "status": self.baseline_status_code(),
+            "label": self.ui.baselineStatus,
             "invalidReason": self.ui.baselineInvalidReason,
             "progress": session.progress(now_ns) if session else 0.0,
             "ready": self.ui.baseline is not None,
             "validCells": int(self.ui.baseline.validMask.sum()) if self.ui.baseline else 0,
+            "frameCount": session.frameCount if session else (self.ui.baseline.frameCount if self.ui.baseline else 0),
+            "rejectedFrameCount": session.rejectedFrameCount if session else (self.ui.baseline.rejectedFrameCount if self.ui.baseline else 0),
+            "pendingDisplayMode": self.ui.pendingDisplayMode.value if self.ui.pendingDisplayMode else None,
         }
 
     def display_payload(self) -> dict[str, Any]:
         return {
+            "ok": True,
             "displayMode": self.ui.displayMode.value,
+            "pendingDisplayMode": self.ui.pendingDisplayMode.value if self.ui.pendingDisplayMode else None,
             "measurementDomain": self.ui.measurementDomain,
             "showCellText": self.ui.cellText,
             "pauseDisplay": self.ui.paused,
             "freezeColor": self.ui.freezeColor,
             "unitMode": self.ui.unitMode,
             "circuitOffsetPf": self.ui.circuitOffsetPf,
+            "trendLatestN": self.ui.trendLatestN,
+            "baselineStatus": self.baseline_payload(),
         }
+
+    def set_trend_latest_n(self, latest_n: int) -> dict[str, Any]:
+        latest = int(latest_n)
+        if latest <= 0:
+            latest = self.matrixStore.history.capacity
+        latest = min(max(latest, 1), self.matrixStore.history.capacity)
+        self.ui.trendLatestN = latest
+        return history_payload(self, latest_n=latest)
+
+    def offsets_payload(self) -> list[list[float]]:
+        return super().offsets_payload()
+
+    def get_offsets_payload(self) -> dict[str, Any]:
+        return {"ok": True, "offsetsPf": self.offsets_payload()}
+
+    def set_offset_cell(self, row: int, col: int, offset_pf: float) -> dict[str, Any]:
+        row_index, col_index = _cell_indices(row, col)
+        offsets = self.user_offsets_array()
+        offsets[row_index, col_index] = _finite_float(offset_pf, "offsetPf")
+        self._commit_offsets(offsets, "cell offset changed")
+        return self.get_offsets_payload()
+
+    def set_offsets_bulk(self, offsets_pf: list[list[float]]) -> dict[str, Any]:
+        offsets = _validate_offsets_matrix(offsets_pf)
+        self._commit_offsets(offsets, "cell offset changed")
+        return self.get_offsets_payload()
+
+    def clear_offsets(self, scope: str, row: int | None = None, col: int | None = None) -> dict[str, Any]:
+        offsets = self.user_offsets_array()
+        normalized_scope = _normalize_scope(scope)
+        if normalized_scope == "all":
+            offsets[:, :] = 0.0
+        elif normalized_scope == "row":
+            if row is None:
+                raise ValueError("row is required for row scope")
+            row_index = _row_index(row)
+            offsets[row_index, :] = 0.0
+        else:
+            if row is None or col is None:
+                raise ValueError("row and col are required for cell scope")
+            row_index, col_index = _cell_indices(row, col)
+            offsets[row_index, col_index] = 0.0
+        self._commit_offsets(offsets, "cell offset changed")
+        return self.get_offsets_payload()
+
+    def zero_current_offsets(self, scope: str, row: int | None = None, col: int | None = None) -> dict[str, Any]:
+        snapshot = self.matrixStore.snapshot()
+        corrected = np.asarray(snapshot.matrix, dtype=np.float64)
+        valid = np.asarray(snapshot.valid, dtype=bool) & np.isfinite(corrected)
+        if snapshot.seq is None:
+            raise ValueError("no capacitance frame yet")
+        offsets = self.user_offsets_array()
+        normalized_scope = _normalize_scope(scope)
+        changed = 0
+        if normalized_scope == "all":
+            mask = valid
+            offsets[mask] = corrected[mask]
+            changed = int(mask.sum())
+        elif normalized_scope == "row":
+            if row is None:
+                raise ValueError("row is required for row scope")
+            row_index = _row_index(row)
+            mask = valid[row_index, :]
+            offsets[row_index, mask] = corrected[row_index, mask]
+            changed = int(mask.sum())
+        else:
+            if row is None or col is None:
+                raise ValueError("row and col are required for cell scope")
+            row_index, col_index = _cell_indices(row, col)
+            if not bool(valid[row_index, col_index]):
+                raise ValueError("selected cell has no valid current value")
+            offsets[row_index, col_index] = corrected[row_index, col_index]
+            changed = 1
+        self._commit_offsets(offsets, "cell offset changed")
+        payload = self.get_offsets_payload()
+        payload["changedCells"] = changed
+        return payload
+
+    def export_session_payload(self) -> dict[str, Any]:
+        snap = snapshot_payload(self)
+        history = self._history_export_frames()
+        logs = self.rawLogs.snapshot(show_data=True, limit=self.rawLogs.maxLines)
+        return {
+            "metadata": {
+                "appVersion": "0.3.0",
+                "exportedAt": datetime.now(timezone.utc).isoformat(),
+                "sourceTransport": snap["connection"]["mode"],
+                "device": snap["connection"]["deviceLabel"],
+                "frameSeq": snap["frame"]["seq"],
+                "fps": snap["frame"]["fps"],
+                "rows": snap["frame"]["rows"],
+            },
+            "display": snap["display"],
+            "offsetsPf": self.offsets_payload(),
+            "currentMatrix": snap["matrix"],
+            "selection": snap["selection"],
+            "history": history_payload(self, latest_n=self.matrixStore.history.capacity),
+            "historyFrames": history,
+            "rawLogs": logs["rows"],
+            "parsedStatus": [],
+            "diagnostics": snap["diagnostics"],
+        }
+
+    def _commit_offsets(self, offsets: np.ndarray, reason: str) -> None:
+        current = self.user_offsets_array()
+        if np.array_equal(current, offsets):
+            return
+        self.ui.userOffsetsPf = [[float(value) for value in row] for row in offsets.reshape(8, 8)]
+        if self.ui.baseline is not None or self._baseline_session is not None:
+            self.invalidate_baseline(reason)
+            self._host_log("Display", "warning", f"Baseline invalid: {reason}")
+
+    def _history_export_frames(self) -> list[dict[str, Any]]:
+        history = self.matrixStore.history
+        frames: list[dict[str, Any]] = []
+        for index in history.ordered_indices():
+            values = np.asarray(history.values[index, :], dtype=np.float64)
+            frames.append(
+                {
+                    "seq": int(history.seq[index]),
+                    "timeSeconds": _json_number(history.timeSeconds[index]),
+                    "rows": int(history.rows[index]),
+                    "valuesPf": [_json_number(value) for value in values],
+                    "valid": [bool(value) for value in history.valid[index, :].tolist()],
+                }
+            )
+        return frames
+
+    def _restore_exported_session_settings(self, replay_path: Path) -> bool:
+        if replay_path.suffix.lower() != ".json":
+            return False
+        try:
+            import json
+
+            payload = json.loads(replay_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not isinstance(payload, dict) or "metadata" not in payload or "currentMatrix" not in payload:
+            return False
+        offsets = payload.get("offsetsPf")
+        if isinstance(offsets, list):
+            self.ui.userOffsetsPf = [[float(value) for value in row] for row in _validate_offsets_matrix(offsets).tolist()]
+        display = payload.get("display")
+        if isinstance(display, dict):
+            mode = display.get("displayMode")
+            self.ui.displayMode = DisplayMode.ABSOLUTE_C if mode == DisplayMode.DELTA_PERCENT.value else DisplayMode(str(mode or DisplayMode.ABSOLUTE_C.value))
+            self.ui.pendingDisplayMode = None
+        return True
 
     def color_range(self, matrix: np.ndarray, valid_mask: np.ndarray | None = None) -> tuple[float | None, float | None]:
         if self.ui.freezeColor and self._lastColorRange != (None, None):
@@ -281,3 +463,54 @@ class BackendRuntime(SensorArrayRuntime):
 
 def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[:limit] + "..."
+
+
+def _row_index(row: int) -> int:
+    index = int(row) - 1
+    if not (0 <= index < 8):
+        raise ValueError("row must be 1..8")
+    return index
+
+
+def _cell_indices(row: int, col: int) -> tuple[int, int]:
+    row_index = _row_index(row)
+    col_index = int(col) - 1
+    if not (0 <= col_index < 8):
+        raise ValueError("col must be 1..8")
+    return row_index, col_index
+
+
+def _finite_float(value: Any, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not np.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
+
+
+def _validate_offsets_matrix(offsets_pf: list[list[float]]) -> np.ndarray:
+    offsets = np.asarray(offsets_pf, dtype=np.float64)
+    if offsets.shape != (8, 8):
+        raise ValueError("offsetsPf must be an 8x8 matrix")
+    if not np.isfinite(offsets).all():
+        raise ValueError("offsetsPf must contain only finite numbers")
+    return offsets
+
+
+def _normalize_scope(scope: str) -> str:
+    normalized = str(scope or "cell").lower()
+    if normalized not in {"cell", "row", "all"}:
+        raise ValueError("scope must be cell, row, or all")
+    return normalized
+
+
+def _json_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return number

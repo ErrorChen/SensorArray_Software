@@ -1,13 +1,12 @@
-import type { BrowserWindow as BrowserWindowType, OpenDialogOptions } from "electron";
-import { createRequire } from "node:module";
+import type { BrowserWindow as BrowserWindowType, MenuItemConstructorOptions, OpenDialogOptions, SaveDialogOptions } from "electron";
+import electron from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BackendProcess, findAvailablePort, startBackend, stopBackend, waitForHealth } from "./backendProcess.js";
 
-const nodeRequire = createRequire(import.meta.url);
-const { app, BrowserWindow, dialog, ipcMain } = nodeRequire("electron") as typeof import("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain } = electron;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
@@ -24,7 +23,7 @@ ipcMain.handle("dialog:selectReplayFile", async () => {
     title: "Open replay file",
     properties: ["openFile"],
     filters: [
-      { name: "SensorArray logs", extensions: ["txt", "log", "json", "bin"] },
+      { name: "SensorArray replay data", extensions: ["json", "jsonl", "log", "txt", "csv", "bin"] },
       { name: "All files", extensions: ["*"] }
     ]
   };
@@ -33,6 +32,26 @@ ipcMain.handle("dialog:selectReplayFile", async () => {
     return null;
   }
   return result.filePaths[0];
+});
+ipcMain.handle("dialog:saveExportedSession", async (_event, defaultName: string, data: string) => {
+  const options: SaveDialogOptions = {
+    title: "Export current session data",
+    defaultPath: defaultName,
+    filters: [
+      { name: "SensorArray session JSON", extensions: ["json"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  };
+  const result = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+  if (result.canceled || !result.filePath) {
+    return { ok: false, canceled: true };
+  }
+  try {
+    await fs.promises.writeFile(result.filePath, String(data), "utf-8");
+    return { ok: true, path: result.filePath };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 });
 
 async function createWindow(): Promise<void> {
@@ -53,8 +72,8 @@ async function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
-    minWidth: 1180,
-    minHeight: 760,
+    minWidth: 1000,
+    minHeight: 680,
     title: "SensorArray",
     icon: resolveIconPath(),
     backgroundColor: "#f7f8fa",
@@ -82,6 +101,43 @@ async function createWindow(): Promise<void> {
     stopBackend(backend);
     backend = null;
     throw error;
+  }
+  installApplicationMenu();
+}
+
+function installApplicationMenu(): void {
+  const template: MenuItemConstructorOptions[] = [
+    {
+      label: "File",
+      submenu: [
+        {
+          label: "Import Replay Data...",
+          click: () => void importReplayDataFromMenu()
+        },
+        {
+          label: "Export Current Session Data...",
+          click: () => mainWindow?.webContents.send("menu:exportSessionData")
+        },
+        { type: "separator" },
+        process.platform === "darwin" ? { role: "close" } : { role: "quit", label: "Exit" }
+      ]
+    }
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+async function importReplayDataFromMenu(): Promise<void> {
+  const options: OpenDialogOptions = {
+    title: "Import replay data",
+    properties: ["openFile"],
+    filters: [
+      { name: "SensorArray replay data", extensions: ["json", "jsonl", "log", "txt", "csv"] },
+      { name: "All files", extensions: ["*"] }
+    ]
+  };
+  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+  if (!result.canceled && result.filePaths[0]) {
+    mainWindow?.webContents.send("menu:importReplayData", result.filePaths[0]);
   }
 }
 

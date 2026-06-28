@@ -128,7 +128,7 @@ Electron main process
 React + TypeScript frontend
 -> resizable heatmap/setup/trend workspace
 -> Write / Command panel
--> Raw Log / Event Log panel
+-> Raw Log / Status panel
 -> REST commands and WebSocket snapshots
 
 FastAPI backend
@@ -148,6 +148,7 @@ Reusable protocol, transport, domain, and store code is under
 ```text
 GET  /health
 GET  /api/status
+GET  /api/history?latest_n=600
 POST /api/transport/mode
 
 GET  /api/transport/serial/ports
@@ -170,7 +171,13 @@ POST /api/replay/seek
 POST /api/rows
 POST /api/settings/display
 POST /api/settings/baseline
+GET  /api/settings/offsets
+POST /api/settings/offsets/cell
+POST /api/settings/offsets/bulk
+POST /api/settings/offsets/clear
+POST /api/settings/offsets/zero-current
 POST /api/selection
+GET  /api/export/session
 
 WS   /ws
 ```
@@ -207,9 +214,22 @@ The main workspace is resizable:
 The bottom area is also resizable:
 
 - Left pane: Write / Command.
-- Right pane: Raw Log / Event Log.
+- Right pane: Raw Log / Status.
 - Default split: 50% / 50%.
 - Stored key: `sensorarray.layout.bottomSplitRatio`.
+
+The Electron File menu contains:
+
+- Import Replay Data: choose `.json`, `.jsonl`, `.log`, `.txt`, or `.csv`, then
+  start the existing replay flow.
+- Export Current Session Data: save a JSON snapshot containing metadata,
+  display state, offsets, current matrix, selected history, raw logs, and
+  diagnostics.
+
+Exported session JSON can be imported again as replay data. The replay transport
+recognises this JSON shape and converts stored frames back into b41 `C/D/K`
+text so the existing parser, matrix store, snapshot builder, heatmap, trends,
+and logs are still used.
 
 ## Heatmap And Trends
 
@@ -223,13 +243,57 @@ Colour modes:
 - Freeze colour: keeps the last range and new frames do not overwrite it.
 
 Absolute pF ranges include padding. Delta percent ranges are symmetric around
-zero and at least +/-0.5%. Tooltips show cell label, corrected pF, raw pF,
-rawFixed, validity, frame sequence, and source transport. Heatmap and trend
-charts use `ResizeObserver` so they resize with their panes.
+zero and at least +/-0.5%. Tooltips show cell label, raw pF, corrected pF,
+user offset pF, displayed value, rawFixed, validity, frame sequence, and source
+transport. Heatmap and trend charts use `ResizeObserver` with animation-frame
+resizes so they shrink and grow with their panes.
 
 Clicking D1-D4 selects that row's primary FDC group. Clicking D5-D8 selects that
-row's secondary FDC group. Trend history is limited to the latest 600 points,
-and invalid cells do not enter valid trend series.
+row's secondary FDC group. The heatmap keeps the ECharts series click handler
+and also uses a zrender pixel-to-cell fallback, so clicks on cell edges and null
+cells still select the corresponding trend group.
+
+Trend charts use a relative visible x-axis. If timestamps are present, x is
+seconds since the first visible point; otherwise x is the visible sample index.
+Tooltips still show the real sequence number and timestamp. The Trend Window
+control supports Latest 300, 600, 1200, 3000, and All session. Invalid cells do
+not enter valid trend series.
+
+## Display, Baseline, Rows, And Offset
+
+Display mode comes from the backend snapshot. When Delta C/C0 % is requested
+without a ready baseline, the backend keeps Absolute C active, records
+`pendingDisplayMode=delta_percent`, starts baseline capture when a frame is
+available, then switches to Delta automatically after a valid baseline is
+complete. If no frame exists, baseline status reports No data instead of
+silently flipping back.
+
+Rows supports 1 through 8 and is now selection-applies-immediately. There is no
+Apply button. Live transports send `ROWS=n` through the existing command
+service; `RCMD` means accepted and only `RAPP` means applied. Replay or
+disconnected mode is display-only and is reported as such in the UI/API.
+
+The right-side configuration area exposes Setup and Advanced as sibling panels.
+Advanced contains per-cell Offset. It is not a transport mode and does not call
+`/api/transport/mode` or disconnect Serial/BLE/Wi-Fi. Offset uses this display
+contract:
+
+```text
+rawPf       = parser raw pF, unchanged
+correctedPf = parser/circuit corrected pF, unchanged
+userOffsetPf = user-entered pF offset
+displayPf  = correctedPf - userOffsetPf
+```
+
+Absolute heatmap and trends show `displayPf`. Delta C/C0 % uses `displayPf` for
+both the baseline and current value. Changing offsets invalidates any existing
+baseline with `Baseline invalid: cell offset changed`; capture a new baseline
+before using Delta again.
+
+Offset controls support setting one cell, zeroing the selected cell/current
+row/all cells from the current frame, and clearing selected/row/all offsets.
+Exported session JSON includes offsets and restores them when imported as
+replay data.
 
 ## Write / Command
 
@@ -254,6 +318,17 @@ CMD_TX_FAIL,mode=ble,error=...
 ```
 
 Long command/error text is truncated in logs and UI records.
+
+## Log Status
+
+The Log panel has Raw Log and Status tabs. Raw Log defaults to recent bounded
+rows, supports filtering, auto-scroll, and copy-visible. Status parses raw log
+rows into human-readable items without replacing the raw view.
+
+Recognised summaries include `CMD_TX`, `CMD_TX_FAIL`, `BLE_RX50`,
+`BLE_FRAG50`, `PROTO50`, `RCMD`, `RAPP`, baseline state, parser errors, and
+transport lifecycle logs. Unknown tags are still shown under Other, with any
+CSV key=value fields parsed into details.
 
 ## Bluetooth LE
 
@@ -284,6 +359,12 @@ BLE diagnostics are aggregated rather than dumped per notify:
 Parser, CRC, fragment, or length errors are counted and logged but do not stop
 the BLE transport unless the underlying connection actually closes.
 
+BLE scan results resolve RSSI from `device.rssi`, `adv.rssi`, and platform
+details when available. Devices with RSSI sort ahead of devices without RSSI,
+and stronger RSSI sorts first within the same verified/matched group. The UI
+shows `-62 dBm` when available and `RSSI unavailable` when the backend cannot
+resolve a value; it should not show `? dBm`.
+
 ## Transport Notes
 
 Serial ports are discovered with `serial.tools.list_ports.comports()`. COM12 is
@@ -296,11 +377,19 @@ Replay uses the same parser, matrix store, snapshot builder, WebSocket path,
 heatmap, and trend charts as live transports. Replay is software validation
 only and does not replace serial or BLE hardware validation.
 
-## ROWS
+## Troubleshooting
 
-ROWS supports 1 through 8. Live transports send `ROWS=n` through the existing
-command service. `RCMD` means accepted; only `RAPP` means applied. Replay or
-disconnected mode is display-only and is reported as such.
+- BLE RSSI unavailable: some Windows/bleak backends do not expose RSSI in
+  standard fields. Re-scan, verify Bluetooth permissions/driver state, and
+  inspect backend BLE discovery logs.
+- Delta cannot switch: check baseline status. No data means no capacitance
+  frame has arrived; Invalid means capture failed or offsets changed and a new
+  Set baseline is required.
+- Replay import fails: confirm the file is a supported replay text/CSV/log file
+  or an exported SensorArray session JSON. Existing replay still streams bytes
+  through the parser.
+- Offset after Delta looks wrong: offset changes invalidate the old baseline.
+  Reset or Set baseline again before returning to Delta C/C0 %.
 
 ## Validation
 

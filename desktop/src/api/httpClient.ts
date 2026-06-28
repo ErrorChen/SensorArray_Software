@@ -1,4 +1,18 @@
-import type { BleDevice, DisplayMode, SerialPort, TransportMode, WifiDevice, WriteCommandRequest, WriteCommandResponse } from "./types";
+import type {
+  BaselineSnapshot,
+  BleDevice,
+  DisplayMode,
+  ExportSessionPayload,
+  HistoryPayload,
+  OffsetResponse,
+  OffsetScope,
+  RowsResponse,
+  SerialPort,
+  TransportMode,
+  WifiDevice,
+  WriteCommandRequest,
+  WriteCommandResponse
+} from "./types";
 
 export class BackendHttpClient {
   constructor(private readonly baseUrl: string) {}
@@ -54,8 +68,8 @@ export class BackendHttpClient {
     await this.post("/api/replay/stop", {});
   }
 
-  async setRows(rows: number): Promise<void> {
-    await this.post("/api/rows", { rows });
+  async setRows(rows: number): Promise<RowsResponse> {
+    return this.post<RowsResponse>("/api/rows", { rows });
   }
 
   async setDisplaySettings(settings: {
@@ -66,16 +80,40 @@ export class BackendHttpClient {
     freezeColor?: boolean;
     unitMode?: string;
     circuitOffsetPf?: number;
-  }): Promise<void> {
-    await this.post("/api/settings/display", settings);
+  }): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/settings/display", settings);
   }
 
-  async baseline(action: "capture" | "reset" | "cancel"): Promise<void> {
-    await this.post("/api/settings/baseline", { action });
+  async baseline(action: "capture" | "reset" | "cancel"): Promise<BaselineSnapshot> {
+    return this.post<BaselineSnapshot>("/api/settings/baseline", { action });
   }
 
-  async selectCell(cell: string): Promise<void> {
-    await this.post("/api/selection", { cell });
+  async selectCell(cell: string): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/selection", { cell });
+  }
+
+  async getHistory(latestN: number): Promise<HistoryPayload> {
+    return this.get<HistoryPayload>(`/api/history?latest_n=${encodeURIComponent(String(latestN))}`);
+  }
+
+  async getOffsets(): Promise<OffsetResponse> {
+    return this.get<OffsetResponse>("/api/settings/offsets");
+  }
+
+  async setOffsetCell(row: number, col: number, offsetPf: number): Promise<OffsetResponse> {
+    return this.post<OffsetResponse>("/api/settings/offsets/cell", { row, col, offsetPf });
+  }
+
+  async clearOffsets(scope: OffsetScope, row?: number, col?: number): Promise<OffsetResponse> {
+    return this.post<OffsetResponse>("/api/settings/offsets/clear", { scope, row, col });
+  }
+
+  async zeroCurrentOffsets(scope: OffsetScope, row?: number, col?: number): Promise<OffsetResponse> {
+    return this.post<OffsetResponse>("/api/settings/offsets/zero-current", { scope, row, col });
+  }
+
+  async exportSession(): Promise<ExportSessionPayload> {
+    return this.get<ExportSessionPayload>("/api/export/session");
   }
 
   private async get<T>(path: string): Promise<T> {

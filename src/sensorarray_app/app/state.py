@@ -8,9 +8,14 @@ from sensorarray_app.domain.models import DisplayMode
 from sensorarray_app.domain.selection import FourPointSelection, default_selection
 
 
+def default_user_offsets_pf() -> list[list[float]]:
+    return [[0.0 for _ in range(8)] for _ in range(8)]
+
+
 @dataclass
 class UiState:
     displayMode: DisplayMode = DisplayMode.ABSOLUTE_C
+    pendingDisplayMode: DisplayMode | None = None
     measurementDomain: str = "auto"
     paused: bool = False
     followLatest: bool = True
@@ -26,3 +31,5 @@ class UiState:
     baselineStatus: str = "Not captured"
     baselineInvalidReason: str = ""
     clearRevision: int = 0
+    trendLatestN: int = 600
+    userOffsetsPf: list[list[float]] = field(default_factory=default_user_offsets_pf)

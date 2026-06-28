@@ -7,7 +7,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from sensorarray_app.app.configuration import AppConfiguration
-from sensorarray_backend.api import routes_replay, routes_rows, routes_settings, routes_status, routes_transport, websocket
+from sensorarray_backend.api import (
+    routes_export,
+    routes_offsets,
+    routes_replay,
+    routes_rows,
+    routes_settings,
+    routes_status,
+    routes_transport,
+    websocket,
+)
 from sensorarray_backend.core.runtime import BackendRuntime
 
 
@@ -38,6 +47,7 @@ def create_app(config: AppConfiguration | None = None) -> FastAPI:
     app.include_router(routes_replay.router)
     app.include_router(routes_rows.router)
     app.include_router(routes_settings.router)
+    app.include_router(routes_offsets.router)
+    app.include_router(routes_export.router)
     app.include_router(websocket.router)
     return app
-

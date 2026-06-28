@@ -14,24 +14,27 @@ def cell_index(cell: str) -> int:
     return (row - 1) * 8 + (detector - 1)
 
 
-def history_payload(runtime, latest_n: int = 600) -> dict:
+def history_payload(runtime, latest_n: int | None = None) -> dict:
     selection = runtime.ui.selection
     cells = list(selection.cells)
     indices = [cell_index(cell) for cell in cells]
-    history = runtime.matrixStore.history.slice(indices, latest_n=latest_n)
-    values = history.values.copy()
-    valid = history.valid.copy()
+    latest = int(latest_n if latest_n is not None else getattr(runtime.ui, "trendLatestN", 600))
+    history = runtime.matrixStore.history.slice(indices, latest_n=latest)
+    offsets = runtime.user_offsets_array().reshape(64)
+    values = history.values.copy() - offsets[indices].reshape(1, len(indices))
+    valid = history.valid.copy() & np.isfinite(values)
     unit = "pF"
     if runtime.ui.displayMode.value == "delta_percent" and runtime.ui.baseline is not None:
         unit = "%"
         all_indices = runtime.matrixStore.history.ordered_indices()
-        if latest_n > 0:
-            all_indices = all_indices[-latest_n:]
-        full_values = runtime.matrixStore.history.values[all_indices, :].copy()
+        if latest > 0:
+            all_indices = all_indices[-latest:]
+        full_values = runtime.matrixStore.history.values[all_indices, :].copy() - offsets.reshape(1, 64)
         delta_values = np.vstack([delta_percent(row, runtime.ui.baseline) for row in full_values]) if full_values.size else full_values
         values = delta_values[:, indices]
         baseline_valid = runtime.ui.baseline.validMask[indices]
-        valid = valid & baseline_valid.reshape(1, len(indices)) & np.isfinite(values)
+        source_valid = runtime.matrixStore.history.valid[np.ix_(all_indices, indices)].copy()
+        valid = source_valid & baseline_valid.reshape(1, len(indices)) & np.isfinite(values)
     series = []
     for column, cell in enumerate(cells):
         points = []
@@ -50,6 +53,7 @@ def history_payload(runtime, latest_n: int = 600) -> dict:
         "title": selection.title,
         "unit": unit,
         "revision": history.revision,
+        "latestN": latest,
         "series": series,
     }
 
@@ -62,4 +66,3 @@ def _json_number(value) -> float | None:
     if not np.isfinite(number):
         return None
     return number
-

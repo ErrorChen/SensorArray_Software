@@ -28,6 +28,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
   const [replayPath, setReplayPath] = useSlot("");
   const [replaySpeed, setReplaySpeed] = useSlot(1);
   const [rows, setRows] = useSlot(8);
+  const [rowsPending, setRowsPending] = useSlot(false);
   const [busyAction, setBusyAction] = useSlot<string | null>(null);
 
   const connection = snapshot?.connection;
@@ -48,6 +49,12 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
       }
     });
   }, [client]);
+
+  useEffect(() => {
+    if (!rowsPending && typeof snapshot?.frame.rows === "number") {
+      setRows(snapshot.frame.rows);
+    }
+  }, [rowsPending, setRows, snapshot?.frame.rows]);
 
   const visibleBleDevices = useMemo(
     () => bleDevices.filter((device) => showAdvancedBle || !device.advanced),
@@ -129,6 +136,23 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
     }
   }
 
+  async function handleRowsChange(nextRows: number): Promise<void> {
+    const previousRows = snapshot?.frame.rows ?? rows;
+    setRows(nextRows);
+    if (!client || rowsPending) {
+      return;
+    }
+    setRowsPending(true);
+    try {
+      await client.setRows(nextRows);
+    } catch (error) {
+      setRows(previousRows);
+      onError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRowsPending(false);
+    }
+  }
+
   function primaryDisabled(): boolean {
     if (!client || busyAction !== null || currentModeBusy) {
       return true;
@@ -187,7 +211,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
             <option value="">Select scanned BLE device</option>
             {visibleBleDevices.map((device) => (
               <option key={device.address} value={device.address}>
-                {device.name || "Unnamed"} - {device.address} - {device.rssi ?? "?"} dBm
+                {device.name || "Unnamed"} - {device.address} - {formatRssi(device.rssi)}
               </option>
             ))}
           </select>
@@ -250,16 +274,16 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
       <div className="controlGroup">
         <div className="panelHeader small">Rows</div>
         <div className="inputRow">
-          <select value={rows} onChange={(event) => setRows(Number(event.target.value))}>
+          <select disabled={!client || rowsPending} value={rows} onChange={(event) => void handleRowsChange(Number(event.target.value))}>
             {[1, 2, 3, 4, 5, 6, 7, 8].map((value) => (
               <option key={value} value={value}>
                 {value}
               </option>
             ))}
           </select>
-          <button onClick={() => void run("Sending...", () => client!.setRows(rows))}>
-            <Rows3 size={16} /> Apply
-          </button>
+          <span className="rowsStatus">
+            <Rows3 size={15} /> {rowsPending ? "Applying rows..." : rowsStatus(snapshot)}
+          </span>
         </div>
       </div>
 
@@ -267,17 +291,21 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
         <div className="panelHeader small">Display</div>
         <label>Mode</label>
         <select
+          disabled={!client}
           value={snapshot?.display.displayMode ?? "absolute_pf"}
-          onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ displayMode: event.target.value as "absolute_pf" | "delta_percent" }))}
+          onChange={(event) =>
+            void run("Saving...", () => client!.setDisplaySettings({ displayMode: event.target.value as "absolute_pf" | "delta_percent" }).then(() => undefined))
+          }
         >
           <option value="absolute_pf">Absolute C</option>
           <option value="delta_percent">Delta C/C0 %</option>
         </select>
+        <div className="baselineStatus">{baselineMessage(snapshot)}</div>
         <label className="checkLine">
           <input
             type="checkbox"
             checked={snapshot?.display.showCellText ?? true}
-            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ showCellText: event.target.checked }))}
+            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ showCellText: event.target.checked }).then(() => undefined))}
           />
           Cell text
         </label>
@@ -285,7 +313,7 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.pauseDisplay ?? false}
-            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ pauseDisplay: event.target.checked }))}
+            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ pauseDisplay: event.target.checked }).then(() => undefined))}
           />
           Pause display
         </label>
@@ -293,15 +321,61 @@ export function SetupPanel({ client, snapshot, onError }: Props): JSX.Element {
           <input
             type="checkbox"
             checked={snapshot?.display.freezeColor ?? false}
-            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ freezeColor: event.target.checked }))}
+            onChange={(event) => void run("Saving...", () => client!.setDisplaySettings({ freezeColor: event.target.checked }).then(() => undefined))}
           />
           Freeze colour
         </label>
         <div className="buttonRow">
-          <button onClick={() => void run("Saving...", () => client!.baseline("capture"))}>Set baseline</button>
-          <button onClick={() => void run("Saving...", () => client!.baseline("reset"))}>Reset</button>
+          <button disabled={!client || snapshot?.baseline.status === "capturing"} onClick={() => void run("Saving...", () => client!.baseline("capture").then(() => undefined))}>
+            Set baseline
+          </button>
+          <button disabled={!client} onClick={() => void run("Saving...", () => client!.baseline("reset").then(() => undefined))}>
+            Reset
+          </button>
         </div>
       </div>
     </section>
   );
+}
+
+function formatRssi(rssi: number | null): string {
+  return typeof rssi === "number" && Number.isFinite(rssi) ? `${rssi} dBm` : "RSSI unavailable";
+}
+
+function rowsStatus(snapshot: BackendSnapshotPayload | null): string {
+  const commands = snapshot?.commands as { requestedRows?: number; activeRows?: number; pendingRows?: number } | undefined;
+  const requested = commands?.requestedRows;
+  const active = commands?.activeRows ?? snapshot?.frame.rows;
+  const pending = commands?.pendingRows;
+  if (typeof pending === "number") {
+    return `requested ${pending}; applied ${active ?? "-"}`;
+  }
+  if (typeof requested === "number") {
+    return `requested ${requested}; applied ${active ?? "-"}`;
+  }
+  return `applied ${active ?? "-"}`;
+}
+
+function baselineMessage(snapshot: BackendSnapshotPayload | null): string {
+  const baseline = snapshot?.baseline;
+  if (!snapshot?.frame.valid && baseline?.status !== "capturing") {
+    return "No data";
+  }
+  if (baseline?.status === "capturing") {
+    const progress = typeof baseline.progress === "number" ? ` ${Math.round(baseline.progress * 100)}%` : "";
+    return `Capturing baseline...${progress}`;
+  }
+  if (baseline?.status === "ready" || baseline?.ready) {
+    return `Ready (${baseline.validCells ?? 0} cells)`;
+  }
+  if (baseline?.status === "invalid") {
+    return `Invalid: ${baseline.invalidReason || "baseline invalid"}`;
+  }
+  if (baseline?.status === "no_data") {
+    return "No data";
+  }
+  if (baseline?.pendingDisplayMode === "delta_percent" || snapshot?.display.pendingDisplayMode === "delta_percent") {
+    return "Delta pending baseline";
+  }
+  return baseline?.label || "Not captured";
 }

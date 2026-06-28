@@ -31,6 +31,7 @@ class BaselineSession:
     measurementDomain: str
     circuitOffsetPf: float
     startMonotonicNs: int
+    userOffsetsPf: np.ndarray | None = None
     durationSeconds: float = BASELINE_DURATION_SECONDS
     minSamples: int = BASELINE_MIN_SAMPLES
     epsilonPf: float = BASELINE_EPSILON_PF
@@ -58,7 +59,10 @@ class BaselineSession:
             self.rejectedFrameCount += 1
             return False
         self.frameCount += 1
-        values = frame.correctedPfValues
+        values = np.asarray(frame.correctedPfValues, dtype=np.float64).copy()
+        if self.userOffsetsPf is not None:
+            offsets = np.asarray(self.userOffsetsPf, dtype=np.float64).reshape(64)
+            values = values - offsets[: len(values)]
         valid = frame.validMask
         for index in range(min(len(values), self.activeRows * 8)):
             value = float(values[index])
