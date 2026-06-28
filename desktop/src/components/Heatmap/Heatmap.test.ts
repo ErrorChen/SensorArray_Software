@@ -14,14 +14,15 @@ describe("Heatmap data helpers", () => {
     expect(data).toHaveLength(64);
     expect(data.find((item) => item[3] === "S1D2")).toEqual([1, 0, null, "S1D2", false]);
 
-    const option = buildDynamicHeatmapOption(snapshot, new Set(["S1D5"])) as {
+    const selected = data[Math.floor(data.length / 8)];
+    const option = buildDynamicHeatmapOption(snapshot, new Set([String(selected[3])])) as {
       series: Array<{ id: string; type: string; data: unknown[]; silent?: boolean }>;
     };
 
     expect(option.series[0].id).toBe("heatmap-values");
     expect(option.series[1].id).toBe("selected-cells");
     expect(option.series[1].silent).toBe(true);
-    expect(option.series[1].data).toEqual([[4, 0]]);
+    expect(option.series[1].data).toEqual([[selected[0], selected[1]]]);
   });
 
   it("maps zrender pointer coordinates to SxDy cells through the chart grid", () => {
@@ -51,15 +52,18 @@ describe("Heatmap data helpers", () => {
 
   it("formats tooltip content from the latest snapshot values", () => {
     const snapshot = makeSnapshot();
-    snapshot.matrix.rawPf[0][4] = 101.2345;
-    snapshot.matrix.correctedPf[0][4] = 99.5;
-    snapshot.matrix.userOffsetPf[0][4] = 1.25;
-    snapshot.matrix.displayValues[0][4] = 99.5;
+    const rowIndex = 0;
+    const colIndex = Math.floor(snapshot.matrix.cols.length / 2);
+    const label = `${snapshot.matrix.rows[rowIndex]}${snapshot.matrix.cols[colIndex]}`;
+    snapshot.matrix.rawPf[rowIndex][colIndex] = 101.2345;
+    snapshot.matrix.correctedPf[rowIndex][colIndex] = 99.5;
+    snapshot.matrix.userOffsetPf[rowIndex][colIndex] = 1.25;
+    snapshot.matrix.displayValues[rowIndex][colIndex] = 99.5;
     snapshot.frame.seq = 123;
 
-    const tooltip = formatHeatmapTooltip({ value: [4, 0, 99.5, "S1D5", 1] } as never, snapshot);
+    const tooltip = formatHeatmapTooltip({ value: [colIndex, rowIndex, 99.5, label, 1] } as never, snapshot);
 
-    expect(tooltip).toContain("<strong>S1D5</strong>");
+    expect(tooltip).toContain(`<strong>${label}</strong>`);
     expect(tooltip).toContain("raw pF: 101.234");
     expect(tooltip).toContain("corrected pF: 99.500");
     expect(tooltip).toContain("seq: 123");
@@ -69,7 +73,7 @@ describe("Heatmap data helpers", () => {
 function makeSnapshot(): BackendSnapshotPayload {
   const numbers = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 0));
   return {
-    connection: { mode: "serial", state: "connected", deviceLabel: "COM12", generation: 1 },
+    connection: { mode: "serial", state: "connected", deviceLabel: "SERIAL_TEST_PORT", generation: 1 },
     frame: { seq: 1, fps: 20, rows: 8, valid: true, timestampUs: 1000, revision: 1 },
     matrix: {
       rows: Array.from({ length: 8 }, (_, index) => `S${index + 1}`),

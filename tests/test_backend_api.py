@@ -16,13 +16,13 @@ def test_serial_ports_are_discovered_not_defaulted(monkeypatch):
     monkeypatch.setattr(
         SerialTransport,
         "list_ports",
-        staticmethod(lambda: [{"device": "COM12", "label": "COM12 - USB Serial", "value": "COM12"}]),
+        staticmethod(lambda: [{"device": "SERIAL_TEST_PORT", "label": "SERIAL_TEST_PORT - USB Serial", "value": "SERIAL_TEST_PORT"}]),
     )
     app = create_app(AppConfiguration())
     with TestClient(app) as client:
         ports = client.get("/api/transport/serial/ports").json()["ports"]
         blank_connect = client.post("/api/transport/serial/connect", json={"port": "", "baud": 115200})
-    assert ports[0]["device"] == "COM12"
+    assert ports[0]["device"] == "SERIAL_TEST_PORT"
     assert blank_connect.status_code == 422
 
 
@@ -72,7 +72,7 @@ def test_transport_write_serial_respects_line_ending():
         runtime = app.state.runtime
         fake = FakeSerialTransport()
         runtime.transport.current = fake
-        runtime.transport.status.update({"transport": "serial", "state": "STREAMING", "device": "COM12"})
+        runtime.transport.status.update({"transport": "serial", "state": "STREAMING", "device": "SERIAL_TEST_PORT"})
         response = client.post("/api/transport/write", json={"text": "PING", "lineEnding": "crlf", "mode": "text"})
     payload = response.json()
     assert payload == {"ok": True, "transport": "serial", "bytesWritten": 6}

@@ -41,13 +41,15 @@ npm run desktop
 Python backend sidecar. Backend-only development is still available:
 
 ```powershell
-.\.venv\Scripts\python.exe -m sensorarray_backend --host 127.0.0.1 --port 6666
+.\.venv\Scripts\python.exe -m sensorarray_backend --host 127.0.0.1 --port 8888
 ```
 
-The backend default port is `6666`. Electron tries `6666`, then `8888`, then
-the first available port from `8750` through `8799` when it starts the sidecar.
-Electron explicitly allows those ports before the renderer starts because
-Chromium otherwise treats `6666` as a restricted port.
+The backend default port is `8888`. Electron starts the Python backend sidecar
+on `127.0.0.1` by trying `8888`, then `8889`, continuing one port at a time
+through `8988`. Each candidate must start the backend and return HTTP 200 from
+`/health`; failed candidates are stopped before the next port is tried. The
+renderer receives the selected `backendUrl` from the load query or Electron
+preload bridge, and all HTTP and WebSocket clients derive from that same URL.
 
 ## Icons
 
@@ -190,6 +192,10 @@ POST /api/setup/profile
 WS   /ws
 ```
 
+`GET /api/transport/serial/ports` returns `{ ok, ports, error }`. Empty
+`ports` is valid when no hardware is attached; `ok: false` indicates a backend
+dependency or platform error such as missing `pyserial`.
+
 Session/Data export and import are intentionally symmetric and support only
 `.csv`, `.xlsx`, `.mat`, and `.h5`. Session/Data JSON export is not provided.
 Legacy replay/raw-log import still supports `.json`, `.jsonl`, `.log`, `.txt`,
@@ -198,7 +204,9 @@ and legacy `.csv` replay files through the Replay flow.
 `POST /api/setup/profile` applies preferences without automatically connecting
 Serial, BLE, or Wi-Fi. Setup profiles are JSON only and include transport
 preferences, row count, display settings, command line ending, offsets, and
-`paths.defaultSaveDirectory`.
+`paths.defaultSaveDirectory`. Importing a profile that names a serial port or
+BLE device that is not currently scanned does not crash or auto-connect; the
+preference remains editable and the user can refresh/scan again.
 
 SetupProfile top-level structure:
 
@@ -260,14 +268,16 @@ The Electron File menu contains:
 - Screenshot / Capture: save a PNG directly to the default save directory.
 
 There is also a top-level `Screenshot / Capture` menu with the screenshot
-shortcut. Screenshot filenames use `Screenshot_CscArray_HHDDMM.png`; if that
-exists, the app extends the name to minute and then second precision before
-adding a numeric suffix as a final fallback.
+shortcut. The Electron main process captures the current window and writes a
+PNG to the default save directory. Screenshot filenames use
+`Screenshot_SensorArray_YYYYMMDD_HHMMSS.png`, with a numeric suffix if needed.
 
 Advanced contains Default Save Directory. It defaults to the runtime directory
 and is used for session export, setup export, and screenshots. The directory is
 stored in local setup profile state and synchronized to the Electron main
-process; non-writable paths show a UI error instead of failing silently.
+process. Browse, Check, Reset, and Open folder are Electron-only preload APIs;
+browser/Vite mode reports that desktop file APIs are unavailable. Non-writable
+or missing paths show a clear UI error instead of failing silently.
 
 CSV files contain one row per frame/cell with columns `frameIndex`, `seq`,
 `timeSeconds`, `rows`, `cell`, `row`, `col`, `correctedPf`, `valid`, and
@@ -342,11 +352,12 @@ baseline with `Baseline invalid: cell offset changed`; capture a new baseline
 before using Delta again.
 
 Offset controls use the existing 8x8 grid. Single click selects a cell and
-updates the readout; double click opens the offset editor for that cell. The
-editor supports Save offset, Zero this cell to current corrected value, Clear
-this cell, Enter to save, and Esc to cancel. Live snapshot refreshes do not
-overwrite a dirty offset input. Batch actions still support zeroing or clearing
-the selected cell, current row, and all cells.
+updates the right-side inline editor; double click selects the cell and focuses
+the Offset pF input. There are no Row/Detector dropdowns and no secondary edit
+dialog. The inline editor supports Save selected offset, Zero selected cell,
+and Clear selected cell. Batch controls below the grid support zeroing or
+clearing the selected cell, current row, and all cells. Live snapshot refreshes
+do not overwrite a dirty offset input.
 
 ## Write / Command
 
@@ -394,6 +405,14 @@ streaming. The backend also rejects `/api/transport/ble/scan` in that state with
 BLE scan is disabled while connected; disconnect first.
 ```
 
+`GET /api/transport/ble/scan?timeout=10` keeps discovery state at `scanning`
+until the scan finishes or a platform error is returned. Responses include
+`ok`, `devices`, `advancedDevices`, `error`, `state`, and `durationMs`. Verified
+devices are promoted by protocol/service/name pattern; Advanced devices exposes
+unverified candidates and diagnostic reasons. If `bleak` is unavailable or the
+adapter/permissions fail, the UI shows the backend error instead of reducing it
+to an empty list.
+
 BLE notify channels are normalized before routing:
 
 - `data`, `d`, `cap`, `caps`, `c`, `capacitance` -> `data`
@@ -422,8 +441,10 @@ resolve a value; it should not show `? dBm`.
 
 ## Transport Notes
 
-Serial ports are discovered with `serial.tools.list_ports.comports()`. COM12 is
-only a hardware validation example and is not hardcoded.
+Serial ports are discovered with `serial.tools.list_ports.comports()`. The
+Serial setup field is an input with a datalist, so a scanned port can be chosen
+or any port name can be typed manually. If `pyserial` is unavailable, the
+serial ports API returns `ok: false` with an explanatory error.
 
 Wi-Fi UDP keeps DATA, LOG, and CTRL channels separate. Command write uses the
 CTRL UDP port when Wi-Fi is active.
@@ -471,18 +492,22 @@ npm.cmd run build
 Serial:
 
 1. Select Serial.
-2. Select the scanned hardware port, for example COM12 if present.
+2. Refresh ports and select a dynamically scanned hardware port if present.
+   If no ports are found, type a port name manually to verify the UI path.
 3. Baud 115200.
-4. Connect and run for at least 120 seconds.
+4. If hardware is available, connect and run for at least 120 seconds.
 5. Verify heatmap data, trend data after cell selection, Auto/Freeze colour,
    both splitters, command TX log, and Disconnect returning to Connect.
 
 BLE:
 
 1. Select Bluetooth LE.
-2. Scan, select the SensorArray device, then Connect.
-3. Run for at least 120 seconds.
-4. Verify BLE connected/streaming, Scan disabled, no repeated scan found logs,
+2. Scan with the default timeout and select the first verified SensorArray
+   device if one is found.
+3. If no verified device is found, enable Advanced devices and verify candidate
+   reasons or the backend error are visible.
+4. If hardware is available, connect and run for at least 120 seconds.
+5. Verify BLE connected/streaming, Scan disabled, no repeated scan found logs,
    `BLE_RX50` / `BLE_FRAG50` / `PROTO50`, heatmap/trend data, clear command
    write success or missing-ctrl error, and graceful Disconnect.
 

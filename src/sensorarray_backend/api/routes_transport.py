@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -50,7 +51,10 @@ def set_mode(body: ModeRequest, runtime: BackendRuntime = Depends(get_runtime)) 
 
 @router.get("/serial/ports")
 def serial_ports(runtime: BackendRuntime = Depends(get_runtime)) -> dict:
-    return {"ports": runtime.list_serial_ports()}
+    try:
+        return {"ok": True, "ports": runtime.list_serial_ports(), "error": ""}
+    except Exception as exc:
+        return {"ok": False, "ports": [], "error": str(exc)}
 
 
 @router.post("/serial/connect")
@@ -64,13 +68,32 @@ def serial_connect(body: SerialConnectRequest, runtime: BackendRuntime = Depends
 
 @router.get("/ble/scan")
 async def ble_scan(timeout: float = 10.0, runtime: BackendRuntime = Depends(get_runtime)) -> dict[str, Any]:
+    started = time.perf_counter()
     try:
         devices = await asyncio.to_thread(runtime.scan_ble_once, timeout)
-        return {"devices": devices, "state": runtime.discovery_payload()["bleState"]}
+        state = runtime.discovery_payload()["bleState"]
+        error = state.removeprefix("failed: ").strip() if state.startswith("failed: ") else ""
+        return {
+            "ok": not error,
+            "devices": devices,
+            "advancedDevices": [device for device in devices if device.get("advanced")],
+            "error": error,
+            "state": state,
+            "durationMs": int((time.perf_counter() - started) * 1000),
+        }
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        state = runtime.discovery_payload()["bleState"]
+        error = str(exc)
+        return {
+            "ok": False,
+            "devices": [],
+            "advancedDevices": [],
+            "error": error,
+            "state": state if state.startswith("failed: ") else f"failed: {error}",
+            "durationMs": int((time.perf_counter() - started) * 1000),
+        }
 
 
 @router.post("/ble/connect")

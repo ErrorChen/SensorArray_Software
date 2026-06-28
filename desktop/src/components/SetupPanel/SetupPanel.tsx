@@ -32,6 +32,11 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
   const [rows, setRows] = useSlot(8);
   const [rowsPending, setRowsPending] = useSlot(false);
   const [busyAction, setBusyAction] = useSlot<string | null>(null);
+  const [serialScanStatus, setSerialScanStatus] = useSlot("");
+  const [serialScanError, setSerialScanError] = useSlot("");
+  const [bleScanning, setBleScanning] = useSlot(false);
+  const [bleScanError, setBleScanError] = useSlot("");
+  const [bleScanSummary, setBleScanSummary] = useSlot("");
 
   const connection = snapshot?.connection;
   const connectionMode = connection?.mode;
@@ -102,10 +107,21 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
     if (!client) {
       return;
     }
-    const ports = await client.listSerialPorts();
-    setSerialPorts(ports);
-    if (!selectedPort && ports.length === 1) {
-      setSelectedPort(ports[0].device);
+    setSerialScanStatus("Scanning serial ports...");
+    setSerialScanError("");
+    const response = await client.listSerialPorts();
+    setSerialPorts(response.ports);
+    if (!response.ok) {
+      setSerialScanStatus("");
+      setSerialScanError(response.error || "Serial port scan failed");
+      return;
+    }
+    setSerialScanStatus(response.ports.length ? `Found ${response.ports.length} serial port${response.ports.length === 1 ? "" : "s"}` : "No serial ports found; enter a port manually.");
+    const currentPort = selectedPort || setupProfile.transport.serial.port || "";
+    if (!currentPort && response.ports.length === 1) {
+      const port = response.ports[0].device;
+      setSelectedPort(port);
+      updateTransportProfile({ serial: { ...setupProfile.transport.serial, port } });
     }
   }
 
@@ -113,13 +129,32 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
     if (!client || bleScanDisabled) {
       return;
     }
-    const devices = await client.scanBle();
-    setBleDevices(devices);
-    const firstVerified = devices.find((device) => device.verified || !device.advanced);
-    const address = selectedBle || firstVerified?.address || "";
-    setSelectedBle(address);
-    if (address) {
-      updateTransportProfile({ ble: { ...setupProfile.transport.ble, address, deviceId: address } });
+    setBleScanning(true);
+    setBleScanError("");
+    setBleScanSummary("scanning");
+    try {
+      const response = await client.scanBle(10);
+      const devices = mergeBleDevices(response.devices, response.advancedDevices);
+      setBleDevices(devices);
+      const verifiedDevices = devices.filter((device) => !device.advanced);
+      const advancedDevices = devices.filter((device) => device.advanced);
+      if (!response.ok || response.error) {
+        setBleScanError(formatBleScanError(response.error || "BLE scan failed"));
+      } else if (verifiedDevices.length === 0 && advancedDevices.length > 0) {
+        setBleScanSummary("No verified SensorArray device found; enable Advanced devices to inspect all BLE candidates.");
+      } else {
+        setBleScanSummary(response.state || `found ${verifiedDevices.length} devices`);
+      }
+      const firstVerified = verifiedDevices.find((device) => device.verified) ?? verifiedDevices[0];
+      const address = selectedBle || firstVerified?.address || "";
+      setSelectedBle(address);
+      if (address && !selectedBle) {
+        updateTransportProfile({ ble: { ...setupProfile.transport.ble, address, deviceId: address } });
+      }
+    } catch (error) {
+      setBleScanError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBleScanning(false);
     }
   }
 
@@ -212,25 +247,26 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         <div className="modePanel">
           <label>Port</label>
           <div className="inputRow">
-            <select
+            <input
+              list="serial-port-options"
               value={selectedPort}
               onChange={(event) => {
                 const port = event.target.value;
                 setSelectedPort(port);
                 updateTransportProfile({ serial: { ...setupProfile.transport.serial, port } });
               }}
-            >
-              <option value="">Select scanned port</option>
+              placeholder="Enter or select a serial port"
+            />
+            <datalist id="serial-port-options">
               {serialPorts.map((port) => (
-                <option key={port.device} value={port.device}>
-                  {port.label}
-                </option>
+                <option key={port.device} value={port.device} label={port.label} />
               ))}
-            </select>
+            </datalist>
             <button title="Refresh ports" onClick={() => void run("Scanning...", refreshSerialPorts)}>
               <RefreshCw size={16} />
             </button>
           </div>
+          {serialScanError ? <div className="inlineError compactMessage">{serialScanError}</div> : <div className="scanState">{serialScanStatus}</div>}
           <label>Baud</label>
           <input
             value={baud}
@@ -258,7 +294,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
           >
             <option value="">Select scanned BLE device</option>
             {visibleBleDevices.map((device) => (
-              <option key={device.address} value={device.address}>
+              <option key={device.address || `${device.name}-${device.reason}-${device.matchReason}`} value={device.address}>
                 {device.name || "Unnamed"} - {device.address} - {formatRssi(device.rssi)}
               </option>
             ))}
@@ -267,9 +303,22 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
             <input type="checkbox" checked={showAdvancedBle} onChange={(event) => setShowAdvancedBle(event.target.checked)} />
             Advanced devices
           </label>
-          <div className="scanState">{bleScanDisabled ? "BLE scan disabled while connected" : snapshot?.discovery.bleState ?? "idle"}</div>
-          <button disabled={bleScanDisabled || busyAction !== null} onClick={() => void run("Scanning...", scanBle)}>
-            <Bluetooth size={16} /> {busyAction === "Scanning..." ? "Scanning..." : "Scan"}
+          <div className={bleScanError ? "inlineError compactMessage" : "scanState"}>
+            {bleScanDisabled ? "BLE scan disabled while connected; disconnect first." : bleScanError || bleScanSummary || snapshot?.discovery.bleState || "idle"}
+          </div>
+          {visibleBleDevices.length ? (
+            <div className="candidateList">
+              {visibleBleDevices.map((device) => (
+                <div key={device.address || `${device.name}-${device.reason}`} className="candidateRow">
+                  <strong>{device.name || "Unnamed"}</strong>
+                  <span>{device.address || "no address"}</span>
+                  <span>{device.advanced ? device.reason || device.matchReason || "advanced candidate" : device.reason || device.matchReason || "verified candidate"}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <button disabled={bleScanDisabled || bleScanning || !client} onClick={() => void scanBle()}>
+            <Bluetooth size={16} /> {bleScanning ? "Scanning..." : "Scan"}
           </button>
         </div>
       ) : null}
@@ -448,6 +497,21 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
 
 function formatRssi(rssi: number | null): string {
   return typeof rssi === "number" && Number.isFinite(rssi) ? `${rssi} dBm` : "RSSI unavailable";
+}
+
+function mergeBleDevices(devices: BleDevice[], advancedDevices: BleDevice[] | undefined): BleDevice[] {
+  const byKey = new Map<string, BleDevice>();
+  for (const device of [...devices, ...(advancedDevices ?? [])]) {
+    const key = device.address || `${device.name}-${device.reason}-${device.matchReason}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, device);
+    }
+  }
+  return [...byKey.values()];
+}
+
+function formatBleScanError(error: string): string {
+  return error.toLowerCase().includes("bleak unavailable") ? `BLE backend unavailable: ${error}` : error;
 }
 
 function rowsStatus(snapshot: BackendSnapshotPayload | null): string {

@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState as useSlot } from "re
 import type { PointerEvent as ReactPointerEvent, RefObject } from "react";
 
 import { BackendHttpClient } from "./api/httpClient";
+import { resolveBackendUrl } from "./api/backendUrl";
 import { SnapshotWebSocket } from "./api/websocketClient";
-import type { BackendSnapshotPayload, HistoryPayload, SelectionSnapshot, WebSocketMessage } from "./api/types";
+import type { BackendSnapshotPayload, DesktopActionResult, HistoryPayload, SelectionSnapshot, WebSocketMessage } from "./api/types";
 import { AdvancedPanel } from "./components/AdvancedPanel/AdvancedPanel";
 import { CommandPanel } from "./components/CommandPanel/CommandPanel";
 import { Heatmap } from "./components/Heatmap/Heatmap";
@@ -44,15 +45,12 @@ export function App(): JSX.Element {
   const selectionRequestSeqRef = useRef(0);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const queryUrl = params.get("backendUrl");
-    if (queryUrl) {
-      setBackendUrl(queryUrl);
-    } else if (window.sensorarrayDesktop) {
-      void window.sensorarrayDesktop.getBackendUrl().then((url) => setBackendUrl(url));
-    } else {
-      setBackendUrl("http://127.0.0.1:6666");
-    }
+    void resolveBackendUrl()
+      .then((url) => {
+        setBackendUrl(url);
+        setError((current) => (isBackendError(current) ? null : current));
+      })
+      .catch((backendError) => setError(backendError instanceof Error ? backendError.message : String(backendError)));
     void (async () => {
       const runtime = (await window.sensorarrayDesktop?.getRuntimeDirectory()) || ".";
       setRuntimeDirectory(runtime);
@@ -116,7 +114,13 @@ export function App(): JSX.Element {
     }
     const socket = new SnapshotWebSocket(backendUrl, {
       onMessage: handleMessage,
-      onConnectionStatus: setSocketState
+      onConnectionStatus: (status) => {
+        setSocketState(status);
+        if (status === "connected") {
+          setError((current) => (isBackendError(current) ? null : current));
+        }
+      },
+      onError: setError
     });
     socket.start();
     return () => socket.stop();
@@ -155,12 +159,11 @@ export function App(): JSX.Element {
     const importSessionData = () => void handleImportSessionData(client);
     const exportSetupProfile = () => void handleExportSetupProfile();
     const importSetupProfile = () => void handleImportSetupProfile(client);
-    const captureScreenshot = () => void handleCaptureScreenshot();
     const removeImportSession = window.sensorarrayDesktop?.onImportSessionData(importSessionData);
     const removeExport = window.sensorarrayDesktop?.onExportSessionData(exportSessionData);
     const removeImportSetup = window.sensorarrayDesktop?.onImportSetupProfile(importSetupProfile);
     const removeExportSetup = window.sensorarrayDesktop?.onExportSetupProfile(exportSetupProfile);
-    const removeScreenshot = window.sensorarrayDesktop?.onCaptureScreenshot(captureScreenshot);
+    const removeScreenshot = window.sensorarrayDesktop?.onScreenshotResult?.(handleScreenshotResult);
     return () => {
       removeImport?.();
       removeImportSession?.();
@@ -285,6 +288,16 @@ export function App(): JSX.Element {
     }
   }
 
+  function handleScreenshotResult(result: DesktopActionResult): void {
+    if (result.ok) {
+      setError(null);
+      setNotice(`Screenshot saved: ${result.path}`);
+      return;
+    }
+    setNotice(null);
+    setError(result.error || "screenshot failed");
+  }
+
   const setFreezeColor = useCallback(
     async (freezeColor: boolean) => {
       try {
@@ -390,6 +403,10 @@ export function App(): JSX.Element {
       </main>
     </div>
   );
+}
+
+function isBackendError(value: string | null): boolean {
+  return Boolean(value?.startsWith("Backend ") || value?.startsWith("Legacy unsafe backend port"));
 }
 
 function selectionFromCell(cell: string, current: SelectionSnapshot | undefined): SelectionSnapshot {

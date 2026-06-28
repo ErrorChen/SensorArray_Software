@@ -14,7 +14,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "b41"
 
 
 def envelope(payload: bytes, ns: int = 1_000_000_000) -> TransportEnvelope:
-    return TransportEnvelope("serial", "data", "COM12", 1, ns, time.time(), payload)
+    return TransportEnvelope("serial", "data", "SERIAL_TEST_PORT", 1, ns, time.time(), payload)
 
 
 def parse_fixture(name: str) -> list:

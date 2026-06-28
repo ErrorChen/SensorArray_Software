@@ -33,7 +33,7 @@ describe("OffsetPanel helpers", () => {
 function makeSnapshot(): BackendSnapshotPayload {
   const numbers = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 0));
   return {
-    connection: { mode: "serial", state: "connected", deviceLabel: "COM12", generation: 1 },
+    connection: { mode: "serial", state: "connected", deviceLabel: "SERIAL_TEST_PORT", generation: 1 },
     frame: { seq: 1, fps: 20, rows: 8, valid: true, timestampUs: 1000, revision: 1 },
     matrix: {
       rows: Array.from({ length: 8 }, (_, index) => `S${index + 1}`),

@@ -5,8 +5,11 @@ import http from "node:http";
 import net from "node:net";
 import path from "node:path";
 
+import { buildBackendPortCandidates, defaultBackendHost } from "./backendPortPolicy.js";
+
 export type BackendProcess = {
   child: ChildProcessWithoutNullStreams;
+  host: string;
   port: number;
   url: string;
   stdout: string[];
@@ -19,21 +22,64 @@ export type BackendProcess = {
 
 export type BackendStartOptions = {
   projectRoot: string;
+  host?: string;
   port: number;
   isPackaged: boolean;
   resourcesPath: string;
 };
 
-export async function findAvailablePort(preferredPorts: number[] = [6666, 8888, ...Array.from({ length: 50 }, (_, index) => 8750 + index)]): Promise<number> {
-  for (const port of preferredPorts) {
-    if (await canListen(port)) {
-      return port;
+export type BackendStartWithHealthyPortOptions = Omit<BackendStartOptions, "port"> & {
+  ports?: number[];
+  healthTimeoutMs?: number;
+};
+
+type BackendPortFailure = {
+  port: number;
+  reason: string;
+  stdout: string;
+  stderr: string;
+};
+
+export class BackendStartError extends Error {
+  constructor(public readonly failures: BackendPortFailure[]) {
+    super(formatBackendStartFailures(failures));
+    this.name = "BackendStartError";
+  }
+}
+
+export async function startBackendWithFirstHealthyPort(options: BackendStartWithHealthyPortOptions): Promise<BackendProcess> {
+  const host = options.host ?? defaultBackendHost;
+  const ports = options.ports ?? buildBackendPortCandidates();
+  const failures: BackendPortFailure[] = [];
+  for (const port of ports) {
+    const bindCheck = await canBindPort(host, port);
+    if (!bindCheck.ok) {
+      failures.push({ port, reason: bindCheck.reason, stdout: "", stderr: "" });
+      continue;
+    }
+
+    let backend: BackendProcess | null = null;
+    try {
+      backend = startBackend({ ...options, host, port });
+      await waitForHealth(backend, options.healthTimeoutMs ?? 15000);
+      console.log(`[backend] selected ${backend.url}`);
+      return backend;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failures.push({
+        port,
+        reason,
+        stdout: backend?.stdout.join("").slice(-2000) ?? "",
+        stderr: backend?.stderr.join("").slice(-4000) ?? ""
+      });
+      await stopBackendProcess(backend);
     }
   }
-  throw new Error(`No available backend port from ${preferredPorts.join(", ")}`);
+  throw new BackendStartError(failures);
 }
 
 export function startBackend(options: BackendStartOptions): BackendProcess {
+  const host = options.host ?? defaultBackendHost;
   const command = resolveBackendCommand(options);
   const child = spawn(command.executable, command.args, {
     cwd: command.cwd,
@@ -44,8 +90,9 @@ export function startBackend(options: BackendStartOptions): BackendProcess {
   const stderr: string[] = [];
   const backend: BackendProcess = {
     child,
+    host,
     port: options.port,
-    url: `http://127.0.0.1:${options.port}`,
+    url: `http://${host}:${options.port}`,
     stdout,
     stderr,
     exited: false,
@@ -79,7 +126,7 @@ export async function waitForHealth(processInfo: BackendProcess, timeoutMs = 150
     }
     try {
       const statusCode = await requestHealthStatus(`${processInfo.url}/health`);
-      if (statusCode >= 200 && statusCode < 300) {
+      if (statusCode === 200) {
         return;
       }
       lastError = `HTTP ${statusCode}`;
@@ -102,6 +149,32 @@ export function stopBackend(processInfo: BackendProcess | null): void {
   }
 }
 
+export async function stopBackendProcess(processInfo: BackendProcess | null, timeoutMs = 3000): Promise<void> {
+  if (!processInfo || processInfo.exited || processInfo.child.killed) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      try {
+        processInfo.child.kill("SIGKILL");
+      } catch {
+        // The process may have exited before the forced kill request.
+      }
+      resolve();
+    }, timeoutMs);
+    processInfo.child.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    try {
+      processInfo.child.kill();
+    } catch {
+      clearTimeout(timeout);
+      resolve();
+    }
+  });
+}
+
 type BackendCommand = {
   executable: string;
   args: string[];
@@ -110,7 +183,7 @@ type BackendCommand = {
 };
 
 function resolveBackendCommand(options: BackendStartOptions): BackendCommand {
-  const args = ["--host", "127.0.0.1", "--port", String(options.port)];
+  const args = ["--host", options.host ?? defaultBackendHost, "--port", String(options.port)];
   if (options.isPackaged) {
     const backendExe = path.join(options.resourcesPath, "backend", "SensorArrayBackend.exe");
     if (!existsSync(backendExe)) {
@@ -171,13 +244,26 @@ function formatBackendExit(processInfo: BackendProcess): string {
   return `Backend exited before becoming healthy (code=${code}, signal=${signal})`;
 }
 
-function canListen(port: number): Promise<boolean> {
+export function canBindPort(host: string, port: number): Promise<{ ok: true } | { ok: false; reason: string }> {
   return new Promise((resolve) => {
     const server = net.createServer();
-    server.once("error", () => resolve(false));
+    server.once("error", (error: NodeJS.ErrnoException) => resolve({ ok: false, reason: error.code ? `${error.code}: ${error.message}` : error.message }));
     server.once("listening", () => {
-      server.close(() => resolve(true));
+      server.close(() => resolve({ ok: true }));
     });
-    server.listen(port, "127.0.0.1");
+    server.listen(port, host);
   });
+}
+
+function formatBackendStartFailures(failures: BackendPortFailure[]): string {
+  const lines = failures.map((failure) => {
+    const stderr = failure.stderr ? ` stderr=${summarizeLine(failure.stderr)}` : "";
+    const stdout = failure.stdout ? ` stdout=${summarizeLine(failure.stdout)}` : "";
+    return `${failure.port}: ${failure.reason}${stderr}${stdout}`;
+  });
+  return `No healthy backend port found from 8888 through 8988.\n${lines.join("\n")}`;
+}
+
+function summarizeLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(-700);
 }

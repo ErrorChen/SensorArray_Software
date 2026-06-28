@@ -1,12 +1,12 @@
 import type {
   BaselineSnapshot,
-  BleDevice,
+  BleScanResponse,
   DisplayMode,
   HistoryPayload,
   OffsetResponse,
   OffsetScope,
   RowsResponse,
-  SerialPort,
+  SerialPortsResponse,
   SessionDataFormat,
   SetupProfile,
   SetupProfileApplyResponse,
@@ -15,26 +15,38 @@ import type {
   WriteCommandRequest,
   WriteCommandResponse
 } from "./types";
+import { normaliseBackendUrl } from "./backendUrl";
 
 export class BackendHttpClient {
-  constructor(private readonly baseUrl: string) {}
+  private readonly baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = normaliseBackendUrl(baseUrl);
+  }
 
   async setMode(mode: TransportMode): Promise<void> {
     await this.post("/api/transport/mode", { mode });
   }
 
-  async listSerialPorts(): Promise<SerialPort[]> {
-    const payload = await this.get<{ ports: SerialPort[] }>("/api/transport/serial/ports");
-    return payload.ports;
+  async listSerialPorts(): Promise<SerialPortsResponse> {
+    const payload = await this.get<SerialPortsResponse>("/api/transport/serial/ports");
+    return { ok: payload.ok !== false, ports: payload.ports ?? [], error: payload.error ?? "" };
   }
 
   async connectSerial(port: string, baud: number): Promise<void> {
     await this.post("/api/transport/serial/connect", { port, baud });
   }
 
-  async scanBle(): Promise<BleDevice[]> {
-    const payload = await this.get<{ devices: BleDevice[] }>("/api/transport/ble/scan");
-    return payload.devices;
+  async scanBle(timeoutSeconds = 10): Promise<BleScanResponse> {
+    const payload = await this.get<BleScanResponse>(`/api/transport/ble/scan?timeout=${encodeURIComponent(String(timeoutSeconds))}`);
+    return {
+      ok: payload.ok !== false,
+      devices: payload.devices ?? [],
+      advancedDevices: payload.advancedDevices ?? [],
+      error: payload.error ?? "",
+      state: payload.state,
+      durationMs: payload.durationMs
+    };
   }
 
   async connectBle(address: string, deviceId = ""): Promise<void> {
@@ -115,11 +127,14 @@ export class BackendHttpClient {
   }
 
   async exportSession(format: SessionDataFormat): Promise<ArrayBuffer> {
-    const response = await fetch(`${this.baseUrl}/api/export/session?format=${encodeURIComponent(format)}`);
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(text || `HTTP ${response.status}`);
+    const url = this.url(`/api/export/session?format=${encodeURIComponent(format)}`);
+    let response: Response;
+    try {
+      response = await fetch(url);
+    } catch (error) {
+      throw new Error(formatBackendError(this.baseUrl, `/api/export/session`, error));
     }
+    await assertHttpOk(response, url);
     return response.arrayBuffer();
   }
 
@@ -136,24 +151,77 @@ export class BackendHttpClient {
   }
 
   private async get<T>(path: string): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`);
-    return this.decode<T>(response);
+    const url = this.url(path);
+    let response: Response;
+    try {
+      response = await fetch(url);
+    } catch (error) {
+      throw new Error(formatBackendError(this.baseUrl, path, error));
+    }
+    return this.decode<T>(response, url);
   }
 
   private async post<T = unknown>(path: string, body: unknown): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    return this.decode<T>(response);
+    const url = this.url(path);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    } catch (error) {
+      throw new Error(formatBackendError(this.baseUrl, path, error));
+    }
+    return this.decode<T>(response, url);
   }
 
-  private async decode<T>(response: Response): Promise<T> {
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(text || `HTTP ${response.status}`);
-    }
+  private async decode<T>(response: Response, url: string): Promise<T> {
+    await assertHttpOk(response, url);
     return (await response.json()) as T;
+  }
+
+  private url(path: string): string {
+    if (!this.baseUrl) {
+      throw new Error("Backend URL is not resolved");
+    }
+    if (this.baseUrl.includes(":6666")) {
+      throw new Error("Legacy unsafe backend port 6666 is still in use; check backend port policy.");
+    }
+    return `${this.baseUrl}${path}`;
+  }
+}
+
+export function formatBackendError(baseUrl: string, path: string, error: unknown): string {
+  if (!baseUrl) {
+    return "Backend URL is not resolved";
+  }
+  const url = `${baseUrl}${path}`;
+  if (baseUrl.includes(":6666")) {
+    return "Legacy unsafe backend port 6666 is still in use; check backend port policy.";
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return `Backend unreachable at ${url}: ${message}`;
+}
+
+async function assertHttpOk(response: Response, url: string): Promise<void> {
+  if (response.ok) {
+    return;
+  }
+  const detail = await responseDetail(response);
+  throw new Error(`Backend HTTP ${response.status} at ${url}: ${detail || response.statusText || "request failed"}`);
+}
+
+async function responseDetail(response: Response): Promise<string> {
+  const text = await response.text();
+  if (!text) {
+    return "";
+  }
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown; error?: unknown; message?: unknown };
+    const detail = parsed.detail ?? parsed.error ?? parsed.message;
+    return typeof detail === "string" ? detail : JSON.stringify(detail ?? parsed);
+  } catch {
+    return text;
   }
 }

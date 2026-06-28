@@ -193,8 +193,13 @@ class BackendRuntime(SensorArrayRuntime):
         self._discovery_state["ble"] = "scanning"
         try:
             self._ble_scan_results = [asdict(item) for item in scan_ble(timeout_seconds)]
-            self._discovery_state["ble"] = f"found {len(self._ble_scan_results)} devices"
-            self._host_log("Discovery", "info", f"BLE scan found {len(self._ble_scan_results)} devices")
+            diagnostic_error = _ble_diagnostic_error(self._ble_scan_results)
+            if diagnostic_error:
+                self._discovery_state["ble"] = f"failed: {diagnostic_error}"
+                self._host_log("Discovery", "error", f"BLE scan failed: {diagnostic_error}")
+            else:
+                self._discovery_state["ble"] = f"found {len(self._ble_scan_results)} devices"
+                self._host_log("Discovery", "info", f"BLE scan found {len(self._ble_scan_results)} devices")
             return list(self._ble_scan_results)
         except Exception as exc:
             self._discovery_state["ble"] = f"failed: {exc}"
@@ -620,6 +625,16 @@ class BackendRuntime(SensorArrayRuntime):
 
 def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[:limit] + "..."
+
+
+def _ble_diagnostic_error(results: list[dict[str, Any]]) -> str:
+    if len(results) != 1:
+        return ""
+    candidate = results[0]
+    reason = str(candidate.get("reason") or "").strip()
+    if candidate.get("address") or not candidate.get("advanced") or not reason:
+        return ""
+    return reason
 
 
 def _row_index(row: int) -> int:

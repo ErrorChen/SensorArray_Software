@@ -69,7 +69,7 @@ class SerialTransport:
     @staticmethod
     def list_ports() -> list[dict[str, str]]:
         if list_ports is None:
-            return []
+            raise RuntimeError("pyserial is not installed or serial.tools.list_ports is unavailable")
         ports: list[dict[str, str]] = []
         for item in list_ports.comports():
             ports.append(

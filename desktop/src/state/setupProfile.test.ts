@@ -49,7 +49,7 @@ describe("setup profile", () => {
 
   it("exports display and offsets from the current snapshot without losing transport preferences", () => {
     const current = defaultSetupProfile("C:/runtime");
-    current.transport.serial = { port: "COM12", baud: 921600 };
+    current.transport.serial = { port: "SERIAL_TEST_PORT", baud: 921600 };
     const snapshot = makeSnapshot();
     snapshot.frame.rows = 2;
     snapshot.display.displayMode = "delta_percent";
@@ -57,7 +57,7 @@ describe("setup profile", () => {
 
     const profile = setupProfileFromSnapshot(snapshot, current);
 
-    expect(profile.transport.serial).toEqual({ port: "COM12", baud: 921600 });
+    expect(profile.transport.serial).toEqual({ port: "SERIAL_TEST_PORT", baud: 921600 });
     expect(profile.acquisition.rows).toBe(2);
     expect(profile.display.displayMode).toBe("delta_percent");
     expect(profile.offsetsPf[0][0]).toBe(7.5);

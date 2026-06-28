@@ -219,14 +219,14 @@ Invoke-Step "Smoke test Python backend sidecar" {
     if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force }
 
     $backendProcess = Start-Process -FilePath $BackendExe `
-        -ArgumentList @("--host", "127.0.0.1", "--port", "6666") `
+        -ArgumentList @("--host", "127.0.0.1", "--port", "8888") `
         -WorkingDirectory (Split-Path -Parent $BackendExe) `
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath `
         -PassThru
     try {
-        Wait-BackendHealth -Url "http://127.0.0.1:6666/health" -Process $backendProcess -StderrPath $stderrPath
+        Wait-BackendHealth -Url "http://127.0.0.1:8888/health" -Process $backendProcess -StderrPath $stderrPath
     } finally {
         if ($backendProcess -and -not $backendProcess.HasExited) {
             Stop-Process -Id $backendProcess.Id -Force

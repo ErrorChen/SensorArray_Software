@@ -18,7 +18,7 @@ def make_frame(seq: int, ns: int, values: list[float]) -> CapacitanceFrame:
     raw_pf = raw_fixed.astype(float) / 1_000_000.0
     corrected = np.asarray(values, dtype=np.float64)
     valid = np.ones(len(values), dtype=bool)
-    return CapacitanceFrame(seq, seq, 1, 8, 2, 7, 1, 1, 1, 0, 0, 0, raw_fixed, raw_pf, corrected, valid, "serial", 1, time.time(), ns, "COM12")
+    return CapacitanceFrame(seq, seq, 1, 8, 2, 7, 1, 1, 1, 0, 0, 0, raw_fixed, raw_pf, corrected, valid, "serial", 1, time.time(), ns, "SERIAL_TEST_PORT")
 
 
 def test_capacitance_conversion_and_offset():
@@ -57,7 +57,7 @@ def test_selection_primary_secondary_and_inactive():
 
 
 def test_baseline_two_second_window_median_and_percent():
-    session = BaselineSession(1, "serial", "COM12", 1, 2, 7, "capacitance", 33.0, 1_000_000_000)
+    session = BaselineSession(1, "serial", "SERIAL_TEST_PORT", 1, 2, 7, "capacitance", 33.0, 1_000_000_000)
     session.add_frame(make_frame(1, 900_000_000, [1.0] * 8))
     session.add_frame(make_frame(2, 1_100_000_000, [10.0] * 8))
     session.add_frame(make_frame(3, 1_200_000_000, [12.0] * 8))

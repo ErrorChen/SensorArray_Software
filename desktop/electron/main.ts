@@ -11,14 +11,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { BackendProcess, findAvailablePort, startBackend, stopBackend, waitForHealth } from "./backendProcess.js";
+import type { BackendProcess } from "./backendProcess.js";
+import { startBackendWithFirstHealthyPort, stopBackend } from "./backendProcess.js";
+import { buildBackendPortCandidates, defaultBackendHost } from "./backendPortPolicy.js";
 
 const { app, BrowserWindow, Menu, dialog, ipcMain } = electron;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
 const appId = "au.edu.sydney.sensorarray";
-const backendPortCandidates = [6666, 8888, ...Array.from({ length: 50 }, (_, index) => 8750 + index)];
+const backendPortCandidates = buildBackendPortCandidates();
 
 let backend: BackendProcess | null = null;
 let mainWindow: BrowserWindowType | null = null;
@@ -27,7 +29,12 @@ let defaultSaveDirectory = resolveRuntimeDirectory();
 app.setAppUserModelId(appId);
 app.commandLine.appendSwitch("explicitly-allowed-ports", backendPortCandidates.join(","));
 
-ipcMain.handle("backend:url", () => backend?.url ?? "http://127.0.0.1:6666");
+ipcMain.handle("backend:url", () => {
+  if (!backend) {
+    throw new Error("Backend is not ready");
+  }
+  return backend.url;
+});
 ipcMain.handle("runtime:directory", () => resolveRuntimeDirectory());
 ipcMain.handle("paths:getDefaultSaveDirectory", () => defaultSaveDirectory);
 ipcMain.handle("paths:setDefaultSaveDirectory", async (_event, directory: string) => {
@@ -176,16 +183,24 @@ ipcMain.handle("file:readText", async (_event, filePath: string) => fs.promises.
 ipcMain.handle("screenshot:capture", async () => captureScreenshot());
 
 async function createWindow(): Promise<void> {
-  const port = await findAvailablePort(backendPortCandidates);
   try {
-    backend = startBackend({
+    backend = await startBackendWithFirstHealthyPort({
       projectRoot: repoRoot,
-      port,
+      host: defaultBackendHost,
+      ports: backendPortCandidates,
       isPackaged: app.isPackaged,
       resourcesPath: process.resourcesPath
     });
-    await waitForHealth(backend);
   } catch (error) {
+    await showBackendError(error);
+    return;
+  }
+
+  const preloadPath = resolvePreloadPath();
+  if (!fs.existsSync(preloadPath)) {
+    const error = new Error(`Electron preload file was not found: ${preloadPath}`);
+    stopBackend(backend);
+    backend = null;
     await showBackendError(error);
     return;
   }
@@ -199,7 +214,7 @@ async function createWindow(): Promise<void> {
     icon: resolveIconPath(),
     backgroundColor: "#f7f8fa",
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: preloadPath,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -256,7 +271,7 @@ function installApplicationMenu(): void {
         { type: "separator" },
         {
           label: "Screenshot / Capture",
-          click: () => mainWindow?.webContents.send("menu:captureScreenshot")
+          click: () => void captureScreenshotAndNotify()
         },
         { type: "separator" },
         process.platform === "darwin" ? { role: "close" } : { role: "quit", label: "Exit" }
@@ -268,12 +283,17 @@ function installApplicationMenu(): void {
         {
           label: "Capture Screenshot",
           accelerator: "CmdOrCtrl+Shift+S",
-          click: () => mainWindow?.webContents.send("menu:captureScreenshot")
+          click: () => void captureScreenshotAndNotify()
         }
       ]
     }
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+async function captureScreenshotAndNotify(): Promise<void> {
+  const result = await captureScreenshot();
+  mainWindow?.webContents.send("screenshot:result", result);
 }
 
 async function importReplayDataFromMenu(): Promise<void> {
@@ -311,19 +331,13 @@ async function captureScreenshot(): Promise<{ ok: boolean; path?: string; error?
 
 async function nextScreenshotPath(directory: string): Promise<string> {
   const now = new Date();
-  const candidates = [
-    `Screenshot_CscArray_${hourDayMonth(now)}.png`,
-    `Screenshot_CscArray_${hourDayMonthMinute(now)}.png`,
-    `Screenshot_CscArray_${hourDayMonthMinuteSecond(now)}.png`
-  ];
-  for (const candidate of candidates) {
-    const filePath = path.join(directory, candidate);
-    if (!fs.existsSync(filePath)) {
-      return filePath;
-    }
+  const baseName = `Screenshot_SensorArray_${timestampForScreenshot(now)}`;
+  const firstPath = path.join(directory, `${baseName}.png`);
+  if (!fs.existsSync(firstPath)) {
+    return firstPath;
   }
   for (let index = 1; index < 1000; index += 1) {
-    const filePath = path.join(directory, `Screenshot_CscArray_${hourDayMonthMinuteSecond(now)}_${String(index).padStart(3, "0")}.png`);
+    const filePath = path.join(directory, `${baseName}_${String(index).padStart(3, "0")}.png`);
     if (!fs.existsSync(filePath)) {
       return filePath;
     }
@@ -331,16 +345,8 @@ async function nextScreenshotPath(directory: string): Promise<string> {
   throw new Error("Could not allocate a screenshot filename");
 }
 
-function hourDayMonth(date: Date): string {
-  return `${pad2(date.getHours())}${pad2(date.getDate())}${pad2(date.getMonth() + 1)}`;
-}
-
-function hourDayMonthMinute(date: Date): string {
-  return `${hourDayMonth(date)}${pad2(date.getMinutes())}`;
-}
-
-function hourDayMonthMinuteSecond(date: Date): string {
-  return `${hourDayMonthMinute(date)}${pad2(date.getSeconds())}`;
+function timestampForScreenshot(date: Date): string {
+  return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}_${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`;
 }
 
 function pad2(value: number): string {
@@ -411,6 +417,10 @@ function resolveRendererIndexPath(): string {
     return path.join(app.getAppPath(), "dist", "index.html");
   }
   return path.join(repoRoot, "desktop", "dist", "index.html");
+}
+
+function resolvePreloadPath(): string {
+  return path.join(__dirname, "preload.js");
 }
 
 function resolveIconPath(): string | undefined {

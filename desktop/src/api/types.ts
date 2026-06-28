@@ -106,6 +106,15 @@ export type BleDevice = {
   advanced: boolean;
 };
 
+export type BleScanResponse = {
+  ok: boolean;
+  devices: BleDevice[];
+  advancedDevices?: BleDevice[];
+  error?: string;
+  state?: string;
+  durationMs?: number;
+};
+
 export type WifiDevice = {
   host: string;
   method: string;
@@ -263,6 +272,12 @@ export type SerialPort = {
   value: string;
 };
 
+export type SerialPortsResponse = {
+  ok: boolean;
+  ports: SerialPort[];
+  error?: string;
+};
+
 export type DesktopBridge = {
   getBackendUrl: () => Promise<string>;
   getRuntimeDirectory: () => Promise<string>;
@@ -280,6 +295,12 @@ export type DesktopBridge = {
   onImportSetupProfile: (callback: () => void) => () => void;
   onExportSetupProfile: (callback: () => void) => () => void;
   onCaptureScreenshot: (callback: () => void) => () => void;
+  onMenuImportSetup: (callback: () => void) => () => void;
+  onMenuExportSetup: (callback: () => void) => () => void;
+  onMenuImportData: (callback: () => void) => () => void;
+  onMenuExportData: (callback: () => void) => () => void;
+  onMenuCaptureScreenshot: (callback: () => void) => () => void;
+  onScreenshotResult: (callback: (result: DesktopActionResult) => void) => () => void;
   chooseSessionExportPath: (defaultName: string) => Promise<DesktopActionResult>;
   saveExportedSession: (defaultName: string, data: ArrayBuffer | Uint8Array | string) => Promise<DesktopActionResult>;
   writeBinaryFile: (path: string, data: ArrayBuffer | Uint8Array | string) => Promise<DesktopActionResult>;
