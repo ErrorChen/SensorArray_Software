@@ -66,7 +66,12 @@ class BaselineSession:
         valid = frame.validMask
         for index in range(min(len(values), self.activeRows * 8)):
             value = float(values[index])
-            if bool(valid[index]) and np.isfinite(value):
+            row_index = index // 8
+            detector_index = index % 8
+            row_bit = 1 << row_index
+            device_fresh_mask = frame.primaryFreshMask if detector_index < 4 else frame.secondaryFreshMask
+            fresh = bool(frame.rowFreshMask & row_bit) and bool(device_fresh_mask & row_bit)
+            if bool(valid[index]) and fresh and np.isfinite(value):
                 self._samples[index].append(value)
         return True
 

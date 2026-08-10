@@ -331,7 +331,7 @@ export function App(): JSX.Element {
             onPointerDown={(event) =>
               startSplitDrag(event, mainSplitRef, setMainSplitRatio, {
                 minLeftRatio: 0.45,
-                minRightPx: 300
+                minRightPx: 380
               })
             }
           />
@@ -364,7 +364,7 @@ export function App(): JSX.Element {
                 />
               )}
             </section>
-            <TrendGrid client={client} history={history} onHistory={setHistory} onError={setError} />
+            <TrendGrid client={client} snapshot={snapshot} history={history} onHistory={setHistory} onError={setError} />
           </div>
         </div>
         <div ref={bottomSplitRef} className="bottomSplit">

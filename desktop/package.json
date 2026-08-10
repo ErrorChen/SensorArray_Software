@@ -11,9 +11,13 @@
     "build:electron": "npm run clean:electron && tsc -p tsconfig.electron.json",
     "desktop": "concurrently -k -n vite,electron \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && npm run electron:dev\"",
     "electron:dev": "npm run build:electron && node electron/devLauncher.cjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json && tsc --noEmit -p tsconfig.e2e.json",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:electron": "npm run test:e2e",
+    "test:packaged": "node e2e/packagedSmoke.mjs",
+    "test:hardware": "npm run build && node hardware-e2e/runHardwareHil.mjs",
     "package:dir": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win dir --x64",
     "package:win": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win nsis --x64"
   },
@@ -25,6 +29,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.8.0",
+    "@playwright/test": "^1.62.1",
     "@types/node": "^20.14.11",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",

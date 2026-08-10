@@ -26,6 +26,9 @@ class LegacyFastBinaryVoltageProtocol:
         self.resyncs = 0
         self.droppedFrames = 0
 
+    def reset(self) -> None:
+        self._buffer.clear()
+
     def feed(self, envelope: TransportEnvelope) -> list[VoltageFrame | ParserErrorEvent]:
         events: list[VoltageFrame | ParserErrorEvent] = []
         self._buffer.extend(envelope.rawPayload)

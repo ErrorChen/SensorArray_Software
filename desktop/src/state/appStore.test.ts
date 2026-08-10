@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { BackendSnapshotPayload } from "../api/types";
-import { cellLabel, selectionTitle } from "./appStore";
+import { cellLabel, measurementMatrixIsCurrent, selectionTitle, snapshotForDisplay } from "./appStore";
 import { isCommandSendDisabled, updateCommandHistory } from "./commandPanel";
 import { resolveColourRange, type HeatmapDatum } from "./heatmap";
 import { clampSplitRatio } from "./layout";
 import { parseKeyValueText, parseLogStatusRows } from "./logStatus";
 import { isBleScanDisabled } from "./transportUi";
+import { createBackendSnapshot } from "../testUtils/snapshot";
 
 describe("appStore helpers", () => {
   it("generates a defensive selection title", () => {
@@ -18,6 +19,39 @@ describe("appStore helpers", () => {
   it("labels 8x8 cells", () => {
     expect(cellLabel(0, 0)).toBe("S1D1");
     expect(cellLabel(7, 7)).toBe("S8D8");
+  });
+
+  it("keeps the last coherent matrix when an old-generation frame follows MAPP", () => {
+    const current = createBackendSnapshot({ mode: "VOLT" });
+    current.measurement.generation = 7;
+    current.matrix.generation = 7;
+    current.matrix.displayValues[0][0] = 0.25;
+
+    const stale = createBackendSnapshot({ mode: "VOLT" });
+    stale.measurement.generation = 7;
+    stale.matrix.generation = 6;
+    stale.matrix.displayValues[0][0] = 99;
+
+    expect(measurementMatrixIsCurrent(stale, current)).toBe(false);
+    expect(snapshotForDisplay(stale, current).matrix.displayValues[0][0]).toBe(0.25);
+  });
+
+  it("uses the MAPP sequence boundary for CAP instead of comparing ROWS generation", () => {
+    const current = createBackendSnapshot({ mode: "CAP" });
+    current.measurement.generation = 21;
+    current.measurement.frameSeq = 100;
+    current.frame.seq = 101;
+    current.matrix.generation = 2;
+
+    const next = createBackendSnapshot({ mode: "CAP" });
+    next.measurement.generation = 21;
+    next.measurement.frameSeq = 100;
+    next.frame.seq = 102;
+    next.matrix.generation = 3;
+    expect(measurementMatrixIsCurrent(next, current)).toBe(true);
+
+    next.frame.seq = 99;
+    expect(measurementMatrixIsCurrent(next, current)).toBe(false);
   });
 });
 
@@ -44,6 +78,7 @@ describe("heatmap colour range", () => {
     frozen.display.colorRange = { min: 1, max: 2, frozen: true };
     expect(resolveColourRange([[0, 0, 10, "S1D1", true]], frozen)).toEqual([1, 2]);
   });
+
 });
 
 describe("layout and command UI rules", () => {
@@ -99,51 +134,38 @@ describe("log status parser", () => {
     expect(item.category).toBe("Parser");
     expect(item.severity).toBe("error");
   });
+
+  it("does not invent an ADS1262 identity when firmware reports unknown", () => {
+    const [item] = parseLogStatusRows([logRow("ADS", "ADS,chip=unknown,valid=0", "info")]);
+    expect(item.title).toBe("ADS identity unconfirmed");
+    expect(item.severity).toBe("warn");
+  });
+
+  it("understands measurement and ADS diagnostic transaction logs", () => {
+    const items = parseLogStatusRows([
+      logRow("MACK", "MACK,id=42,old=CAP,new=VOLT,state=accepted", "info"),
+      logRow("MAPP", "MAPP,id=42,gen=7,old=CAP,new=VOLT,seq=9,state=applied", "info"),
+      logRow("ADSCHKSTAT", "ADSCHKSTAT,id=5,state=completed,samples=20,fresh=20,restore=ok", "info")
+    ]);
+    expect(items.some((item) => item.title === "Measurement mode accepted")).toBe(true);
+    expect(items.some((item) => item.title === "Measurement mode applied")).toBe(true);
+    expect(items.some((item) => item.title === "ADS diagnostic status" && item.severity === "ok")).toBe(true);
+  });
+
+  it("distinguishes rail RAPP from rows RAPP and surfaces mode failures", () => {
+    const items = parseLogStatusRows([
+      logRow("RAPP", "RAPP,id=51,avdd=3391000,avss=-2500000,source=external,state=applied", "info"),
+      logRow("MERR", "MERR,id=42,new=VOLT,state=SAFE,err=0x103", "error"),
+      logRow("BAPP", "BAPP,id=8,cmd=BATNOW,seq=10,status=complete", "info")
+    ]);
+    expect(items.some((item) => item.title === "Voltage rail configuration applied" && item.category === "Measurement")).toBe(true);
+    expect(items.some((item) => item.title === "Measurement mode failed" && item.severity === "error")).toBe(true);
+    expect(items.some((item) => item.title === "Battery command completed")).toBe(true);
+  });
 });
 
 function snapshot(unit: "pF" | "%"): BackendSnapshotPayload {
-  return {
-    connection: { mode: "serial", state: "disconnected", deviceLabel: "", generation: 0 },
-    frame: { seq: null, fps: 0, rows: 8, valid: false, timestampUs: null, revision: 0 },
-    matrix: {
-      rows: [],
-      cols: [],
-      correctedPf: [],
-      rawPf: [],
-      rawFixed: [],
-      userOffsetPf: [],
-      displayValues: [],
-      validMask: [],
-      unit,
-      domain: "capacitance"
-    },
-    selection: {
-      rowIndex: 0,
-      rowLabel: "S1",
-      fdcGroup: "primary",
-      detectorStart: 1,
-      detectorEnd: 4,
-      cells: [],
-      title: "S1 Primary FDC D1-D4",
-      selectionRevision: 0
-    },
-    display: {
-      displayMode: unit === "%" ? "delta_percent" : "absolute_pf",
-      measurementDomain: "auto",
-      showCellText: true,
-      pauseDisplay: false,
-      freezeColor: false,
-      unitMode: "raw",
-      circuitOffsetPf: 33,
-      trendLatestN: 600,
-      colorRange: { min: null, max: null, frozen: false }
-    },
-    baseline: {},
-    commands: {},
-    logs: { revision: 0, totalRecords: 0, overwrites: 0, rows: [] },
-    discovery: { bleState: "idle", bleResults: [], wifiState: "idle", wifiResults: [] },
-    diagnostics: {}
-  };
+  return createBackendSnapshot({ unit, displayMode: unit === "%" ? "delta_percent" : "absolute_pf" });
 }
 
 function logRow(tag: string, rawText: string, severity: string) {

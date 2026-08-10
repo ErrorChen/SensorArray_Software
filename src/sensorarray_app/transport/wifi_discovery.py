@@ -28,8 +28,13 @@ def current_windows_ssids() -> list[str]:
         )
     except Exception:
         return []
+    # ``subprocess.CompletedProcess.stdout`` is permitted to be ``None``
+    # (for example when a constrained Windows process fails before it can
+    # create the capture pipe). Discovery is best-effort, so an empty capture
+    # must behave like an empty network list instead of crashing the API.
+    stdout = result.stdout or ""
     ssids: list[str] = []
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         stripped = line.strip()
         if stripped.startswith("SSID") and ":" in stripped:
             value = stripped.split(":", maxsplit=1)[1].strip()

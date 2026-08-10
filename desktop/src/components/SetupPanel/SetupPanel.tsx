@@ -3,7 +3,9 @@ import { useEffect, useMemo, useState as useSlot } from "react";
 
 import type { BackendHttpClient } from "../../api/httpClient";
 import type { BackendSnapshotPayload, BleDevice, SerialPort, SetupProfile, TransportMode, WifiDevice } from "../../api/types";
+import { isCapacitanceMode } from "../../state/measurement";
 import { isBleScanDisabled } from "../../state/transportUi";
+import { MeasurementModeControl } from "./MeasurementModeControl";
 
 type Props = {
   client: BackendHttpClient | null;
@@ -17,7 +19,7 @@ const connectedStates = new Set(["connected", "streaming"]);
 const busyStates = new Set(["connecting", "disconnecting", "reconnecting"]);
 
 export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChange, onError }: Props): JSX.Element {
-  const [mode, setMode] = useSlot<TransportMode>("serial");
+  const [transportMode, setTransportMode] = useSlot<TransportMode>("serial");
   const [serialPorts, setSerialPorts] = useSlot<SerialPort[]>([]);
   const [selectedPort, setSelectedPort] = useSlot("");
   const [baud, setBaud] = useSlot(115200);
@@ -41,12 +43,13 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
   const connection = snapshot?.connection;
   const connectionMode = connection?.mode;
   const connectionState = connection?.state ?? "disconnected";
-  const currentModeConnected = connectionMode === mode && connectedStates.has(connectionState);
-  const currentModeBusy = connectionMode === mode && busyStates.has(connectionState);
+  const currentModeConnected = connectionMode === transportMode && connectedStates.has(connectionState);
+  const currentModeBusy = connectionMode === transportMode && busyStates.has(connectionState);
   const bleScanDisabled = isBleScanDisabled(connectionMode, connectionState);
+  const capacitanceMode = isCapacitanceMode(snapshot);
 
   useEffect(() => {
-    setMode(setupProfile.transport.mode);
+    setTransportMode(setupProfile.transport.mode);
     setSelectedPort(setupProfile.transport.serial.port || "");
     setBaud(setupProfile.transport.serial.baud);
     setSelectedBle(setupProfile.transport.ble.address || "");
@@ -62,8 +65,8 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
       return;
     }
     void run("Loading...", async () => {
-      await client.setMode(mode);
-      if (mode === "serial") {
+      await client.setTransportMode(transportMode);
+      if (transportMode === "serial") {
         await refreshSerialPorts();
       }
     });
@@ -91,13 +94,13 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
     }
   }
 
-  async function handleModeChange(nextMode: TransportMode): Promise<void> {
-    setMode(nextMode);
+  async function handleTransportModeChange(nextMode: TransportMode): Promise<void> {
+    setTransportMode(nextMode);
     updateTransportProfile({ mode: nextMode });
     if (!client) {
       return;
     }
-    await client.setMode(nextMode);
+    await client.setTransportMode(nextMode);
     if (nextMode === "serial") {
       await refreshSerialPorts();
     }
@@ -180,11 +183,11 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
       await run("Disconnecting...", () => client.disconnect());
       return;
     }
-    if (mode === "serial") {
+    if (transportMode === "serial") {
       await run("Connecting...", () => client.connectSerial(selectedPort, baud));
-    } else if (mode === "ble") {
+    } else if (transportMode === "ble") {
       await run("Connecting...", () => client.connectBle(selectedBle, selectedBle));
-    } else if (mode === "wifi") {
+    } else if (transportMode === "wifi") {
       await run("Connecting...", () => client.connectWifi(selectedWifi || fallbackHost));
     } else {
       await run("Connecting...", async () => {
@@ -197,7 +200,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
   async function handleRowsChange(nextRows: number): Promise<void> {
     const previousRows = snapshot?.frame.rows ?? rows;
     setRows(nextRows);
-    onSetupProfileChange({ ...setupProfile, acquisition: { rows: nextRows } });
+    onSetupProfileChange({ ...setupProfile, acquisition: { ...setupProfile.acquisition, rows: nextRows } });
     if (!client || rowsPending) {
       return;
     }
@@ -206,7 +209,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
       await client.setRows(nextRows);
     } catch (error) {
       setRows(previousRows);
-      onSetupProfileChange({ ...setupProfile, acquisition: { rows: previousRows } });
+      onSetupProfileChange({ ...setupProfile, acquisition: { ...setupProfile.acquisition, rows: previousRows } });
       onError(error instanceof Error ? error.message : String(error));
     } finally {
       setRowsPending(false);
@@ -220,13 +223,13 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
     if (currentModeConnected) {
       return false;
     }
-    if (mode === "serial") {
+    if (transportMode === "serial") {
       return !selectedPort;
     }
-    if (mode === "ble") {
+    if (transportMode === "ble") {
       return !selectedBle || bleScanDisabled;
     }
-    if (mode === "wifi") {
+    if (transportMode === "wifi") {
       return !(selectedWifi || fallbackHost);
     }
     return !replayPath;
@@ -235,15 +238,16 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
   return (
     <section className="setupPanel">
       <div className="panelHeader">Setup</div>
+      <div className="panelHeader small">Transport</div>
       <div className="segmented">
         {(["serial", "ble", "wifi", "replay"] as TransportMode[]).map((item) => (
-          <button key={item} className={mode === item ? "active" : ""} onClick={() => void run("Loading...", () => handleModeChange(item))}>
+          <button key={item} className={transportMode === item ? "active" : ""} onClick={() => void run("Loading...", () => handleTransportModeChange(item))}>
             {item === "ble" ? "Bluetooth LE" : item === "wifi" ? "Wi-Fi UDP" : item[0].toUpperCase() + item.slice(1)}
           </button>
         ))}
       </div>
 
-      {mode === "serial" ? (
+      {transportMode === "serial" ? (
         <div className="modePanel">
           <label>Port</label>
           <div className="inputRow">
@@ -281,7 +285,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         </div>
       ) : null}
 
-      {mode === "ble" ? (
+      {transportMode === "ble" ? (
         <div className="modePanel">
           <label>Device</label>
           <select
@@ -323,7 +327,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         </div>
       ) : null}
 
-      {mode === "wifi" ? (
+      {transportMode === "wifi" ? (
         <div className="modePanel">
           <label>Discovered host</label>
           <select
@@ -356,7 +360,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         </div>
       ) : null}
 
-      {mode === "replay" ? (
+      {transportMode === "replay" ? (
         <div className="modePanel">
           <label>Replay file</label>
           <div className="inputRow">
@@ -402,11 +406,19 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         <Zap size={16} /> {busyAction ?? (currentModeConnected ? "Disconnect" : "Connect")}
       </button>
 
+      <MeasurementModeControl
+        client={client}
+        snapshot={snapshot}
+        setupProfile={setupProfile}
+        onSetupProfileChange={onSetupProfileChange}
+        onError={onError}
+      />
+
       <div className="controlGroup">
         <div className="panelHeader small">Rows</div>
         <div className="inputRow">
           <select disabled={!client || rowsPending} value={rows} onChange={(event) => void handleRowsChange(Number(event.target.value))}>
-            {[1, 2, 3, 4, 5, 6, 7, 8].map((value) => (
+            {[1, 2, 4, 8].map((value) => (
               <option key={value} value={value}>
                 {value}
               </option>
@@ -420,22 +432,28 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
 
       <div className="controlGroup">
         <div className="panelHeader small">Display</div>
-        <label>Mode</label>
-        <select
-          disabled={!client}
-          value={snapshot?.display.displayMode ?? "absolute_pf"}
-          onChange={(event) =>
-            void run("Saving...", async () => {
-              const displayMode = event.target.value as "absolute_pf" | "delta_percent";
-              onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, displayMode } });
-              await client!.setDisplaySettings({ displayMode });
-            })
-          }
-        >
-          <option value="absolute_pf">Absolute C</option>
-          <option value="delta_percent">Delta C/C0 %</option>
-        </select>
-        <div className="baselineStatus">{baselineMessage(snapshot)}</div>
+        {capacitanceMode ? (
+          <>
+            <label>Capacitance display</label>
+            <select
+              disabled={!client}
+              value={snapshot?.display.displayMode ?? "absolute_pf"}
+              onChange={(event) =>
+                void run("Saving...", async () => {
+                  const displayMode = event.target.value as "absolute_pf" | "delta_percent";
+                  onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, displayMode } });
+                  await client!.setDisplaySettings({ displayMode });
+                })
+              }
+            >
+              <option value="absolute_pf">Absolute C</option>
+              <option value="delta_percent">Delta C/C0 %</option>
+            </select>
+            <div className="baselineStatus">{baselineMessage(snapshot)}</div>
+          </>
+        ) : (
+          <div className="modeOnlyNotice">Baseline, Delta C/C0, and capacitance offsets are available in capacitance mode only.</div>
+        )}
         <label className="checkLine">
           <input
             type="checkbox"
@@ -478,14 +496,16 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
           />
           Freeze colour
         </label>
-        <div className="buttonRow">
-          <button disabled={!client || snapshot?.baseline.status === "capturing"} onClick={() => void run("Saving...", () => client!.baseline("capture").then(() => undefined))}>
-            Set baseline
-          </button>
-          <button disabled={!client} onClick={() => void run("Saving...", () => client!.baseline("reset").then(() => undefined))}>
-            Reset
-          </button>
-        </div>
+        {capacitanceMode ? (
+          <div className="buttonRow">
+            <button disabled={!client || snapshot?.baseline.status === "capturing"} onClick={() => void run("Saving...", () => client!.baseline("capture").then(() => undefined))}>
+              Set baseline
+            </button>
+            <button disabled={!client} onClick={() => void run("Saving...", () => client!.baseline("reset").then(() => undefined))}>
+              Reset
+            </button>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -517,7 +537,11 @@ function formatBleScanError(error: string): string {
 function rowsStatus(snapshot: BackendSnapshotPayload | null): string {
   const commands = snapshot?.commands as { requestedRows?: number; activeRows?: number; pendingRows?: number } | undefined;
   const requested = commands?.requestedRows;
-  const active = commands?.activeRows ?? snapshot?.frame.rows;
+  // A CRC-valid frame is the authoritative matrix geometry, including when a
+  // Replay starts mid-session or a transport did not deliver historical RCMD.
+  // Command state remains visible as requested/pending, but must not leave the
+  // GUI claiming 8 rows while a valid 1/2/4-row frame is displayed.
+  const active = snapshot?.frame.valid ? snapshot.frame.rows : commands?.activeRows ?? snapshot?.frame.rows;
   const pending = commands?.pendingRows;
   if (typeof pending === "number") {
     return `requested ${pending}; applied ${active ?? "-"}`;

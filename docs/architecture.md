@@ -10,7 +10,7 @@ src/sensorarray_backend
   core/               runtime wrapper, snapshot schema, history, selection, units
 src/sensorarray_app
   domain/             typed events, baseline, battery, voltage, resistance
-  protocol/           b41 C/D/K, CRC, BLE fragments, legacy protocol plugins
+  protocol/           current C/V/R ASCII, CRC, BLE fragments, legacy plugins
   transport/          Serial, BLE notify, Wi-Fi UDP, replay, discovery
   store/              matrix, history, raw logs, telemetry, statistics
   services/           command and discovery services
@@ -22,7 +22,8 @@ src/sensorarray_app
 Device or replay
 -> transport envelope
 -> ProtocolRegistry
--> typed domain event
+-> shared C/V/R frame assembler
+-> typed measurement or command event
 -> MatrixStore / RawLogStore / TelemetryStore
 -> backend snapshot
 -> WebSocket /ws
@@ -37,6 +38,10 @@ The frontend never parses device protocols and never owns transport state.
 - One active transport at a time.
 - Session generation changes on connect, disconnect, replay restart, and transport switch.
 - Late packets from older sessions are ignored by state handling.
+- Measurement mode is independent of transport mode and commits only on a
+  matching firmware `MAPP`, never on `MACK`.
+- VOLT/RES use their mode `gen/rid`; CAP mode filtering uses the `MAPP.seq`
+  boundary because CAP `C.gen/rid` belong to ROWS/configuration.
 - Serial requires an explicit scanned port.
 - BLE data is notify/indicate first; read characteristic polling is not the main path.
 - Wi-Fi DATA, LOG, and CTRL remain separate UDP channels.
@@ -44,23 +49,39 @@ The frontend never parses device protocols and never owns transport state.
 
 ## Snapshot Contract
 
-Every WebSocket snapshot contains:
+Every WebSocket snapshot separates connection, measurement transaction, and
+quantity state. The central fields are:
 
 ```text
-connection
+connection.transportMode
+measurement.appliedMode
+measurement.pendingMode
+measurement.transitionState
+measurement.requestId
+measurement.generation
 frame
-matrix.correctedPf
-matrix.rawPf
+matrix.quantity
+matrix.unit
+matrix.scale
+matrix.values
 matrix.rawFixed
-matrix.validMask
+matrix.valid
+matrix.fresh
+matrix.errorCodes
+matrix.pga
+capacitance.rawPf
+capacitance.correctedPf
 selection.title
 display.displayMode
-display.measurementDomain
 display.showCellText
 display.pauseDisplay
 display.freezeColor
-display.circuitOffsetPf
 ```
+
+CAP-only offsets, baseline, and Delta C/C0 % stay in the capacitance branch and
+are not reused as VOLT/RES calibration. Invalid/inactive cells are serialized as
+`null`; stale cells remain diagnosable but do not enter live colour/statistical
+domains.
 
 The backend explicitly serializes `selection.title`; it is not left as a Python
 property that disappears during dataclass conversion. The frontend also has a

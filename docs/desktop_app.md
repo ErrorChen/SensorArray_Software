@@ -20,13 +20,20 @@ status bar
 raw/event log
 ```
 
-The setup panel is mode-first:
+The setup panel separates transport selection from measurement quantity:
 
+- Transport: Serial, Bluetooth LE, Wi-Fi UDP, or Replay.
+- Measurement Mode: CAP, VOLT, or RES, with separate applied/pending/error state.
 - Serial: scan ports, choose dropdown, connect.
-- Bluetooth LE: auto scan on mode selection, choose dropdown, connect.
-- Wi-Fi UDP: auto discover on mode selection, choose dropdown or fallback host, connect.
-- Replay: choose file with native dialog, start or stop playback.
+- Bluetooth LE: scan, choose a verified device, connect.
+- Wi-Fi UDP: discover, choose a device or fallback host, connect.
+- Replay: choose a file with the native dialog, start or stop playback.
+
+The measurement selector does not change `connection.transportMode`. `MACK`
+only creates pending state; a matching `MAPP` commits the applied quantity.
+VOLT Setup also collects paired external measured AVDD/AVSS values and applies
+the rail transaction before requesting VOLT. CAP offset/baseline/Delta controls
+remain visible only for capacitance behavior.
 
 The frontend uses WebSocket snapshots for realtime data. REST is used only for
 commands and discovery actions.
-

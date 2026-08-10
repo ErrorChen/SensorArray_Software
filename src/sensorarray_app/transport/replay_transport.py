@@ -12,7 +12,11 @@ import numpy as np
 from sensorarray_app.constants import CAP_FIXED_SCALE, CAP_INVALID_SENTINEL, FDC_CIRCUIT_OFFSET_PF
 from sensorarray_app.domain.models import TransportEnvelope, TransportStateEvent
 from sensorarray_app.protocol.crc import crc32_reflected
-from sensorarray_backend.core.session_data import frames_to_cap_ascii_bytes, load_session_frames
+from sensorarray_backend.core.session_data import (
+    frames_to_measurement_ascii_bytes,
+    load_session_frames,
+    session_model_from_payload,
+)
 
 
 class ReplayTransport:
@@ -55,6 +59,8 @@ class ReplayTransport:
             payload = _session_file_to_replay_bytes(self.path)
             if payload is not None:
                 self._stream_bytes(payload)
+            elif self.path.suffix.lower() == ".replay":
+                self._stream_timed_fixture()
             else:
                 with self.path.open("rb") as handle:
                     while not self._stop.is_set():
@@ -66,6 +72,32 @@ class ReplayTransport:
         except Exception as exc:
             self._put_state("ERROR", str(exc))
         self._put_state("DISCONNECTED", "")
+
+    def _stream_timed_fixture(self) -> None:
+        """Replay a protocol fixture with optional host-side timing markers.
+
+        ``@delay-ms=<milliseconds>`` is a ReplayTransport directive, not a
+        firmware protocol line.  It lets validation fixtures expose real
+        asynchronous states (for example MACK pending before MAPP) while every
+        non-directive byte still travels through the normal transport queue,
+        protocol registry, domain/store, backend snapshot and WebSocket path.
+        The delay follows the replay speed control just like ordinary chunks.
+        """
+
+        for rawLine in self.path.read_bytes().splitlines(keepends=True):
+            if self._stop.is_set():
+                return
+            marker = rawLine.strip().lower()
+            if marker.startswith(b"@delay-ms="):
+                try:
+                    delayMs = int(marker.split(b"=", maxsplit=1)[1])
+                except (ValueError, IndexError) as exc:
+                    raise ValueError(f"invalid replay delay directive: {rawLine!r}") from exc
+                if delayMs < 0 or delayMs > 60_000:
+                    raise ValueError(f"replay delay must be in 0..60000 ms, got {delayMs}")
+                self._stop.wait((delayMs / 1000.0) / self.speed)
+                continue
+            self._put_payload(rawLine)
 
     def _stream_bytes(self, payload: bytes) -> None:
         offset = 0
@@ -96,7 +128,7 @@ class ReplayTransport:
 
 def _session_file_to_replay_bytes(path: Path) -> bytes | None:
     if path.suffix.lower() in {".csv", ".xlsx", ".mat", ".h5", ".hdf5"}:
-        return frames_to_cap_ascii_bytes(load_session_frames(path))
+        return frames_to_measurement_ascii_bytes(load_session_frames(path))
     if path.suffix.lower() != ".json":
         return None
     try:
@@ -105,16 +137,15 @@ def _session_file_to_replay_bytes(path: Path) -> bytes | None:
         return None
     if not isinstance(payload, dict) or "metadata" not in payload or "currentMatrix" not in payload:
         return None
-    frames = _session_frames(payload)
+    frames = session_model_from_payload(payload).frames
     raw_logs = payload.get("rawLogs") if isinstance(payload.get("rawLogs"), list) else []
     out = bytearray()
-    for frame in frames:
-        out.extend(_frame_to_cap_ascii(frame))
+    out.extend(frames_to_measurement_ascii_bytes(frames))
     for row in raw_logs:
         raw_text = row.get("rawText") if isinstance(row, dict) else None
         if isinstance(raw_text, str) and raw_text.strip():
             text = raw_text.strip()
-            if not text.startswith(("C,", "D", "K,")):
+            if not text.startswith(("C,", "V,", "R,", "D", "P", "K,")):
                 out.extend(text.encode("ascii", errors="ignore") + b"\n")
     return bytes(out)
 

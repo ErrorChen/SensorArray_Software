@@ -6,6 +6,14 @@
   text-rendering: optimizeLegibility;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -84,19 +92,24 @@ label {
 }
 
 .appShell {
-  min-height: 100vh;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .statusBar {
-  height: 46px;
+  min-height: 46px;
+  height: auto;
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 0 18px;
   border-bottom: 1px solid #d9e0e8;
   background: #ffffff;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
 }
 
 .brand {
@@ -111,11 +124,13 @@ label {
   align-items: center;
   gap: 12px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .statusItem,
 .socketState,
-.statusError {
+.statusError,
+.statusWarning {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -123,6 +138,11 @@ label {
   font-size: 12px;
   color: #526070;
   white-space: nowrap;
+}
+
+.statusWarning {
+  color: #b45309;
+  font-weight: 700;
 }
 
 .socketState.connected {
@@ -148,6 +168,7 @@ label {
   gap: 12px;
   padding: 12px;
   min-height: 0;
+  overflow: hidden;
 }
 
 .workspaceSplit,
@@ -158,7 +179,8 @@ label {
 }
 
 .workspaceSplit {
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  overflow: hidden;
 }
 
 .bottomSplit {
@@ -186,6 +208,9 @@ label {
 }
 
 .rightPane {
+  /* Persisted split ratios are viewport-independent. Keep enough width after
+     a later window shrink for two trend columns and the mode/rail controls. */
+  min-width: 380px;
   display: grid;
   grid-template-rows: minmax(210px, 0.58fr) minmax(170px, 0.42fr);
   gap: 12px;
@@ -244,11 +269,42 @@ label {
   position: relative;
 }
 
-.heatmapCanvas {
+.heatmapCanvasLayer {
+  position: relative;
   flex: 1;
+  min-height: 180px;
+}
+
+.heatmapCanvas {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
-  min-height: 360px;
+}
+
+.invalidCellHitLayer {
+  position: absolute;
+  z-index: 10;
+  top: 28px;
+  right: 28px;
+  bottom: 52px;
+  left: 64px;
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  grid-template-rows: repeat(8, minmax(0, 1fr));
+  pointer-events: none;
+}
+
+.invalidCellHitTarget {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  opacity: 0;
+  pointer-events: auto;
 }
 
 .setupPanel {
@@ -339,6 +395,104 @@ label {
   margin-bottom: 12px;
   padding-bottom: 10px;
   border-bottom: 1px solid #e6ebf0;
+}
+
+.measurementModeControl {
+  border-top: 1px solid #e6ebf0;
+  padding-top: 10px;
+}
+
+.measurementApplied {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.measurementApplied strong {
+  font-size: 15px;
+  color: #0f766e;
+}
+
+.measurementPending {
+  color: #b45309;
+  font-weight: 700;
+}
+
+.measurementModeButtons {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.measurementTransition,
+.railState,
+.modeOnlyNotice {
+  color: #526070;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.measurementTransition.error {
+  color: #b91c1c;
+}
+
+.voltageRailFields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+  min-width: 0;
+  margin: 2px 0 0;
+  padding: 8px;
+  border: 1px solid #d9e0e8;
+  border-radius: 6px;
+}
+
+.voltageRailFields legend {
+  padding: 0 4px;
+  color: #526070;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.voltageRailFields p,
+.voltageRailFields .railState {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.voltageRailFields label {
+  display: grid;
+  gap: 4px;
+}
+
+.modeOnlyNotice {
+  padding: 8px;
+  border: 1px solid #d9e0e8;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.tooltipDiagnostics {
+  display: inline-block;
+  margin-top: 4px;
+  font-weight: 700;
+}
+
+.heatmapInvalidTooltip {
+  position: absolute;
+  z-index: 20;
+  width: max-content;
+  max-width: 330px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  background: rgba(17, 24, 39, 0.94);
+  color: #ffffff;
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.28);
+  pointer-events: none;
 }
 
 .modePrimary {
@@ -583,7 +737,7 @@ label {
 
 .offsetPanel {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(210px, 0.8fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   min-width: 0;
 }
@@ -828,5 +982,14 @@ label {
 
   .offsetPanel {
     grid-template-columns: 1fr;
+  }
+
+  .voltageRailFields {
+    grid-template-columns: 1fr;
+  }
+
+  .voltageRailFields p,
+  .voltageRailFields .railState {
+    grid-column: auto;
   }
 }

@@ -1,21 +1,35 @@
 from __future__ import annotations
 
-import re
 import time
+from dataclasses import dataclass
 
-from sensorarray_app.domain.models import DomainEvent, LogRecord, ParserErrorEvent, TransportEnvelope
+from sensorarray_app.domain.models import (
+    CapacitanceFrame,
+    DomainEvent,
+    LogRecord,
+    MeasurementFrame,
+    ParserErrorEvent,
+    TransportEnvelope,
+)
 from sensorarray_app.protocol.ble_fragments import BleFragmentReassembler, normalize_ble_channel
 from sensorarray_app.protocol.cap_ascii import CapAsciiParser
 from sensorarray_app.protocol.legacy_binary_voltage import LegacyFastBinaryVoltageProtocol, MAGIC_BYTES
 from sensorarray_app.protocol.legacy_matv import LegacyMatvProtocol
 from sensorarray_app.protocol.log_protocol import TextLogProtocol
+from sensorarray_app.protocol.measurement_ascii import MeasurementAsciiParser
 
-_CAP_LINE_RE = re.compile(rb"(?m)^(?:C,|D\d+,|K,)")
+
+@dataclass
+class _StreamState:
+    cap: CapAsciiParser
+    measurement: MeasurementAsciiParser
+    activeFrameType: str | None = None
 
 
 class ProtocolRegistry:
     def __init__(self, circuit_offset_pf: float = 33.0):
         self.cap = CapAsciiParser(circuit_offset_pf=circuit_offset_pf)
+        self.measurement = MeasurementAsciiParser()
         self.legacy_binary = LegacyFastBinaryVoltageProtocol()
         self.legacy_matv = LegacyMatvProtocol()
         self.log_protocol = TextLogProtocol()
@@ -23,8 +37,21 @@ class ProtocolRegistry:
         self._text_buffers: dict[tuple[str, str, int], bytearray] = {}
         self._feed_count = 0
         self._cap_count = 0
+        self._voltage_count = 0
+        self._resistance_count = 0
         self._log_count = 0
         self._reject_count = 0
+        self._streamStates: dict[tuple[str, str, int], _StreamState] = {}
+
+    def reset_session(self) -> None:
+        """Clear all partial protocol state before accepting a new session."""
+
+        self.cap.reset()
+        self.measurement.reset()
+        self.legacy_binary.reset()
+        self.ble_fragments.reset()
+        self._text_buffers.clear()
+        self._streamStates.clear()
 
     def feed(self, envelope: TransportEnvelope) -> list[DomainEvent]:
         normalized = _normalized_envelope(envelope)
@@ -43,29 +70,14 @@ class ProtocolRegistry:
         self._feed_count += 1
         if envelope.rawPayload.startswith(MAGIC_BYTES) or self.legacy_binary._buffer:
             return self.legacy_binary.feed(envelope)
-        if envelope.channel == "data" or _contains_cap_ascii(envelope.rawPayload):
-            cap_events = self.cap.feed(envelope)
-            split: list[DomainEvent] = []
-            for event in cap_events:
-                if isinstance(event, LogRecord):
-                    self._log_count += 1
-                    split.extend(self.log_protocol.feed_line(event.rawText, envelope))
-                elif isinstance(event, ParserErrorEvent):
-                    self._reject_count += 1
-                    split.append(event)
-                else:
-                    self._cap_count += 1
-                    split.append(event)
-            split.extend(self._diagnostic_event(envelope))
-            return split
         events = self._feed_text(envelope)
-        self._log_count += len([event for event in events if isinstance(event, LogRecord)])
-        self._reject_count += len([event for event in events if isinstance(event, ParserErrorEvent)])
+        self._count_events(events)
         events.extend(self._diagnostic_event(envelope))
         return events
 
     def _feed_text(self, envelope: TransportEnvelope) -> list[DomainEvent]:
         key = (envelope.source, envelope.channel, envelope.sessionGeneration)
+        state = self._stream_state(key)
         buffer = self._text_buffers.setdefault(key, bytearray())
         buffer.extend(envelope.rawPayload)
         events: list[DomainEvent] = []
@@ -75,33 +87,124 @@ class ProtocolRegistry:
                 break
             raw_line = bytes(buffer[: newline + 1])
             del buffer[: newline + 1]
-            try:
-                line = raw_line.rstrip(b"\r\n").decode("ascii", errors="strict")
-            except UnicodeDecodeError:
-                events.append(
-                    ParserErrorEvent(
-                        source=envelope.source,
-                        channel=envelope.channel,
-                        reason="strict_ascii",
-                        detail="non-ASCII text log line",
-                        sessionGeneration=envelope.sessionGeneration,
-                        rawText=raw_line.hex(" "),
-                    )
-                )
-                continue
-            matv = self.legacy_matv.parse_line(line, envelope)
-            if matv is not None:
-                events.append(matv)
-            else:
-                events.extend(self.log_protocol.feed_line(line, envelope))
+            protocolEvents = self._feed_current_line(raw_line, envelope, state)
+            for event in protocolEvents:
+                if isinstance(event, LogRecord):
+                    matv = self.legacy_matv.parse_line(event.rawText, envelope)
+                    if matv is not None:
+                        events.append(matv)
+                    else:
+                        events.extend(self.log_protocol.feed_line(event.rawText, envelope))
+                else:
+                    events.append(event)
+        events.extend(state.cap.check_timeout(envelope.receivedMonotonicNs, envelope))
+        events.extend(state.measurement.check_timeout(envelope.receivedMonotonicNs, envelope))
+        if state.activeFrameType == "C" and not state.cap.hasPendingFrame:
+            state.activeFrameType = None
+        elif state.activeFrameType in {"V", "R"} and not state.measurement.hasPendingFrame:
+            state.activeFrameType = None
         return events
+
+    def _stream_state(self, key: tuple[str, str, int]) -> _StreamState:
+        state = self._streamStates.get(key)
+        if state is None:
+            if not self._streamStates:
+                state = _StreamState(self.cap, self.measurement)
+            else:
+                state = _StreamState(
+                    CapAsciiParser(circuit_offset_pf=self.cap.circuit_offset_pf),
+                    MeasurementAsciiParser(),
+                )
+            self._streamStates[key] = state
+        # Backend display settings historically update registry.cap directly.
+        # Mirror that value into every channel-specific CAP adapter.
+        state.cap.circuit_offset_pf = self.cap.circuit_offset_pf
+        return state
+
+    def _feed_current_line(
+        self,
+        rawLine: bytes,
+        envelope: TransportEnvelope,
+        state: _StreamState,
+    ) -> list[CapacitanceFrame | MeasurementFrame | LogRecord | ParserErrorEvent]:
+        try:
+            line = rawLine.rstrip(b"\r\n").decode("ascii", errors="strict")
+        except UnicodeDecodeError:
+            if state.activeFrameType == "C":
+                return state.cap.feed_line(rawLine, envelope)
+            if state.activeFrameType in {"V", "R"}:
+                return state.measurement.feed_line(rawLine, envelope)
+            return [
+                ParserErrorEvent(
+                    source=envelope.source,
+                    channel=envelope.channel,
+                    reason="strict_ascii",
+                    detail="non-ASCII text protocol line",
+                    sessionGeneration=envelope.sessionGeneration,
+                    rawText=rawLine.hex(" "),
+                )
+            ]
+
+        tag = line.split(",", maxsplit=1)[0].strip()
+        events: list[CapacitanceFrame | MeasurementFrame | LogRecord | ParserErrorEvent] = []
+        if tag == "C":
+            if state.activeFrameType in {"V", "R"}:
+                events.extend(state.measurement.abort_pending("interrupted_frame", "C header interrupted pending V/R frame", envelope))
+            state.activeFrameType = "C"
+            events.extend(state.cap.feed_line(rawLine, envelope))
+            return events
+        if tag in {"V", "R"}:
+            if state.activeFrameType == "C":
+                events.extend(state.cap.abort_pending("interrupted_frame", f"{tag} header interrupted pending C frame", envelope))
+            state.activeFrameType = tag
+            events.extend(state.measurement.feed_line(rawLine, envelope))
+            return events
+        if tag.startswith("D") and tag[1:].isdigit():
+            if state.activeFrameType in {"V", "R"}:
+                return state.measurement.feed_line(rawLine, envelope)
+            return state.cap.feed_line(rawLine, envelope)
+        if tag.startswith("P") and tag[1:].isdigit():
+            if state.activeFrameType in {"V", "R"}:
+                return state.measurement.feed_line(rawLine, envelope)
+            # P50 is a normal summary outside a V/R frame. Other orphan P rows
+            # are rejected by the V/R parser instead of being mistaken for CAP.
+            if tag == "P50" or state.activeFrameType == "C":
+                return state.cap.feed_line(rawLine, envelope)
+            return state.measurement.feed_line(rawLine, envelope)
+        if tag == "K":
+            activeFrameType = state.activeFrameType
+            state.activeFrameType = None
+            if activeFrameType in {"V", "R"}:
+                return state.measurement.feed_line(rawLine, envelope)
+            return state.cap.feed_line(rawLine, envelope)
+        # Runtime log records can be interleaved between frame lines on the
+        # shared Serial stream.  Only C/V/R/D/P/K are measurement grammar;
+        # other tags remain observable logs and must not destroy a pending
+        # CRC frame.
+        return state.cap.feed_line(rawLine, envelope)
+
+    def _count_events(self, events: list[DomainEvent]) -> None:
+        for event in events:
+            if isinstance(event, CapacitanceFrame):
+                self._cap_count += 1
+            elif isinstance(event, MeasurementFrame):
+                if event.mode == "VOLT":
+                    self._voltage_count += 1
+                elif event.mode == "RES":
+                    self._resistance_count += 1
+            elif isinstance(event, LogRecord):
+                self._log_count += 1
+            elif isinstance(event, ParserErrorEvent):
+                self._reject_count += 1
 
     def _diagnostic_event(self, envelope: TransportEnvelope) -> list[LogRecord]:
         if self._feed_count % 50 != 0:
             return []
         raw_text = (
             f"PROTO50,src={envelope.source},ch={envelope.channel},"
-            f"cap={self._cap_count},log={self._log_count},reject={self._reject_count},frames={self.cap.stats.frames}"
+            f"cap={self._cap_count},volt={self._voltage_count},res={self._resistance_count},"
+            f"log={self._log_count},reject={self._reject_count},"
+            f"frames={self._cap_count + self._voltage_count + self._resistance_count}"
         )
         return [
             LogRecord(
@@ -116,9 +219,11 @@ class ProtocolRegistry:
                     "src": envelope.source,
                     "ch": envelope.channel,
                     "cap": str(self._cap_count),
+                    "volt": str(self._voltage_count),
+                    "res": str(self._resistance_count),
                     "log": str(self._log_count),
                     "reject": str(self._reject_count),
-                    "frames": str(self.cap.stats.frames),
+                    "frames": str(self._cap_count + self._voltage_count + self._resistance_count),
                 },
                 recognised=True,
                 sessionGeneration=envelope.sessionGeneration,
@@ -145,10 +250,6 @@ def _replace_envelope(envelope: TransportEnvelope, channel: str, payload: bytes)
         remoteAddress=envelope.remoteAddress,
         metadata=dict(envelope.metadata),
     )
-
-
-def _contains_cap_ascii(payload: bytes) -> bool:
-    return _CAP_LINE_RE.search(payload) is not None
 
 
 def _contains_g_fragment(payload: bytes) -> bool:

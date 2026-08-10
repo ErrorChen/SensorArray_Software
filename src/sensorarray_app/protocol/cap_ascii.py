@@ -70,6 +70,10 @@ class CapAsciiParser:
         self._pending: _PendingFrame | None = None
         self.stats = CapAsciiStats()
 
+    @property
+    def hasPendingFrame(self) -> bool:
+        return self._pending is not None
+
     def feed(self, envelope: TransportEnvelope) -> list[CapacitanceFrame | LogRecord | ParserErrorEvent]:
         events: list[CapacitanceFrame | LogRecord | ParserErrorEvent] = []
         self._line_buffer.extend(envelope.rawPayload)
@@ -133,6 +137,13 @@ class CapAsciiParser:
             rawPayload=b"",
         )
         return [self._reject_pending("pending_timeout", "C/D/K pending frame timed out", dummy)]
+
+    def abort_pending(self, reason: str, detail: str, envelope: TransportEnvelope) -> list[ParserErrorEvent]:
+        """Abort only an in-progress CAP frame when another frame header wins."""
+
+        if self._pending is None:
+            return []
+        return [self._reject_pending(reason, detail, envelope)]
 
     def reset(self) -> None:
         self._line_buffer.clear()

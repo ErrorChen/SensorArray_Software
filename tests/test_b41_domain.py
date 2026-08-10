@@ -74,4 +74,12 @@ def test_baseline_two_second_window_median_and_percent():
 def test_battery_bt_minus_one_is_invalid():
     telemetry = parse_battery_fields({"bt": "-1", "br": "range_error", "bs": "stale"})
     assert telemetry.batteryMv is None
+    assert telemetry.valid is False
+    assert telemetry.fresh is False
+
+
+def test_ab50_battery_freshness_comes_from_bs_not_ads_fresh():
+    telemetry = parse_battery_fields({"bt": "-1", "br": "range_error", "bs": "stale", "fresh": "1"})
+    assert telemetry.fresh is False
+    assert telemetry.rawFields["fresh"] == "1"
     assert telemetry.reason == "range_error"

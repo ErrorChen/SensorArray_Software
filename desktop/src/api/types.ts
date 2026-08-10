@@ -1,8 +1,40 @@
 export type TransportMode = "serial" | "ble" | "wifi" | "replay";
 export type DisplayMode = "absolute_pf" | "delta_percent";
 export type CommandLineEnding = "lf" | "crlf" | "none";
+export type MeasurementMode = "CAP" | "VOLT" | "RES";
+export type MeasurementQuantity = "capacitance" | "voltage" | "resistance";
+export type MeasurementUnit = "pF" | "V" | "ohm";
+export type MeasurementTransitionState =
+  | "applied"
+  | "requested"
+  | "accepted"
+  | "configuring_rail"
+  | "timeout"
+  | "error"
+  | "synced";
+
+export type VoltageRailSnapshot = {
+  configured: boolean;
+  state: string;
+  requestId: number | null;
+  measuredAvddV: number | null;
+  measuredAvssV: number | null;
+};
+
+export type MeasurementSnapshot = {
+  appliedMode: MeasurementMode;
+  pendingMode: MeasurementMode | null;
+  transitionState: MeasurementTransitionState;
+  requestId: number | null;
+  generation: number | null;
+  frameSeq: number | null;
+  error: string;
+  deviceState?: string;
+  rail: VoltageRailSnapshot;
+};
 
 export type ConnectionSnapshot = {
+  transportMode?: TransportMode;
   mode: TransportMode;
   state: string;
   deviceLabel: string;
@@ -17,18 +49,61 @@ export type FrameSnapshot = {
   valid: boolean;
   timestampUs: number | null;
   revision: number;
+  hostParserFps?: number;
+  generation?: number | null;
+  requestId?: number | null;
+};
+
+export type MatrixDiagnostics = {
+  reference?: string | null;
+  railValid?: boolean | null;
+  railAgeFrames?: number | null;
+  avddUv?: number | null;
+  avssUv?: number | null;
+  matrixReferenceUv?: number | null;
+  referenceResistorOhms?: number | null;
+  durationUs?: number | null;
+  transitionDurationUs?: number | null;
+  gainChangeCount?: number | null;
+  overrangeCount?: number | null;
+  autorangeAttemptCount?: number | null;
+  autorangeFallbackCount?: number | null;
+  recoveredRetryCount?: number | null;
+  drdyTimeoutCount?: number | null;
+  staleCount?: number | null;
+  spiErrorCount?: number | null;
+  [key: string]: unknown;
 };
 
 export type MatrixSnapshot = {
   rows: string[];
   cols: string[];
+  quantity: MeasurementQuantity;
+  mode?: MeasurementMode;
+  unit: MeasurementUnit | "%";
+  wireUnit?: MeasurementUnit;
+  scale: number;
+  format?: string;
+  values: (number | null)[][];
+  displayValues: (number | null)[][];
+  rawFixed: (number | null)[][];
+  valid: boolean[][];
+  fresh: boolean[][];
+  error?: boolean[][];
+  errorCodes: (number | null)[][];
+  errorReasons: (string | null)[][];
+  pga: (number | null)[][];
+  pgaBypass: boolean[][];
+  sourceTransport: string;
+  generation: number | null;
+  requestId: number | null;
+  diagnostics: MatrixDiagnostics;
+  rawHeader?: string;
+  rawTrailer?: string;
   correctedPf: (number | null)[][];
   rawPf: (number | null)[][];
-  rawFixed: (number | null)[][];
   userOffsetPf: (number | null)[][];
-  displayValues: (number | null)[][];
   validMask: boolean[][];
-  unit: "pF" | "%";
   domain: string;
 };
 
@@ -57,6 +132,7 @@ export type DisplaySnapshot = {
     min: number | null;
     max: number | null;
     frozen: boolean;
+    quantity?: MeasurementQuantity;
   };
 };
 
@@ -132,8 +208,10 @@ export type DiscoverySnapshot = {
 
 export type BackendSnapshotPayload = {
   connection: ConnectionSnapshot;
+  measurement: MeasurementSnapshot;
   frame: FrameSnapshot;
   matrix: MatrixSnapshot;
+  capacitance?: CapacitanceSnapshot;
   selection: SelectionSnapshot;
   display: DisplaySnapshot;
   baseline: BaselineSnapshot;
@@ -141,12 +219,26 @@ export type BackendSnapshotPayload = {
   logs: LogsSnapshot;
   discovery: DiscoverySnapshot;
   diagnostics: Record<string, unknown>;
+  battery?: BatterySnapshot;
+  ads?: AdsSnapshot;
+  rates?: RateSnapshot;
+};
+
+export type CapacitanceSnapshot = {
+  available: boolean;
+  rawPf: (number | null)[][];
+  correctedPf: (number | null)[][];
+  userOffsetPf: (number | null)[][];
+  displayPf: (number | null)[][];
+  displayMode: DisplayMode;
 };
 
 export type HistoryPoint = {
   seq: number;
   timeSeconds: number | null;
   value: number | null;
+  valid?: boolean;
+  fresh?: boolean;
 };
 
 export type HistorySeries = {
@@ -155,12 +247,77 @@ export type HistorySeries = {
 };
 
 export type HistoryPayload = {
+  mode: MeasurementMode;
+  quantity: MeasurementQuantity;
   selectionRevision: number;
   title: string;
   unit: string;
   revision: number;
   latestN?: number;
   series: HistorySeries[];
+};
+
+export type BatterySnapshot = {
+  revision?: number;
+  available?: boolean;
+  state?: string;
+  batteryText?: string;
+  batteryMv?: number | null;
+  batteryState?: string;
+  valid?: boolean | null;
+  fresh?: boolean | null;
+  ageMs?: number | null;
+  ageFrames?: number | null;
+  ageSeconds?: number | null;
+  reason?: string;
+  restoreResult?: string | null;
+  restoreFailureCount?: number | null;
+  railUv?: number | null;
+  railValid?: boolean | null;
+  railState?: string | null;
+  railErrorUv?: number | null;
+  retryCount?: number | null;
+  retryLimit?: number | null;
+  retryLastCount?: number | null;
+  retryTotalCount?: number | null;
+  unstableCount?: number | null;
+  timeoutCount?: number | null;
+  spreadRaw?: number | null;
+  spreadMaximumRaw?: number | null;
+  validRunCount?: number | null;
+  invalidRunCount?: number | null;
+  rawFields?: Record<string, string>;
+  [key: string]: unknown;
+};
+
+export type AdsSnapshot = {
+  identity?: { chip?: string; valid?: string | number | boolean; [key: string]: unknown };
+  identityAvailable?: boolean;
+  identityConfirmed?: boolean | null;
+  label?: string;
+  chip?: string;
+  valid?: boolean;
+  state?: string;
+  requestId?: number | null;
+  sampleCount?: number | null;
+  freshCount?: number | null;
+  period?: number | null;
+  spiError?: string | number | null;
+  drdyError?: string | number | null;
+  restore?: string | boolean | null;
+  error?: string;
+  [key: string]: unknown;
+};
+
+export type RateSnapshot = {
+  captureFps?: number | null;
+  emittedFps?: number | null;
+  serialOutputFps?: number | null;
+  bleOutputFps?: number | null;
+  wifiOutputFps?: number | null;
+  targetFps?: number | null;
+  hostParserFps?: number | null;
+  [key: string]: unknown;
 };
 
 export type SnapshotMessage = {
@@ -221,6 +378,18 @@ export type RowsResponse = {
   applied: boolean;
 };
 
+export type MeasurementModeRequest = {
+  mode: MeasurementMode;
+  measuredAvddV?: number;
+  measuredAvssV?: number;
+};
+
+export type MeasurementModeResponse = {
+  ok: boolean;
+  measurement?: MeasurementSnapshot;
+  error?: string;
+};
+
 export type OffsetScope = "cell" | "row" | "all";
 
 export type OffsetResponse = {
@@ -232,7 +401,7 @@ export type OffsetResponse = {
 export type SessionDataFormat = "csv" | "xlsx" | "mat" | "h5";
 
 export type SetupProfile = {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   appVersion?: string;
   transport: {
     mode: TransportMode;
@@ -241,7 +410,11 @@ export type SetupProfile = {
     ble: { address?: string; deviceId?: string };
     replay: { path?: string; speed: number };
   };
-  acquisition: { rows: number };
+  acquisition: { rows: number; measurementMode: MeasurementMode };
+  voltageRail: {
+    measuredAvddV: number | null;
+    measuredAvssV: number | null;
+  };
   display: {
     displayMode: DisplayMode;
     measurementDomain: string;

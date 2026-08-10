@@ -11,11 +11,16 @@ import numpy as np
 from sensorarray_app.app.configuration import AppConfiguration
 from sensorarray_app.app.runtime import SensorArrayRuntime
 from sensorarray_app.constants import APP_VERSION, CAP_FIXED_SCALE, CAP_INVALID_SENTINEL, DEFAULT_SERIAL_BAUD, WIFI_DEFAULT_HOST
-from sensorarray_app.domain.models import DisplayMode
+from sensorarray_app.domain.models import CapacitanceFrame, DisplayMode, MeasurementFrame, TransportEnvelope
 from sensorarray_app.services.discovery_service import scan_ble, scan_wifi
 from sensorarray_app.transport.serial_transport import SerialTransport
 from sensorarray_backend.core.history import history_payload
-from sensorarray_backend.core.session_data import SessionFrame, export_session_bytes, load_session_frames
+from sensorarray_backend.core.session_data import (
+    SessionFrame,
+    export_session_bytes,
+    frames_to_measurement_ascii_bytes,
+    load_session_frames,
+)
 from sensorarray_backend.core.snapshot import snapshot_payload
 
 _LINE_ENDINGS = {"lf": "\n", "crlf": "\r\n", "none": ""}
@@ -36,6 +41,9 @@ class BackendRuntime(SensorArrayRuntime):
         self.commandLineEnding = "lf"
         self.defaultSaveDirectory = str(Path.cwd())
         self._lastColorRange: tuple[float | None, float | None] = (None, None)
+        self.preferredMeasurementMode = "CAP"
+        self.measuredAvddV: float | None = None
+        self.measuredAvssV: float | None = None
 
     def set_transport_mode(self, mode: str) -> dict[str, str]:
         if mode not in {"serial", "ble", "wifi", "replay"}:
@@ -123,6 +131,44 @@ class BackendRuntime(SensorArrayRuntime):
             "rows": rows,
         }
 
+    def request_measurement_mode_api(
+        self,
+        mode: str,
+        measured_avdd_v: float | None = None,
+        measured_avss_v: float | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(mode).strip().upper()
+        normalized = {"CAPACITANCE": "CAP", "VOLTAGE": "VOLT", "RESISTANCE": "RES"}.get(normalized, normalized)
+        if (measured_avdd_v is None) != (measured_avss_v is None):
+            raise ValueError("Measured AVDD and AVSS must be supplied together as one external rail snapshot")
+        next_avdd_v = self.measuredAvddV
+        next_avss_v = self.measuredAvssV
+        if measured_avdd_v is not None:
+            next_avdd_v = _finite_float(measured_avdd_v, "measuredAvddV")
+        if measured_avss_v is not None:
+            next_avss_v = _finite_float(measured_avss_v, "measuredAvssV")
+        super().request_measurement_mode(normalized, next_avdd_v, next_avss_v)
+        self.measuredAvddV = next_avdd_v
+        self.measuredAvssV = next_avss_v
+        self.preferredMeasurementMode = normalized
+        return {"ok": True, "measurement": self.commands.measurement_snapshot()}
+
+    def configure_voltage_rail(self, measured_avdd_v: float, measured_avss_v: float) -> dict[str, Any]:
+        if self.commands.appliedMode == "VOLT":
+            raise ValueError("Cannot apply RAILCFG while VOLT is active; switch to CAP or RES first.")
+        avdd_v = _finite_float(measured_avdd_v, "measuredAvddV")
+        avss_v = _finite_float(measured_avss_v, "measuredAvssV")
+        avdd_uv = int(round(avdd_v * 1_000_000.0))
+        avss_uv = int(round(avss_v * 1_000_000.0))
+        self.measuredAvddV = avdd_v
+        self.measuredAvssV = avss_v
+        self.commands.request_rail(avdd_uv, avss_uv, self.transport.send_command)
+        self._host_log("Commands", "info", f"RAILCFG={avdd_uv},{avss_uv} requested; waiting for RACK/RAPP")
+        return {"ok": True, "measurement": self.commands.measurement_snapshot()}
+
+    def measurement_mode_payload(self) -> dict[str, Any]:
+        return {"ok": True, "measurement": self.commands.measurement_snapshot()}
+
     def update_display_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         if "displayMode" in payload and payload["displayMode"] is not None:
             mode = str(payload["displayMode"])
@@ -149,6 +195,8 @@ class BackendRuntime(SensorArrayRuntime):
 
     def set_display_mode(self, mode: str) -> None:
         selected = DisplayMode(mode)
+        if selected == DisplayMode.DELTA_PERCENT and self.matrixStore.snapshot().mode != "CAP":
+            raise ValueError("Delta C/C0 is available in capacitance mode only.")
         if selected == DisplayMode.DELTA_PERCENT and self.ui.baseline is None:
             self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
             self.capture_baseline()
@@ -316,6 +364,8 @@ class BackendRuntime(SensorArrayRuntime):
 
     def zero_current_offsets(self, scope: str, row: int | None = None, col: int | None = None) -> dict[str, Any]:
         snapshot = self.matrixStore.snapshot()
+        if snapshot.mode != "CAP":
+            raise ValueError("Capacitance offsets are available in capacitance mode only.")
         corrected = np.asarray(snapshot.matrix, dtype=np.float64)
         valid = np.asarray(snapshot.valid, dtype=bool) & np.isfinite(corrected)
         if snapshot.seq is None:
@@ -354,12 +404,17 @@ class BackendRuntime(SensorArrayRuntime):
         return {
             "metadata": {
                 "appVersion": APP_VERSION,
+                "schemaVersion": 2,
                 "exportedAt": datetime.now(timezone.utc).isoformat(),
                 "sourceTransport": snap["connection"]["mode"],
                 "device": snap["connection"]["deviceLabel"],
                 "frameSeq": snap["frame"]["seq"],
                 "fps": snap["frame"]["fps"],
                 "rows": snap["frame"]["rows"],
+                "measurementMode": snap["measurement"]["appliedMode"],
+                "quantity": snap["matrix"]["quantity"],
+                "unit": snap["matrix"]["wireUnit"],
+                "scale": snap["matrix"]["scale"],
             },
             "display": snap["display"],
             "offsetsPf": self.offsets_payload(),
@@ -377,18 +432,65 @@ class BackendRuntime(SensorArrayRuntime):
 
     def import_session_file(self, path: str) -> dict[str, Any]:
         frames = load_session_frames(path)
+        if not frames:
+            raise ValueError("session contains no measurement frames")
+        # Import is an offline replay boundary, not a live command response.
+        # Disconnect and reset every session-scoped state machine atomically so
+        # a pending MACK/RAIL/ROWS transaction cannot leave the imported matrix
+        # disagreeing with measurement.appliedMode.
+        self.disconnect()
+        import_session_generation = int(self.transport.status.get("sessionGeneration", 0) or 0)
+        self.registry.reset_session()
+        self.commands.reset_session(import_session_generation)
+        self.telemetry.reset()
         self.matrixStore.clear()
+        imported_frames = 0
         for frame in frames:
-            self.matrixStore.add_capacitance(self._session_frame_to_capacitance(frame))
+            # Re-enter imported data through the exact current ASCII parser so
+            # import and Replay exercise the same C/V/R, mask, Xhh, PGA and
+            # CRC semantics as live transports.  The exported mode is an
+            # authoritative offline-session boundary; it is not an optimistic
+            # hardware mode transition.
+            payload = frames_to_measurement_ascii_bytes([frame])
+            envelope = TransportEnvelope(
+                source="replay",
+                channel="data",
+                deviceId=str(Path(path)),
+                sessionGeneration=import_session_generation,
+                receivedMonotonicNs=time.monotonic_ns(),
+                receivedWallTime=time.time(),
+                rawPayload=payload,
+            )
+            parsed_frames = [
+                event
+                for event in self.registry.feed(envelope)
+                if isinstance(event, (CapacitanceFrame, MeasurementFrame))
+            ]
+            if len(parsed_frames) != 1:
+                raise ValueError(f"session frame {frame.seq} did not produce exactly one valid measurement frame")
+            parsed = parsed_frames[0]
+            mode = "CAP" if isinstance(parsed, CapacitanceFrame) else parsed.mode
+            generation = parsed.generation
+            request_id = parsed.requestId
+            self.commands.observe_mode_frame(mode, generation, request_id, parsed.seq)
+            self.matrixStore.apply_measurement_mode(mode, generation, request_id, parsed.seq)
+            self._handle_event(parsed)
+            imported_frames += 1
         self.selectedMode = "replay"
         self.replayPath = str(Path(path))
         self._host_log("Replay", "info", f"Imported session data: {Path(path).name}")
-        return {"ok": True, "path": str(Path(path)), "frames": len(frames), "rows": frames[-1].rows}
+        return {
+            "ok": True,
+            "path": str(Path(path)),
+            "frames": imported_frames,
+            "rows": frames[-1].rows,
+            "measurementMode": frames[-1].mode,
+        }
 
     def setup_profile_payload(self) -> dict[str, Any]:
         snap = snapshot_payload(self)
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "appVersion": APP_VERSION,
             "transport": {
                 "mode": self.selectedMode,
@@ -397,7 +499,14 @@ class BackendRuntime(SensorArrayRuntime):
                 "ble": {"address": self.bleAddress, "deviceId": self.bleDeviceId},
                 "replay": {"path": self.replayPath or "", "speed": self.replaySpeed},
             },
-            "acquisition": {"rows": snap["frame"]["rows"]},
+            "acquisition": {
+                "rows": snap["frame"]["rows"],
+                "measurementMode": self.preferredMeasurementMode,
+            },
+            "voltageRail": {
+                "measuredAvddV": self.measuredAvddV,
+                "measuredAvssV": self.measuredAvssV,
+            },
             "display": {
                 "displayMode": self.ui.displayMode.value,
                 "measurementDomain": self.ui.measurementDomain,
@@ -415,7 +524,7 @@ class BackendRuntime(SensorArrayRuntime):
 
     def apply_setup_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
         warnings: list[str] = []
-        if int(payload.get("schemaVersion", 1)) != 1:
+        if int(payload.get("schemaVersion", 1)) not in {1, 2}:
             raise ValueError("unsupported setup profile schemaVersion")
         transport = payload.get("transport") if isinstance(payload.get("transport"), dict) else {}
         serial = transport.get("serial") if isinstance(transport.get("serial"), dict) else {}
@@ -464,6 +573,16 @@ class BackendRuntime(SensorArrayRuntime):
                 raise ValueError("paths.defaultSaveDirectory must not be empty")
             self.defaultSaveDirectory = directory
         acquisition = payload.get("acquisition") if isinstance(payload.get("acquisition"), dict) else {}
+        if "measurementMode" in acquisition:
+            requested_mode = str(acquisition.get("measurementMode") or "CAP").upper()
+            if requested_mode not in {"CAP", "VOLT", "RES"}:
+                raise ValueError("acquisition.measurementMode must be CAP, VOLT, or RES")
+            self.preferredMeasurementMode = requested_mode
+        voltage_rail = payload.get("voltageRail") if isinstance(payload.get("voltageRail"), dict) else {}
+        if voltage_rail.get("measuredAvddV") is not None:
+            self.measuredAvddV = _finite_float(voltage_rail["measuredAvddV"], "voltageRail.measuredAvddV")
+        if voltage_rail.get("measuredAvssV") is not None:
+            self.measuredAvssV = _finite_float(voltage_rail["measuredAvssV"], "voltageRail.measuredAvssV")
         if "rows" in acquisition:
             rows = int(acquisition.get("rows") or 0)
             if not (1 <= rows <= 8):
@@ -497,8 +616,19 @@ class BackendRuntime(SensorArrayRuntime):
                     "seq": int(history.seq[index]),
                     "timeSeconds": _json_number(history.timeSeconds[index]),
                     "rows": int(history.rows[index]),
-                    "valuesPf": [_json_number(value) for value in values],
+                    "measurementMode": str(history.modes[index]),
+                    "unit": str(history.units[index]),
+                    "scale": int(history.scales[index]),
+                    "physicalValues": [_json_number(value) for value in values],
+                    "valuesPf": [_json_number(value) for value in values] if history.modes[index] == "CAP" else [None] * 64,
+                    "rawFixed": [_json_number(value) for value in history.rawFixed[index, :]],
                     "valid": [bool(value) for value in history.valid[index, :].tolist()],
+                    "fresh": [bool(value) for value in history.fresh[index, :].tolist()],
+                    "errorCodes": [None if int(value) < 0 else int(value) for value in history.errorCodes[index, :]],
+                    "pga": [None if int(value) < 0 else int(value) for value in history.pga[index, :]],
+                    "generation": None if int(history.generations[index]) < 0 else int(history.generations[index]),
+                    "requestId": None if int(history.requestIds[index]) < 0 else int(history.requestIds[index]),
+                    "source": str(history.sources[index] or "history"),
                 }
             )
         return frames
@@ -582,6 +712,9 @@ class BackendRuntime(SensorArrayRuntime):
                     padding = span * 0.02
                 self._lastColorRange = (minimum - padding, maximum + padding)
         return self._lastColorRange
+
+    def _measurement_mode_visual_reset(self) -> None:
+        self._lastColorRange = (None, None)
 
     def _correct_selection_locked(self, active_rows: int):
         from sensorarray_app.domain.selection import correct_selection

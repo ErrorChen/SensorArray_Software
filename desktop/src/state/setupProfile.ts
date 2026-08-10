@@ -1,6 +1,6 @@
-import type { BackendSnapshotPayload, CommandLineEnding, SetupProfile, TransportMode } from "../api/types";
+import type { BackendSnapshotPayload, CommandLineEnding, MeasurementMode, SetupProfile, TransportMode } from "../api/types";
 
-export const setupProfileSchemaVersion = 1;
+export const setupProfileSchemaVersion = 2;
 
 export function defaultSetupProfile(runtimeDirectory: string): SetupProfile {
   return {
@@ -13,7 +13,11 @@ export function defaultSetupProfile(runtimeDirectory: string): SetupProfile {
       ble: { address: "", deviceId: "" },
       replay: { path: "", speed: 1 }
     },
-    acquisition: { rows: 8 },
+    acquisition: { rows: 8, measurementMode: "CAP" },
+    voltageRail: {
+      measuredAvddV: null,
+      measuredAvssV: null
+    },
     display: {
       displayMode: "absolute_pf",
       measurementDomain: "auto",
@@ -44,7 +48,11 @@ export function setupProfileFromSnapshot(snapshot: BackendSnapshotPayload | null
       ble: { ...current.transport.ble },
       replay: { ...current.transport.replay }
     },
-    acquisition: { rows: snapshot.frame.rows },
+    acquisition: { rows: snapshot.frame.rows, measurementMode: snapshot.measurement?.appliedMode ?? current.acquisition.measurementMode },
+    voltageRail: {
+      measuredAvddV: finiteOrExisting(snapshot.measurement?.rail.measuredAvddV, current.voltageRail.measuredAvddV),
+      measuredAvssV: finiteOrExisting(snapshot.measurement?.rail.measuredAvssV, current.voltageRail.measuredAvssV)
+    },
     display: {
       displayMode: snapshot.display.displayMode,
       measurementDomain: snapshot.display.measurementDomain,
@@ -65,7 +73,7 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
     return fallback;
   }
   const payload = value as Partial<SetupProfile>;
-  if (payload.schemaVersion !== undefined && payload.schemaVersion !== setupProfileSchemaVersion) {
+  if (payload.schemaVersion !== undefined && payload.schemaVersion !== 1 && payload.schemaVersion !== setupProfileSchemaVersion) {
     throw new Error("Unsupported setup profile schemaVersion");
   }
   const transport = objectValue<SetupProfile["transport"]>(payload.transport);
@@ -77,8 +85,9 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
   const command = objectValue<SetupProfile["command"]>(payload.command);
   const paths = objectValue<SetupProfile["paths"]>(payload.paths);
   const acquisition = objectValue<SetupProfile["acquisition"]>(payload.acquisition);
+  const voltageRail = objectValue<SetupProfile["voltageRail"]>(payload.voltageRail);
   const baud = finitePositive(serial.baud ?? fallback.transport.serial.baud, "transport.serial.baud");
-  const rows = integerRange(acquisition.rows ?? fallback.acquisition.rows, 1, 8, "acquisition.rows");
+  const rows = supportedRows(acquisition.rows ?? fallback.acquisition.rows);
   const lineEnding = normaliseLineEnding(command.lineEnding ?? fallback.command.lineEnding);
   const defaultSaveDirectory = String(paths.defaultSaveDirectory || runtimeDirectory).trim();
   if (!defaultSaveDirectory) {
@@ -97,7 +106,14 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
       ble: { address: String(ble.address ?? fallback.transport.ble.address ?? ""), deviceId: String(ble.deviceId ?? fallback.transport.ble.deviceId ?? "") },
       replay: { path: String(replay.path ?? fallback.transport.replay.path ?? ""), speed: finitePositive(replay.speed ?? fallback.transport.replay.speed, "transport.replay.speed") }
     },
-    acquisition: { rows },
+    acquisition: {
+      rows,
+      measurementMode: normaliseMeasurementMode(acquisition.measurementMode ?? fallback.acquisition.measurementMode)
+    },
+    voltageRail: {
+      measuredAvddV: optionalFiniteNumber(voltageRail.measuredAvddV ?? fallback.voltageRail.measuredAvddV, "voltageRail.measuredAvddV"),
+      measuredAvssV: optionalFiniteNumber(voltageRail.measuredAvssV ?? fallback.voltageRail.measuredAvssV, "voltageRail.measuredAvssV")
+    },
     display: {
       displayMode: display.displayMode === "delta_percent" ? "delta_percent" : fallback.display.displayMode,
       measurementDomain: String(display.measurementDomain ?? fallback.display.measurementDomain),
@@ -161,8 +177,32 @@ function integerRange(value: unknown, min: number, max: number, name: string): n
   return number;
 }
 
+function supportedRows(value: unknown): number {
+  const rows = Math.trunc(finiteNumber(value, "acquisition.rows"));
+  if (![1, 2, 4, 8].includes(rows)) {
+    throw new Error("acquisition.rows must be one of 1, 2, 4, or 8");
+  }
+  return rows;
+}
+
 function normaliseTransportMode(value: unknown): TransportMode {
   return value === "ble" || value === "wifi" || value === "replay" ? value : "serial";
+}
+
+function normaliseMeasurementMode(value: unknown): MeasurementMode {
+  const mode = String(value ?? "").trim().toUpperCase();
+  return mode === "VOLT" || mode === "RES" ? mode : "CAP";
+}
+
+function optionalFiniteNumber(value: unknown, name: string): number | null {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  return finiteNumber(value, name);
+}
+
+function finiteOrExisting(value: number | null | undefined, existing: number | null): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : existing;
 }
 
 function normaliseLineEnding(value: unknown): CommandLineEnding {

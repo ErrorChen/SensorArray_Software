@@ -1,0 +1,10 @@
+MACK,id=42,old=CAP,new=VOLT,state=accepted
+MAPP,id=42,gen=7,old=CAP,new=VOLT,seq=8,state=applied,transitionUs=500
+RACK,id=51,avdd=3391000,avss=-2500000,source=external,state=accepted
+RAPP,id=51,gen=3,seq=9,avdd=3391000,avss=-2500000,source=external,state=applied
+ADS,chip=unknown,valid=0,adc1=0,adc2=0,adc=0,ref=unsynced,pwr=vbias:0,mode=dr0,gap=off
+ACK,cmd=ADSCHK,id=7,samples=100,status=accepted
+ADSCHK,id=7,ok=1,chip=1262,idreg=0x03,rev=0,adc1=1,adc2=0,power=0x02,interface=0x04,mode0=0x00,mode1=0x00,mode2=0x0F,inpmux=0x01,refmux=0x24,dr=38400,filter=sinc1,chop=0,delayUs=0,pga=bypass,reference=avdd-avss,vbias=1
+ADSCHKSTAT,id=7,samples=100,fresh=100,changed=99,periodMinUs=25,periodAvgUs=26,periodMaxUs=28,spi=0,timeout=0,stale=0,statusErr=0,reset=0,restore=ok,durationUs=3000
+ABAT,bt=4012,valid=1,fresh=1,ageMs=12,periodMs=1000,due=0,run=12,validRun=11,invalidRun=1,skip=2,defer=1,boundary=4,restoreFail=0,retry=0/1,unstable=1,timeout=0,spreadRaw=5,spreadMaxRaw=9,raw=123,a8d=100,ac=2005900,a8g=2006000,ratio=2/1,rail=5200000,railState=ok,vbias=1,samples=3,sampleUs=820,restore=ok,reason=ok
+BAPP,id=8,cmd=BATNOW,seq=10,err=0x0,durationUs=820,status=complete

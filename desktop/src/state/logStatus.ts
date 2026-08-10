@@ -44,6 +44,34 @@ function parseLogRow(row: LogRow): StatusItem {
     lastSeen: row.timestamp ? new Date(row.timestamp * 1000).toLocaleTimeString() : undefined
   };
   const schema = logTagSchemas[tag];
+  if (tag === "ADS" && adsIdentityUnconfirmed(details)) {
+    return {
+      ...base,
+      category: "ADS",
+      severity: "warn",
+      title: "ADS identity unconfirmed",
+      explanation: "Firmware did not confirm the ADC identity. The host does not assume an ADS1262 device.",
+      details: labelDetails(details, schema?.fieldLabels ?? {}, "Legacy/unknown field", schema?.fieldFormatters)
+    };
+  }
+  if (tag === "RAPP" && (details.source === "external" || "avdd" in details || "avss" in details)) {
+    return buildStatusItemFromSchema(
+      row,
+      tag,
+      {
+        category: "Measurement",
+        title: "Voltage rail configuration applied",
+        explanation: "Firmware applied the measured external AVDD/AVSS configuration.",
+        fieldLabels: {
+          id: "Request ID (id)", gen: "Generation (gen)", seq: "Frame sequence (seq)",
+          avdd: "Measured AVDD µV (avdd)", avss: "Measured AVSS µV (avss)",
+          source: "Rail source (source)", state: "Transaction state (state)"
+        },
+        severity: "ok"
+      },
+      details
+    );
+  }
   if (schema) {
     return buildStatusItemFromSchema(row, tag, schema, details);
   }
@@ -85,6 +113,13 @@ function parseLogRow(row: LogRow): StatusItem {
     explanation: Object.keys(details).length ? "Unknown firmware log with parsed key/value fields." : "Unknown firmware log line.",
     details: labelDetails(details, {}, "Unknown firmware field")
   };
+}
+
+function adsIdentityUnconfirmed(details: Record<string, LogFieldValue>): boolean {
+  const chip = String(details.chip ?? "").trim().toLowerCase();
+  const valid = details.valid;
+  const invalid = valid === false || valid === 0 || String(valid).trim() === "0" || String(valid).toLowerCase() === "false";
+  return invalid && (!chip || chip === "unknown");
 }
 
 function buildStatusItemFromSchema(row: LogRow, tag: string, schema: LogTagSchema, details: Record<string, LogFieldValue>): StatusItem {

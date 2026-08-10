@@ -83,6 +83,11 @@ class BleFragmentReassembler:
                 output.append((input_channel, raw_payload))
         return output
 
+    def reset(self) -> None:
+        """Discard partial messages at a transport-session boundary."""
+
+        self._messages.clear()
+
     def _feed_fragment(
         self,
         input_channel: str,

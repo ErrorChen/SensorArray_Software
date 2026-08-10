@@ -33,6 +33,9 @@ dist-backend/
 /desktop/.eslintcache
 /desktop/.vitest/
 
+# Local GUI acceptance screenshots, Playwright reports, traces and videos
+/validation_artifacts/
+
 # Editable/install metadata
 *.egg-info/
 

@@ -41,7 +41,11 @@ async def scan_ble_candidates(timeout_seconds: float = 10.0) -> list[BleCandidat
         name = device.name or (adv.local_name if adv else "") or ""
         uuids = tuple(sorted({uuid.lower() for uuid in (adv.service_uuids if adv else [])}))
         match_reason = _scan_match_reason(name, uuids)
-        advanced = match_reason == "unnamed"
+        # 0x00FF is a generic vendor service UUID and is not sufficient to
+        # identify a SensorArray device. Keep service-only matches available
+        # for explicit advanced inspection, but do not present them as normal
+        # verified project candidates.
+        advanced = match_reason in {"unnamed", "service"}
         if match_reason or not name:
             candidates.append(
                 BleCandidate(
@@ -90,9 +94,13 @@ async def discover_verified_ble_candidates(scan_seconds: float = 10.0) -> list[B
     candidates = await scan_ble_candidates(scan_seconds)
     verified: list[BleCandidate] = []
     for candidate in candidates:
-        # Only connect-probe likely SensorArray devices. Unnamed and unrelated
-        # devices remain available under the advanced UI list but are not promoted.
-        if candidate.matchReason in {"service", "project_name"}:
+        # Connect/GATT-probe only candidates whose advertised project name is
+        # SensorArray-specific. The FF service is deliberately generic; probing
+        # every FF advertiser serially can add eight seconds per unrelated
+        # device and make the GUI scan exceed its bounded timeout. A named
+        # candidate still undergoes the complete service + FF10/11/20/30 check
+        # in ``verify_ble_candidate`` before it is promoted as verified.
+        if candidate.matchReason == "project_name":
             verified.append(await verify_ble_candidate(candidate))
         else:
             verified.append(candidate)
@@ -101,10 +109,14 @@ async def discover_verified_ble_candidates(scan_seconds: float = 10.0) -> list[B
 
 def _scan_match_reason(name: str, uuids: tuple[str, ...]) -> str:
     lower_name = name.lower()
-    if _uuid_match(BLE_SERVICE_UUID, set(uuids)):
-        return "service"
+    # Project naming is more specific than the generic 0x00FF advertisement.
+    # Check it first so a real CscArray device is selected for full GATT
+    # verification while unrelated FF advertisers remain inexpensive scan
+    # results under Advanced devices.
     if name.startswith(BLE_NAME_PREFIX) or any(hint in lower_name for hint in PROJECT_NAME_HINTS):
         return "project_name"
+    if _uuid_match(BLE_SERVICE_UUID, set(uuids)):
+        return "service"
     if not name:
         return "unnamed"
     return ""

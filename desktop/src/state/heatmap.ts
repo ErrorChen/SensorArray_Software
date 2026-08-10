@@ -1,4 +1,5 @@
 import type { BackendSnapshotPayload } from "../api/types";
+import { matrixDisplayUnit } from "./measurement";
 
 export type HeatmapDatum = [number, number, number | null, string, boolean];
 
@@ -9,11 +10,11 @@ export function resolveColourRange(data: HeatmapDatum[], snapshot: BackendSnapsh
   }
   const values = data.map((item) => item[2]).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   if (!values.length) {
-    return snapshot.matrix.unit === "%" ? [-0.5, 0.5] : [0, 1];
+    return matrixDisplayUnit(snapshot) === "%" ? [-0.5, 0.5] : [0, 1];
   }
   const minimum = Math.min(...values);
   const maximum = Math.max(...values);
-  if (snapshot.matrix.unit === "%") {
+  if (matrixDisplayUnit(snapshot) === "%") {
     const extent = Math.max(Math.abs(minimum), Math.abs(maximum), 0.5);
     return [-extent, extent];
   }

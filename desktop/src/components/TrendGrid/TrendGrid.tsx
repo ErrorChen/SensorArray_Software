@@ -2,10 +2,12 @@ import * as echarts from "echarts";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { BackendHttpClient } from "../../api/httpClient";
-import type { HistoryPayload, HistorySeries } from "../../api/types";
+import type { BackendSnapshotPayload, HistoryPayload, HistorySeries, MeasurementMode, MeasurementQuantity } from "../../api/types";
+import { appliedMeasurementMode, formatMeasurementValue, quantityForMode, quantityLabel } from "../../state/measurement";
 
 type Props = {
   client: BackendHttpClient | null;
+  snapshot: BackendSnapshotPayload | null;
   history: HistoryPayload | null;
   onHistory: (history: HistoryPayload) => void;
   onError: (message: string) => void;
@@ -19,10 +21,12 @@ const trendWindowOptions = [
   { label: "All session", value: 0 }
 ];
 
-export function TrendGrid({ client, history, onHistory, onError }: Props): JSX.Element {
+export function TrendGrid({ client, snapshot, history, onHistory, onError }: Props): JSX.Element {
   const [latestN, setLatestN] = useState(history?.latestN ?? 600);
   const [pending, setPending] = useState(false);
-  const series = history?.series ?? [];
+  const appliedMode = appliedMeasurementMode(snapshot);
+  const visibleHistory = historyForMode(history, appliedMode);
+  const series = visibleHistory?.series ?? [];
   const padded = [0, 1, 2, 3].map((index) => series[index] ?? { cell: "-", points: [] });
   const hasData = series.some((item) => item.points.some((point) => point.value !== null));
 
@@ -50,7 +54,9 @@ export function TrendGrid({ client, history, onHistory, onError }: Props): JSX.E
   return (
     <section className="trendPanel">
       <div className="panelHeader panelHeaderWithActions">
-        <span>{history?.title ?? "S1 Primary FDC D1-D4"}</span>
+        <span>
+          {visibleHistory?.title ?? "S1 Primary FDC D1-D4"} · {quantityLabel(visibleHistory?.quantity ?? quantityForMode(appliedMode))}
+        </span>
         <label className="compactField">
           <span>Trend Window</span>
           <select disabled={pending} value={latestN} onChange={(event) => void changeTrendWindow(Number(event.target.value))}>
@@ -64,7 +70,12 @@ export function TrendGrid({ client, history, onHistory, onError }: Props): JSX.E
       </div>
       <div className="trendGrid">
         {padded.map((item, index) => (
-          <TrendChart key={`${item.cell}-${index}`} series={item} unit={history?.unit ?? "pF"} />
+          <TrendChart
+            key={`${appliedMode}-${item.cell}-${index}`}
+            series={item}
+            unit={visibleHistory?.unit ?? unitForMode(appliedMode)}
+            quantity={visibleHistory?.quantity ?? quantityForMode(appliedMode)}
+          />
         ))}
       </div>
       {hasData ? null : <div className="trendEmpty">No data yet</div>}
@@ -72,7 +83,7 @@ export function TrendGrid({ client, history, onHistory, onError }: Props): JSX.E
   );
 }
 
-function TrendChart({ series, unit }: { series: HistorySeries; unit: string }): JSX.Element {
+function TrendChart({ series, unit, quantity }: { series: HistorySeries; unit: string; quantity: MeasurementQuantity }): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
 
@@ -109,7 +120,7 @@ function TrendChart({ series, unit }: { series: HistorySeries; unit: string }): 
         grid: { left: 44, right: 16, top: 34, bottom: 30 },
         tooltip: {
           trigger: "axis",
-          formatter: (params: unknown) => formatTooltip(params, unit)
+          formatter: (params: unknown) => formatTooltip(params, unit, quantity)
         },
         xAxis: {
           type: "value",
@@ -120,13 +131,13 @@ function TrendChart({ series, unit }: { series: HistorySeries; unit: string }): 
           nameTextStyle: { fontSize: 10 },
           splitLine: { show: false }
         },
-        yAxis: { type: "value", name: unit, nameTextStyle: { fontSize: 10 }, scale: true },
+        yAxis: { type: "value", name: unit === "ohm" ? "Ω" : unit, nameTextStyle: { fontSize: 10 }, scale: true },
         series: [{ type: "line", showSymbol: false, data: points, lineStyle: { width: 1.6, color: "#0f766e" } }]
       },
       { notMerge: true, lazyUpdate: false }
     );
     requestAnimationFrame(() => chart.resize());
-  }, [series, unit]);
+  }, [quantity, series, unit]);
 
   return <div ref={hostRef} className="trendCanvas" />;
 }
@@ -138,8 +149,8 @@ type TrendDatum = {
   cell: string;
 };
 
-function buildTrendPoints(series: HistorySeries): TrendDatum[] {
-  const visible = series.points.filter((point) => point.value !== null);
+export function buildTrendPoints(series: HistorySeries): TrendDatum[] {
+  const visible = series.points.filter((point) => point.value !== null && point.valid !== false && point.fresh !== false);
   const firstTime = visible.find((point) => typeof point.timeSeconds === "number")?.timeSeconds ?? null;
   return visible.map((point, index) => {
     const x = typeof point.timeSeconds === "number" && firstTime !== null ? point.timeSeconds - firstTime : index;
@@ -152,7 +163,7 @@ function buildTrendPoints(series: HistorySeries): TrendDatum[] {
   });
 }
 
-function formatTooltip(params: unknown, unit: string): string {
+function formatTooltip(params: unknown, unit: string, quantity: MeasurementQuantity): string {
   const first = Array.isArray(params) ? params[0] : params;
   if (!first || typeof first !== "object" || !("data" in first)) {
     return "";
@@ -163,8 +174,30 @@ function formatTooltip(params: unknown, unit: string): string {
   }
   return [
     `<strong>${data.cell}</strong>`,
-    `value: ${data.value[1].toFixed(unit === "%" ? 2 : 3)} ${unit}`,
+    `value: ${formatMeasurementValue(data.value[1], quantity, { percent: unit === "%" })}`,
     `seq: ${data.seq}`,
     `time: ${typeof data.timeSeconds === "number" ? data.timeSeconds.toFixed(3) : "NA"}`
   ].join("<br/>");
+}
+
+export function historyForMode(history: HistoryPayload | null, mode: MeasurementMode): HistoryPayload | null {
+  if (!history) {
+    return null;
+  }
+  const historyMode = history.mode ?? modeFromQuantity(history.quantity);
+  return historyMode === mode ? history : null;
+}
+
+function modeFromQuantity(quantity: MeasurementQuantity | undefined): MeasurementMode {
+  if (quantity === "voltage") {
+    return "VOLT";
+  }
+  if (quantity === "resistance") {
+    return "RES";
+  }
+  return "CAP";
+}
+
+function unitForMode(mode: MeasurementMode): string {
+  return mode === "VOLT" ? "V" : mode === "RES" ? "ohm" : "pF";
 }

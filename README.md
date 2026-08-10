@@ -1,481 +1,199 @@
 # SensorArray Desktop Host
 
-Desktop host software for the SensorArray b41 8x8 matrix. The default user
-interface is an Electron desktop application with a React frontend and a Python
-FastAPI backend sidecar.
+SensorArray Desktop Host is the Electron/React/FastAPI application for the
+SensorArray 8x8 measurement matrix. It supports three measurement quantities
+without replacing the existing transport and desktop architecture:
 
-Firmware protocol baseline:
+- `CAP`: capacitance in pF, including circuit correction, per-cell offsets,
+  baseline capture, and Delta C/C0 %.
+- `VOLT`: signed fixed-point microvolts converted to volts.
+- `RES`: fixed-point milliohms converted to ohms.
 
-```text
-b41c5256fbb5b23a0f0d98ed651db2f6ced3a0d6
-```
+Serial, Bluetooth LE, Wi-Fi UDP, and Replay all feed the same content-routed
+protocol layer, typed measurement state, WebSocket snapshot, heatmap, and trend
+charts. Replay validates the software path; it is not evidence that a hardware
+transport passed.
 
-## Environment
+## Protocol authority
 
-Python backend work should use the repository `.venv`. Electron/React uses the
-system Node.js and npm installation. You do not need to exit `.venv` before
-running npm commands.
+The sibling [SensorArray firmware repository](https://github.com/ErrorChen/SensorArray)
+is authoritative for the measurement and command wire protocol. Host fixtures
+are compatibility copies, not a second protocol specification. When firmware
+documentation disagrees with production formatter/command code and its tests,
+the implementation and tests take precedence.
+
+The current host understands:
+
+- CAP `C` headers, `D` value chunks, and `K` CRC trailers.
+- VOLT/RES `V` or `R` headers, `D` value/error chunks, packed `P` PGA chunks,
+  and `K` CRC trailers.
+- `MODE?`, `STATE?`, `MODE=CAP|VOLT|RES`, and the strict `MACK` accepted / `MAPP`
+  applied transaction.
+- `ROWS`, `RCMD`, and `RAPP`.
+- external measured-rail `RAILCFG`, `RACK`, `RAPP`, and `RERR`.
+- ADS identity and `ADSCHK` diagnostics.
+- battery cache, immediate transaction, scheduler, and diagnostic telemetry.
+
+VOLT data is signed integer microvolts (`unit=V,scale=-6`); RES data is integer
+milliohms (`unit=ohm,scale=-3`). A value such as `-1250` is a valid negative
+voltage. `Xhh` is an invalid cell carrying firmware error code `0xHH`; it is
+never converted to zero. PGA literals are `01/02/04/08/10/20` for x1 through
+x32, while `00` means verified PGA bypass.
+
+For the exact frame, mask, CRC, transaction, and diagnostic contracts, see
+[Host measurement protocol compatibility notes](docs/measurement-protocol.md).
+
+## Install and run
+
+Use the repository virtual environment for Python and the system Node.js/npm
+installation for Electron:
 
 ```powershell
-.\.venv\Scripts\python.exe --version
-node --version
-npm.cmd --version
-```
-
-On Windows, `npm` may be blocked by PowerShell execution policy. Use `npm.cmd`
-from the same terminal, or refresh VS Code/PATH. Do not bake local absolute
-paths into source files.
-
-## Install And Run
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
 cd desktop
-npm install
-npm run desktop
+npm.cmd install
+npm.cmd run desktop
 ```
 
-`npm run desktop` starts Vite, launches Electron, and lets Electron start the
-Python backend sidecar. Backend-only development is still available:
+`npm.cmd run desktop` starts Vite and Electron. Electron starts the Python
+backend sidecar, probes `127.0.0.1` ports `8888` through `8988`, waits for a
+successful `GET /health`, and supplies the selected backend URL to the renderer
+through the existing preload bridge. Backend-only development remains available:
 
 ```powershell
 .\.venv\Scripts\python.exe -m sensorarray_backend --host 127.0.0.1 --port 8888
 ```
 
-The backend default port is `8888`. Electron starts the Python backend sidecar
-on `127.0.0.1` by trying `8888`, then `8889`, continuing one port at a time
-through `8988`. Each candidate must start the backend and return HTTP 200 from
-`/health`; failed candidates are stopped before the next port is tried. The
-renderer receives the selected `backendUrl` from the load query or Electron
-preload bridge, and all HTTP and WebSocket clients derive from that same URL.
-
-## Icons
-
-The only source icon is the repository root `icon.png`. All other icon assets
-are generated from it:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\generate_icons.py
-```
-
-The script center-crops `icon.png`, generates PNG sizes under
-`desktop/assets/icons/`, creates `sensorarray-icon.ico`, and syncs
-`desktop/public/favicon.ico`, `icon-192.png`, and `icon-512.png`. Electron uses
-`desktop/assets/icons/sensorarray-icon.ico` in development and checks packaged
-resource locations when packaged. Windows may cache old taskbar/window icons;
-restart Electron or clear the Windows icon cache if the generated icon does not
-appear immediately.
-
-## Packaging Windows Installer
-
-Packaging is intended to run on Windows from the repository root.
-
-Prerequisites for maintainers:
-
-- Windows.
-- Python 3.11 or newer.
-- Node.js LTS.
-- npm.
-
-Build the Python backend sidecar, Electron app, `win-unpacked` smoke target, and
-NSIS installer with one command:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\package_windows.ps1
-```
-
-Outputs are written under:
-
-```text
-desktop/release/
-```
-
-The distributable installer is the `*-nsis.exe` file in `desktop/release/`.
-End users do not need Python, Node.js, npm, Git, the source tree, or `.venv`.
-The installer contains the Electron frontend and the PyInstaller-built Python
-backend sidecar. For internal validation, run
-`desktop/release/win-unpacked/SensorArray.exe` first. For normal distribution,
-use the NSIS installer, for example:
-
-```text
-desktop/release/SensorArray-1.0.0-win-x64-nsis.exe
-```
-
-The packaged app starts the backend from
-`process.resourcesPath\backend\SensorArrayBackend.exe` and loads the bundled
-`dist/index.html`; it does not use the Vite dev server or the repository
-`.venv`.
-
-Common issues:
-
-- Windows SmartScreen may warn because the installer is unsigned. Use the
-  publisher signing flow before broad distribution.
-- Antivirus software may flag unsigned Electron or PyInstaller binaries. Verify
-  the build machine and submit the installer for vendor review if needed.
-- BLE failures are usually Windows permission, adapter, or driver issues. Check
-  that Bluetooth is enabled and the adapter supports BLE.
-- Serial connection failures often mean the COM port is already open in another
-  tool. Close serial monitors before connecting.
-- If the app shows "backend failed to start", the error window includes recent
-  backend stderr/stdout. For installer builds, reproduce with
-  `desktop/release/win-unpacked/SensorArray.exe` to inspect the bundled
-  sidecar path before installing.
-
 ## Architecture
 
 ```text
-Electron main process
--> starts Python backend sidecar
--> waits for GET /health
--> opens SensorArray BrowserWindow with generated icon
--> terminates the backend child process on application exit
-
-React + TypeScript frontend
--> resizable heatmap/setup/trend workspace
--> Write / Command panel
--> Raw Log / Status panel
--> REST commands and WebSocket snapshots
-
-FastAPI backend
--> Serial / BLE / Wi-Fi UDP / Replay transports
--> content-routed b41 C/D/K parser
--> matrix and history stores
--> baseline and delta C/C0 %
--> REST API and /ws realtime stream
+Serial / BLE / Wi-Fi / Replay
+             |
+             v
+      ProtocolRegistry
+             |
+       C / V / R parser
+             |
+   typed measurement + command events
+             |
+     MatrixStore / history / telemetry
+             |
+       FastAPI + WebSocket
+             |
+       React UI in Electron
 ```
 
-Reusable protocol, transport, domain, and store code is under
-`src/sensorarray_app`. The desktop backend service is under
-`src/sensorarray_backend`.
+The existing BLE service and characteristics remain `00FF`, `FF10`, `FF11`,
+`FF20`, and `FF30`. Wi-Fi UDP remains DATA `3333`, LOG `3334`, and CTRL `3335`.
+BLE fragmentation/reassembly occurs before content routing. A complete
+measurement packet received on a log channel is still routed by its `C`, `V`,
+or `R` content.
 
-## API
+Transport mode and measurement mode are deliberately separate:
+
+- `connection.transportMode`: `serial`, `ble`, `wifi`, or `replay`.
+- `measurement.appliedMode`: `CAP`, `VOLT`, or `RES`.
+
+The UI does not optimistically commit a measurement mode on `MACK`. It shows a
+pending transition until a matching `MAPP` supplies the generation and frame
+sequence boundary. Old-generation VOLT/RES frames and pre-boundary CAP frames
+are rejected.
+
+## Voltage rail configuration
+
+VOLT requires a paired, externally measured rail snapshot from the current
+power, wiring, and load condition:
+
+```text
+RAILCFG=<positive_AVDD_uV>,<negative_AVSS_uV>
+```
+
+Enter the readings as volts in Setup; the host converts them to integer uV. Do
+not use nominal supply values, battery voltage, `RAIL?`, or the ADS supply
+monitor as a substitute for an external DMM reading. The host applies
+`RAILCFG` while in CAP/RES, waits for matching `RACK` and
+`RAPP,source=external,state=applied`, and only then sends `MODE=VOLT`.
+
+RES does not require this external rail workflow. CAP-only offset, baseline,
+and Delta controls are not applied to VOLT or RES.
+
+## API and snapshots
+
+Key endpoints include:
 
 ```text
 GET  /health
 GET  /api/status
-GET  /api/history?latest_n=600
-POST /api/transport/mode
+GET  /api/history
 
+POST /api/transport/mode
 GET  /api/transport/serial/ports
 POST /api/transport/serial/connect
-
 GET  /api/transport/ble/scan
 POST /api/transport/ble/connect
-
 GET  /api/transport/wifi/discover
 POST /api/transport/wifi/connect
-
 POST /api/transport/write
 POST /api/transport/disconnect
+
+GET  /api/measurement/mode
+POST /api/measurement/mode
+POST /api/measurement/rail
+POST /api/rows
 
 POST /api/replay/open
 POST /api/replay/start
 POST /api/replay/stop
 POST /api/replay/seek
 
-POST /api/rows
-POST /api/settings/display
-POST /api/settings/baseline
-GET  /api/settings/offsets
-POST /api/settings/offsets/cell
-POST /api/settings/offsets/bulk
-POST /api/settings/offsets/clear
-POST /api/settings/offsets/zero-current
-POST /api/selection
 GET  /api/export/session?format=csv|xlsx|mat|h5
 POST /api/import/session
 GET  /api/setup/profile
 POST /api/setup/profile
-
 WS   /ws
 ```
 
-`GET /api/transport/serial/ports` returns `{ ok, ports, error }`. Empty
-`ports` is valid when no hardware is attached; `ok: false` indicates a backend
-dependency or platform error such as missing `pyserial`.
+Snapshots keep connection and measurement state distinct. Generic matrix data
+includes quantity, unit, scale, values, raw fixed values, valid/fresh/error
+masks, error codes, and PGA. CAP-specific raw/corrected/display pF, offsets,
+baseline, and Delta data remain under capacitance-specific fields.
 
-Session/Data export and import are intentionally symmetric and support only
-`.csv`, `.xlsx`, `.mat`, and `.h5`. Session/Data JSON export is not provided.
-Legacy replay/raw-log import still supports `.json`, `.jsonl`, `.log`, `.txt`,
-and legacy `.csv` replay files through the Replay flow.
+Session CSV/XLSX/MAT/H5 export records measurement mode and quantity rather than
+placing VOLT or RES values into pF-named fields. Legacy CAP session and replay
+files remain supported where their schema is unambiguous. Setup profiles default
+missing legacy `acquisition.measurementMode` to `CAP`; configured external rail
+fields are explicitly named `voltageRail.measuredAvddV` and
+`voltageRail.measuredAvssV` so they are not mistaken for live telemetry.
 
-`POST /api/setup/profile` applies preferences without automatically connecting
-Serial, BLE, or Wi-Fi. Setup profiles are JSON only and include transport
-preferences, row count, display settings, command line ending, offsets, and
-`paths.defaultSaveDirectory`. Importing a profile that names a serial port or
-BLE device that is not currently scanned does not crash or auto-connect; the
-preference remains editable and the user can refresh/scan again.
+## Desktop behavior
 
-SetupProfile top-level structure:
+The single workspace retains the 8x8 heatmap, selection, trends, resizable
+splitters, Write / Command panel, Raw Log, and Status. Presentation changes by
+quantity:
 
-- `transport.serial.baud` and optional serial port preference.
-- `transport.wifi.host` and `transport.wifi.fallbackHost`.
-- `transport.ble.address` and optional device ID.
-- `transport.replay.path` and `transport.replay.speed`.
-- `acquisition.rows`.
-- `display.displayMode`, measurement domain, cell text, pause, freeze colour,
-  unit mode, circuit offset, and trend window.
-- `offsetsPf` as an 8x8 finite pF matrix.
-- `command.lineEnding`.
-- `paths.defaultSaveDirectory`.
+- CAP shows pF or Delta C/C0 %, offsets, and baseline controls.
+- VOLT shows engineering voltage units and signed values.
+- RES shows engineering resistance units.
+- VOLT/RES tooltips show raw fixed values, physical values, PGA/bypass,
+  validity, freshness, error reason, frame sequence, generation, request ID,
+  source transport, and available rail/reference/retry diagnostics.
 
-`POST /api/transport/write` writes through the active transport abstraction:
+Invalid and inactive cells are `null`, not zero. Invalid or stale values do not
+enter auto colour ranges, baseline calculations, statistics, or valid trend
+series. Colour domains reset when the quantity changes, and trend history is
+filtered by mode so pF, V, and ohm values never share an axis.
 
-```json
-{
-  "text": "COMMAND",
-  "lineEnding": "lf",
-  "encoding": "utf-8",
-  "mode": "text"
-}
-```
-
-Successful responses include `transport` and `bytesWritten`. Unsupported modes,
-disconnected state, missing BLE ctrl characteristic, or write failures return
-`ok: false` with a clear error. Replay write is intentionally unsupported.
-
-## Desktop UI
-
-Connect and Disconnect are a single primary action in the active setup mode.
-The button state comes from `snapshot.connection.mode` and
-`snapshot.connection.state`, so the top status bar and setup panel stay
-consistent. Switching tabs does not disconnect an active transport.
-
-The main workspace is resizable:
-
-- Left pane: 8x8 heatmap.
-- Right pane: setup and 2x2 trend charts.
-- Default split: 75% / 25%.
-- Stored key: `sensorarray.layout.mainSplitRatio`.
-
-The bottom area is also resizable:
-
-- Left pane: Write / Command.
-- Right pane: Raw Log / Status.
-- Default split: 50% / 50%.
-- Stored key: `sensorarray.layout.bottomSplitRatio`.
-
-The Electron File menu contains:
-
-- Import Replay Data: choose `.json`, `.jsonl`, `.log`, `.txt`, or `.csv`, then
-  start the existing replay flow.
-- Import Session Data: choose `.csv`, `.xlsx`, `.mat`, or `.h5` and load frames
-  back through the same matrix path.
-- Export Current Session Data: choose `.csv`, `.xlsx`, `.mat`, or `.h5`.
-- Import Setup / Export Setup: JSON profile only.
-- Screenshot / Capture: save a PNG directly to the default save directory.
-
-There is also a top-level `Screenshot / Capture` menu with the screenshot
-shortcut. The Electron main process captures the current window and writes a
-PNG to the default save directory. Screenshot filenames use
-`Screenshot_CscArray__YYYYMMDD_HHMMSS.png`, with a numeric suffix if needed.
-
-Advanced contains Default Save Directory. It defaults to the runtime directory
-and is used for session export, setup export, and screenshots. The directory is
-stored in local setup profile state and synchronized to the Electron main
-process. Browse, Check, Reset, and Open folder are Electron-only preload APIs;
-browser/Vite mode reports that desktop file APIs are unavailable. Non-writable
-or missing paths show a clear UI error instead of failing silently.
-
-CSV files contain one row per frame/cell with columns `frameIndex`, `seq`,
-`timeSeconds`, `rows`, `cell`, `row`, `col`, `correctedPf`, `valid`, and
-`source`. XLSX exports include `metadata`, `frames`, `current_matrix`,
-`offsets`, and `raw_logs` sheets. MAT exports include `current_matrix_pf`,
-`current_valid_mask`, `offsets_pf`, `frames_values_pf`, `frames_valid_mask`,
-`frame_seq`, `frame_time_seconds`, and `frame_rows`. HDF5 exports include
-`/metadata` attributes plus `/current/matrix_pf`, `/current/valid_mask`,
-`/offsets/offsets_pf`, and `/frames/{values_pf,valid_mask,seq,time_seconds,rows}`.
-
-The `.xlsx`, `.mat`, and `.h5` paths use `openpyxl`, `scipy`, and `h5py`.
-Those packages increase packaged size; that is expected for these file formats.
-
-## Heatmap And Trends
-
-Invalid and inactive cells are sent to the heatmap as `null`, not `0`, and do
-not participate in colour range calculation. The heatmap series explicitly maps
-`x: 0`, `y: 1`, and `value: 2`; `visualMap.dimension` is also `2`.
-
-Colour modes:
-
-- Auto colour: every frame derives the range from valid finite cells only.
-- Freeze colour: keeps the last range and new frames do not overwrite it.
-
-Absolute pF ranges include padding. Delta percent ranges are symmetric around
-zero and at least +/-0.5%. Tooltips show cell label, raw pF, corrected pF,
-user offset pF, displayed value, rawFixed, validity, frame sequence, and source
-transport. Heatmap and trend charts use `ResizeObserver` with animation-frame
-resizes so they shrink and grow with their panes.
-
-Clicking D1-D4 selects that row's primary FDC group. Clicking D5-D8 selects that
-row's secondary FDC group. The heatmap creates its ECharts instance only on
-mount, updates live data with fixed series IDs, and uses one zrender
-pixel-to-grid click path so cell edges, labels, selected rings, and null cells
-still select the corresponding trend group without rebuilding the chart.
-
-Trend charts use a relative visible x-axis. If timestamps are present, x is
-seconds since the first visible point; otherwise x is the visible sample index.
-Tooltips still show the real sequence number and timestamp. The Trend Window
-control supports Latest 300, 600, 1200, 3000, and All session. Invalid cells do
-not enter valid trend series.
-
-## Display, Baseline, Rows, And Offset
-
-Display mode comes from the backend snapshot. When Delta C/C0 % is requested
-without a ready baseline, the backend keeps Absolute C active, records
-`pendingDisplayMode=delta_percent`, starts baseline capture when a frame is
-available, then switches to Delta automatically after a valid baseline is
-complete. If no frame exists, baseline status reports No data instead of
-silently flipping back.
-
-Rows supports 1 through 8 and is now selection-applies-immediately. There is no
-Apply button. Live transports send `ROWS=n` through the existing command
-service; `RCMD` means accepted and only `RAPP` means applied. Replay or
-disconnected mode is display-only and is reported as such in the UI/API.
-
-The right-side configuration area exposes Setup and Advanced as sibling panels.
-Advanced contains per-cell Offset. It is not a transport mode and does not call
-`/api/transport/mode` or disconnect Serial/BLE/Wi-Fi. Offset uses this display
-contract:
-
-```text
-rawPf       = parser raw pF, unchanged
-correctedPf = parser/circuit corrected pF, unchanged
-userOffsetPf = user-entered pF offset
-displayPf  = correctedPf - userOffsetPf
-```
-
-Absolute heatmap and trends show `displayPf`. Delta C/C0 % uses `displayPf` for
-both the baseline and current value. Changing offsets invalidates any existing
-baseline with `Baseline invalid: cell offset changed`; capture a new baseline
-before using Delta again.
-
-Offset controls use the existing 8x8 grid. Single click selects a cell and
-updates the right-side inline editor; double click selects the cell and focuses
-the Offset pF input. There are no Row/Detector dropdowns and no secondary edit
-dialog. The inline editor supports Save selected offset, Zero selected cell,
-and Clear selected cell. Batch controls below the grid support zeroing or
-clearing the selected cell, current row, and all cells. Live snapshot refreshes
-do not overwrite a dirty offset input.
-
-## Write / Command
-
-The Write / Command panel sends text commands through
-`POST /api/transport/write`; it does not access Serial, BLE, or Wi-Fi directly.
-
-Controls:
-
-- Active transport label.
-- Multiline command input.
-- Append LF, Append CRLF, or No line ending.
-- Ctrl+Enter sends; Enter inserts a newline.
-- History keeps the latest 20 commands in `sensorarray.command.history`.
-- Send is disabled while disconnected, connecting/disconnecting, pending, or
-  when the input is empty.
-
-Each write produces a short backend log:
-
-```text
-CMD_TX,mode=serial,bytes=...,ending=lf
-CMD_TX_FAIL,mode=ble,error=...
-```
-
-Long command/error text is truncated in logs and UI records.
-
-## Log Status
-
-The Log panel has Raw Log and Status tabs. Raw Log defaults to recent bounded
-rows, supports filtering, auto-scroll, and copy-visible. Status parses raw log
-rows into human-readable items without replacing the raw view.
-
-Recognised summaries include `BL50`, `I2C50`, `SF50`, `TR50`, `AB50`, `OT50`,
-`ROW50`, `FB50`, `P50`, `H50`, `HC`, `BATD`, `ARL`, `ADS`, `RST`, `ACK`,
-`ERR`, `CMD_TX`, `CMD_TX_FAIL`, `BLE_RX50`, `BLE_FRAG50`, `PROTO50`, `RCMD`,
-and `RAPP`. Status expands common firmware abbreviations such as `conn`, `sub`,
-`mtu`, `phy`, and `mq` into readable labels. Unknown tags are shown as
-`Unknown firmware log (TAG)` and unknown fields are labelled explicitly.
-
-## Bluetooth LE
-
-BLE uses `bleak`. BLE scan is disabled while BLE is connecting, connected, or
-streaming. The backend also rejects `/api/transport/ble/scan` in that state with:
-
-```text
-BLE scan is disabled while connected; disconnect first.
-```
-
-`GET /api/transport/ble/scan?timeout=10` keeps discovery state at `scanning`
-until the scan finishes or a platform error is returned. Responses include
-`ok`, `devices`, `advancedDevices`, `error`, `state`, and `durationMs`. Verified
-devices are promoted by protocol/service/name pattern; Advanced devices exposes
-unverified candidates and diagnostic reasons. If `bleak` is unavailable or the
-adapter/permissions fail, the UI shows the backend error instead of reducing it
-to an empty list.
-
-BLE notify channels are normalized before routing:
-
-- `data`, `d`, `cap`, `caps`, `c`, `capacitance` -> `data`
-- `log`, `logs`, `l` -> `log`
-- `ctrl`, `control`, `cmd`, `command` -> `ctrl`
-
-The protocol registry routes by payload content, not channel alone. If `C/D/K`
-frames arrive through a log or `L` characteristic, they still enter
-`CapAsciiParser` and update MatrixStore. `SF50`, `TR50`, `AB50`, `OT50`,
-`BL50`, and `I2C50` remain log events and do not pollute matrix data.
-
-BLE diagnostics are aggregated rather than dumped per notify:
-
-- `BLE_RX50`: notify counts/bytes/reassembled/failures and last prefix.
-- `BLE_FRAG50`: fragment rx/reassembled/duplicate/missing/timeout/crc/length.
-- `PROTO50`: parser cap/log/reject/frame counters.
-
-Parser, CRC, fragment, or length errors are counted and logged but do not stop
-the BLE transport unless the underlying connection actually closes.
-
-BLE scan results resolve RSSI from `device.rssi`, `adv.rssi`, and platform
-details when available. Devices with RSSI sort ahead of devices without RSSI,
-and stronger RSSI sorts first within the same verified/matched group. The UI
-shows `-62 dBm` when available and `RSSI unavailable` when the backend cannot
-resolve a value; it should not show `? dBm`.
-
-## Transport Notes
-
-Serial ports are discovered with `serial.tools.list_ports.comports()`. The
-Serial setup field is an input with a datalist, so a scanned port can be chosen
-or any port name can be typed manually. If `pyserial` is unavailable, the
-serial ports API returns `ok: false` with an explanatory error.
-
-Wi-Fi UDP keeps DATA, LOG, and CTRL channels separate. Command write uses the
-CTRL UDP port when Wi-Fi is active.
-
-Replay uses the same parser, matrix store, snapshot builder, WebSocket path,
-heatmap, and trend charts as live transports. Replay is software validation
-only and does not replace serial or BLE hardware validation.
-
-## Troubleshooting
-
-- BLE RSSI unavailable: some Windows/bleak backends do not expose RSSI in
-  standard fields. Re-scan, verify Bluetooth permissions/driver state, and
-  inspect backend BLE discovery logs.
-- Delta cannot switch: check baseline status. No data means no capacitance
-  frame has arrived; Invalid means capture failed or offsets changed and a new
-  Set baseline is required.
-- Replay import fails: confirm the file is a supported legacy replay
-  text/CSV/log/JSON file. Session/Data files use Import Session Data instead.
-  Existing replay still streams bytes through the parser.
-- Offset after Delta looks wrong: offset changes invalidate the old baseline.
-  Reset or Set baseline again before returning to Delta C/C0 %.
+`ADS,chip=unknown,valid=0` is shown as **ADS identity unconfirmed**, never as a
+guessed ADS1262. Battery telemetry is shown with validity, freshness, age,
+reason, restore, retry, unstable, timeout, spread, and run diagnostics where
+present; the host does not invent a battery state-of-charge percentage.
 
 ## Validation
 
+Run the complete software gates from the repository root:
+
 ```powershell
-.\.venv\Scripts\python.exe --version
-node --version
-npm.cmd --version
-
-.\.venv\Scripts\python.exe scripts\generate_icons.py
-
 .\.venv\Scripts\python.exe -m compileall src tests scripts
 .\.venv\Scripts\python.exe -m pytest -q
 
@@ -485,37 +203,66 @@ npm.cmd run typecheck
 npm.cmd run lint
 npm.cmd run test
 npm.cmd run build
+npm.cmd run test:e2e
 ```
 
-## Hardware Validation
+Formal GUI acceptance launches the locally built renderer in Electron; the
+Electron main process starts the repository `.venv` Python sidecar and the
+preload bridge supplies its dynamic loopback port. It does not use Chrome,
+Vite, or a LAN renderer. Replay still traverses Transport -> Registry -> Parser
+-> Store -> WebSocket -> React, and screenshots are saved under
+`validation_artifacts/gui/`. Passing Vitest alone is not GUI acceptance.
 
-Serial:
+Real hardware GUI acceptance uses the same full local application:
 
-1. Select Serial.
-2. Refresh ports and select a dynamically scanned hardware port if present.
-   If no ports are found, type a port name manually to verify the UI path.
-3. Baud 115200.
-4. If hardware is available, connect and run for at least 120 seconds.
-5. Verify heatmap data, trend data after cell selection, Auto/Freeze colour,
-   both splitters, command TX log, and Disconnect returning to Connect.
+```powershell
+cd desktop
+npm.cmd run test:hardware
+```
 
-BLE:
+Hardware results are reported independently as Serial GUI, BLE GUI, and Wi-Fi
+GUI PASS/FAIL/BLOCKED. A transport is PASS only after real hardware ran through
+the GUI for the required scenarios. VOLT hardware validation is BLOCKED when a
+current paired external DMM rail measurement is unavailable; no nominal or
+monitor value may be fabricated. See [validation](docs/validation.md).
 
-1. Select Bluetooth LE.
-2. Scan with the default timeout and select the first verified SensorArray
-   device if one is found.
-3. If no verified device is found, enable Advanced devices and verify candidate
-   reasons or the backend error are visible.
-4. If hardware is available, connect and run for at least 120 seconds.
-5. Verify BLE connected/streaming, Scan disabled, no repeated scan found logs,
-   `BLE_RX50` / `BLE_FRAG50` / `PROTO50`, heatmap/trend data, clear command
-   write success or missing-ctrl error, and graceful Disconnect.
+### Current firmware transport limitation
 
-If BLE still has no matrix data, capture the minimal failure summary: notify
-map, data/log/ctrl counts, first/last payload prefix, fragment stats, parser
-stats, whether `C/D/K` was detected, whether `CapAsciiParser` ran, whether
-MatrixStore updated, and state transitions.
+In the authoritative firmware implementation, accepted control responses reach
+the initiating transport, but frame-boundary applied events such as `MAPP`, rail
+and rows `RAPP`, `ADSCHK`/`ADSCHKSTAT`, and `BAPP` are currently printed on the
+Serial event path and are not published to BLE `FF30` or Wi-Fi LOG. Therefore a
+strict BLE-only or Wi-Fi-only host cannot prove a transaction applied. It must
+remain pending and eventually show a timeout; it must not infer success from a
+new data frame. BLE/Wi-Fi transaction HIL requires a Serial observation sidecar
+or a firmware change that broadcasts applied events. This is a firmware
+capability blocker, not a Replay PASS or host PASS.
 
-After validation, close Electron, Vite, Uvicorn/backend sidecars, BLE readers,
-and serial readers. Do not keep screenshots or long raw dumps unless they are
-the minimal failure evidence for a failed run.
+## Windows packaging
+
+From the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package_windows.ps1
+```
+
+Artifacts are written under `desktop/release/`. Smoke-test
+`desktop/release/win-unpacked/SensorArray.exe` before distributing the NSIS
+installer. The packaged application uses the PyInstaller backend sidecar under
+`process.resourcesPath\backend`; end users do not need Python, Node.js, npm, or
+the source tree.
+
+The retained packaged-app smoke launches that executable directly with
+Playwright Electron, rejects non-`file:` renderers, and verifies the packaged
+backend health and preload bridge:
+
+```powershell
+cd desktop
+npm.cmd run test:packaged
+```
+
+The root `icon.png` remains the source for generated desktop icons:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\generate_icons.py
+```

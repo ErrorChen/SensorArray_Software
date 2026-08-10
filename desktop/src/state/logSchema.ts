@@ -9,6 +9,8 @@ export type StatusCategory =
   | "Serial"
   | "Parser"
   | "Rows"
+  | "Measurement"
+  | "ADS"
   | "Baseline"
   | "Display"
   | "Battery"
@@ -109,6 +111,7 @@ export const logTagSchemas: Record<string, LogTagSchema> = {
     severity: countersSeverity(["agf"])
   },
   AB50: batterySchema("ADS/battery 50-frame summary"),
+  ABAT: batterySchema("Battery measurement accepted"),
   OT50: {
     category: "Transport",
     title: "Output transport 50-frame summary",
@@ -154,15 +157,51 @@ export const logTagSchemas: Record<string, LogTagSchema> = {
   BATD: batterySchema("Battery detail"),
   ARL: batterySchema("Analog rail reading"),
   ADS: {
-    category: "Battery",
+    category: "ADS",
     title: "ADS converter identity",
     explanation: "ADS126x converter identity and revision information.",
     fieldLabels: {
       chip: "ADS chip model (chip)",
       dev: "Device ID (dev)",
       rev: "Revision (rev)",
-      adc: "ADC label (adc)"
+      adc: "ADC label (adc)",
+      valid: "Identity valid (valid)",
+      id: "Request ID (id)"
     }
+  },
+  ADSCHK: {
+    category: "ADS",
+    title: "ADS diagnostic check",
+    explanation: "Firmware ADS diagnostic sampling progress and result.",
+    fieldLabels: {
+      id: "Request ID (id)",
+      state: "Check state (state)",
+      samples: "Sample count (samples)",
+      fresh: "Fresh sample count (fresh)",
+      period: "Sample period (period)",
+      spi: "SPI result (spi)",
+      drdy: "DRDY result (drdy)",
+      error: "Error detail (error)",
+      restore: "Restore result (restore)"
+    },
+    severity: diagnosticSeverity
+  },
+  ADSCHKSTAT: {
+    category: "ADS",
+    title: "ADS diagnostic status",
+    explanation: "Firmware ADS diagnostic status associated with its request ID.",
+    fieldLabels: {
+      id: "Request ID (id)",
+      state: "Check state (state)",
+      samples: "Sample count (samples)",
+      fresh: "Fresh sample count (fresh)",
+      period: "Sample period (period)",
+      spi: "SPI result (spi)",
+      drdy: "DRDY result (drdy)",
+      error: "Error detail (error)",
+      restore: "Restore result (restore)"
+    },
+    severity: diagnosticSeverity
   },
   RST: {
     category: "Firmware",
@@ -197,6 +236,78 @@ export const logTagSchemas: Record<string, LogTagSchema> = {
       status: "Apply status (status)"
     },
     severity: "ok"
+  },
+  MACK: {
+    category: "Measurement",
+    title: "Measurement mode accepted",
+    explanation: "Firmware accepted a mode request; the applied mode remains unchanged until the matching MAPP event.",
+    fieldLabels: {
+      id: "Request ID (id)",
+      old: "Applied mode before request (old)",
+      new: "Requested mode (new)",
+      state: "Transaction state (state)"
+    },
+    severity: "ok"
+  },
+  MAPP: {
+    category: "Measurement",
+    title: "Measurement mode applied",
+    explanation: "Firmware applied a mode request at a frame boundary.",
+    fieldLabels: {
+      id: "Request ID (id)",
+      gen: "Measurement generation (gen)",
+      old: "Previous mode (old)",
+      new: "Applied mode (new)",
+      seq: "First frame sequence (seq)",
+      state: "Transaction state (state)",
+      transitionUs: "Transition time microseconds (transitionUs)"
+    },
+    severity: "ok"
+  },
+  MERR: {
+    category: "Measurement",
+    title: "Measurement mode failed",
+    explanation: "Firmware rejected or failed a mode transition and may have entered SAFE/DEGRADED state.",
+    fieldLabels: {
+      id: "Request ID (id)", old: "Previous mode (old)", new: "Requested mode (new)",
+      seq: "Frame sequence (seq)", state: "Device state (state)", err: "Firmware error (err)"
+    },
+    severity: "error"
+  },
+  MFAULT: {
+    category: "Measurement",
+    title: "Measurement runtime fault",
+    explanation: "Firmware reported a measurement fault or restore failure.",
+    fieldLabels: { id: "Request ID (id)", state: "Device state (state)", err: "Firmware error (err)", restore: "Restore result (restore)" },
+    severity: "error"
+  },
+  RACK: {
+    category: "Measurement",
+    title: "Voltage rail configuration accepted",
+    explanation: "Firmware accepted measured external AVDD/AVSS; the host still waits for the matching rail RAPP.",
+    fieldLabels: { id: "Request ID (id)", avdd: "Measured AVDD µV (avdd)", avss: "Measured AVSS µV (avss)", source: "Rail source (source)", state: "Transaction state (state)" },
+    severity: "ok"
+  },
+  RERR: {
+    category: "Measurement",
+    title: "Voltage rail configuration failed",
+    explanation: "Firmware rejected or failed the external rail configuration.",
+    fieldLabels: { id: "Request ID (id)", avdd: "Measured AVDD µV (avdd)", avss: "Measured AVSS µV (avss)", state: "Transaction state (state)", err: "Firmware error (err)" },
+    severity: "error"
+  },
+  BAPP: {
+    category: "Battery",
+    title: "Battery command completed",
+    explanation: "Firmware completed BATNOW/BATD work; BAT? obtains the current telemetry snapshot.",
+    fieldLabels: { id: "Request ID (id)", cmd: "Battery command (cmd)", seq: "Frame sequence (seq)", durationUs: "Duration µs (durationUs)", status: "Completion state (status)", err: "Firmware error (err)" },
+    severity: diagnosticSeverity
+  },
+  BATPERIOD: {
+    category: "Battery",
+    title: "Battery schedule",
+    explanation: "Firmware battery telemetry scheduler configuration or live status.",
+    fieldLabels: { id: "Request ID (id)", enabled: "Scheduler enabled (enabled)", periodMs: "Period ms (periodMs)", due: "Measurement due (due)", ageMs: "Sample age ms (ageMs)", status: "Transaction state (status)" },
+    severity: diagnosticSeverity
   },
   ACK: {
     category: "Transport",
@@ -263,11 +374,13 @@ export const logTagSchemas: Record<string, LogTagSchema> = {
   PROTO50: {
     category: "Parser",
     title: "Protocol parser statistics",
-    explanation: "Content router counters for capacitance frames, text logs, rejects, and accepted frames.",
+    explanation: "Content router counters for measurement frames, text logs, rejects, and accepted frames.",
     fieldLabels: {
       src: "Envelope source (src)",
       ch: "Envelope channel (ch)",
       cap: "Capacitance frame count (cap)",
+      volt: "Voltage frame count (volt)",
+      res: "Resistance frame count (res)",
       log: "Log line count (log)",
       reject: "Parser reject count (reject)",
       frame: "Accepted frame count (frame)",
@@ -298,12 +411,33 @@ function batterySchema(title: string): LogTagSchema {
       age: "Sample age (age)",
       z: "Zero offset pair (z)",
       fresh: "Fresh sample flag (fresh)",
+      valid: "Valid sample flag (valid)",
+      ageMs: "Sample age milliseconds (ageMs)",
+      reason: "Battery reason (reason)",
+      restore: "Restore result (restore)",
+      retry: "Recovered retry count (retry)",
+      unstable: "Unstable sample count/flag (unstable)",
+      timeout: "Timeout count/flag (timeout)",
+      spreadRaw: "Raw sample spread (spreadRaw)",
+      spreadMaxRaw: "Maximum allowed raw spread (spreadMaxRaw)",
+      validRun: "Consecutive valid samples (validRun)",
+      invalidRun: "Consecutive invalid samples (invalidRun)",
       status: "ADS status byte (status)",
       dg: "Diagnostic flag (dg)",
       chip: "ADS chip model (chip)"
     },
     severity: (_row, details) => (details.bt === -1 || details.br === "range_error" || details.bs === "stale" ? "warn" : "ok")
   };
+}
+
+function diagnosticSeverity(row: LogRow, details: Record<string, LogFieldValue>): StatusSeverity {
+  if (row.severity === "error" || details.state === "failed" || details.state === "error" || Boolean(details.error)) {
+    return "error";
+  }
+  if (details.restore === false || details.restore === "failed") {
+    return "warn";
+  }
+  return details.state === "completed" || details.state === "done" ? "ok" : "info";
 }
 
 function countersSeverity(keys: string[]): (row: LogRow, details: Record<string, LogFieldValue>) => StatusSeverity {

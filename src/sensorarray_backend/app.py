@@ -11,6 +11,7 @@ from sensorarray_app.constants import APP_VERSION
 from sensorarray_backend.api import (
     routes_export,
     routes_import,
+    routes_measurement,
     routes_offsets,
     routes_replay,
     routes_rows,
@@ -49,6 +50,7 @@ def create_app(config: AppConfiguration | None = None) -> FastAPI:
     app.include_router(routes_transport.router)
     app.include_router(routes_replay.router)
     app.include_router(routes_rows.router)
+    app.include_router(routes_measurement.router)
     app.include_router(routes_settings.router)
     app.include_router(routes_offsets.router)
     app.include_router(routes_export.router)

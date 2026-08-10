@@ -17,8 +17,10 @@ from sensorarray_app.domain.models import (
     CapacitanceFrame,
     CommandAccepted,
     CommandApplied,
+    CommandTransactionEvent,
     DisplayMode,
     LogRecord,
+    MeasurementFrame,
     ParserErrorEvent,
     ResistanceFrame,
     TransportEnvelope,
@@ -88,19 +90,70 @@ class SensorArrayRuntime:
         self.commands.request_rows(rows, self.transport.send_command)
         self._host_log("Commands", "info", f"ROWS={rows} requested; waiting for RCMD/RAPP")
 
+    def request_measurement_mode(
+        self,
+        mode: str,
+        measured_avdd_v: float | None = None,
+        measured_avss_v: float | None = None,
+    ) -> None:
+        normalized = str(mode).strip().upper()
+        normalized = {"CAPACITANCE": "CAP", "VOLTAGE": "VOLT", "RESISTANCE": "RES"}.get(normalized, normalized)
+        if normalized not in {"CAP", "VOLT", "RES"}:
+            raise ValueError("measurement mode must be CAP, VOLT, or RES")
+        if normalized == "VOLT":
+            if (measured_avdd_v is None or measured_avss_v is None) and not self.commands.railConfigured:
+                raise ValueError("Voltage mode requires measured AVDD/AVSS rail configuration.")
+            if measured_avdd_v is not None and measured_avss_v is not None:
+                avdd_uv = int(round(float(measured_avdd_v) * 1_000_000.0))
+                avss_uv = int(round(float(measured_avss_v) * 1_000_000.0))
+                applied_avdd_uv = (
+                    int(round(self.commands.measuredAvddV * 1_000_000.0))
+                    if self.commands.measuredAvddV is not None
+                    else None
+                )
+                applied_avss_uv = (
+                    int(round(self.commands.measuredAvssV * 1_000_000.0))
+                    if self.commands.measuredAvssV is not None
+                    else None
+                )
+                requested_rail_is_applied = (
+                    self.commands.railConfigured
+                    and applied_avdd_uv == avdd_uv
+                    and applied_avss_uv == avss_uv
+                )
+                if not requested_rail_is_applied:
+                    if self.commands.appliedMode == "VOLT":
+                        raise ValueError(
+                            "Cannot replace measured AVDD/AVSS while VOLT is applied; switch to CAP or RES first."
+                        )
+                    self.commands.request_rail(
+                        avdd_uv,
+                        avss_uv,
+                        self.transport.send_command,
+                        desired_mode="VOLT",
+                    )
+                    self._host_log(
+                        "Commands",
+                        "info",
+                        f"RAILCFG={avdd_uv},{avss_uv} requested; waiting for RACK/RAPP before MODE=VOLT",
+                    )
+                    return
+        self.commands.request_mode(normalized, self.transport.send_command)
+        self._host_log("Commands", "info", f"MODE={normalized} requested; waiting for MACK/MAPP")
+
     def send_command(self, command: str) -> None:
         self.transport.send_command(command)
         self._host_log("Commands", "info", command)
 
     def capture_baseline(self) -> None:
         snap = self.matrixStore.snapshot()
-        if snap.seq is None or snap.firmwareGeneration is None or snap.requestId is None:
+        if snap.mode != "CAP" or snap.seq is None or snap.firmwareGeneration is None or snap.requestId is None:
             self._baseline_session = None
             self.ui.pendingDisplayMode = None
             self.ui.baseline = None
             self.ui.displayMode = DisplayMode.ABSOLUTE_C
             self.ui.baselineStatus = "No data"
-            self.ui.baselineInvalidReason = "No capacitance frame yet"
+            self.ui.baselineInvalidReason = "Available in capacitance mode only" if snap.mode != "CAP" else "No capacitance frame yet"
             return
         if self.ui.displayMode == DisplayMode.DELTA_PERCENT:
             self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
@@ -250,8 +303,21 @@ class SensorArrayRuntime:
                 self._complete_baseline_if_due()
                 continue
             if isinstance(item, TransportStateEvent):
+                if item.sessionGeneration != self.commands.sessionGeneration:
+                    self.registry.reset_session()
+                    self.commands.reset_session(item.sessionGeneration)
+                    self.matrixStore.clear()
+                    self.telemetry.reset()
+                    self.matrixStore.apply_measurement_mode("CAP", None, None, None)
                 self.transport.apply_state_event(item)
                 self._host_log("Transport", "info", f"{item.source} {item.state} {item.message}".strip())
+                continue
+            active_session_generation = int(self.transport.status.get("sessionGeneration", 0) or 0)
+            if item.sessionGeneration != active_session_generation:
+                # A stopped BLE/Serial worker can have one final notification
+                # already queued.  Never let it mutate the newly connected
+                # session's parser, transactions, or matrix.
+                self.stats.record_reject("stale_session_generation")
                 continue
             self.stats.record_transport(len(item.rawPayload))
             events = self.registry.feed(item)
@@ -261,10 +327,34 @@ class SensorArrayRuntime:
 
     def _handle_event(self, event: Any) -> None:
         if isinstance(event, CapacitanceFrame):
-            self.matrixStore.add_capacitance(event)
-            self.stats.record_frame()
-            if self._baseline_session is not None:
-                self._baseline_session.add_frame(event)
+            if self.matrixStore.add_capacitance(event):
+                self.stats.record_frame()
+                if self._baseline_session is not None:
+                    self._baseline_session.add_frame(event)
+            else:
+                self._frame_drop_log("CAP", event.seq, event.generation, event.requestId)
+        elif isinstance(event, MeasurementFrame):
+            # A complete current V/R frame may establish mode only on first
+            # attach, before this session has observed any measurement or a
+            # MAPP generation.  After MAPP (or after CAP data), a late frame
+            # from the previous mode must reach the store's wrong-mode gate;
+            # it must never be allowed to redefine the applied mode here.
+            first_session_measurement = self.matrixStore.snapshot().seq is None
+            if (
+                self.commands.pendingMode is None
+                and self.commands.appliedMode != event.mode
+                and self.commands.modeGeneration is None
+                and first_session_measurement
+            ):
+                changed = self.commands.observe_mode_frame(event.mode, event.generation, event.requestId, event.seq)
+                if changed:
+                    self.matrixStore.sync_measurement_mode_from_frame(event)
+                    self.invalidate_baseline("measurement mode changed")
+                    self._measurement_mode_visual_reset()
+            if self.matrixStore.add_measurement(event):
+                self.stats.record_frame()
+            else:
+                self._frame_drop_log(event.mode, event.seq, event.generation, event.requestId)
         elif isinstance(event, VoltageFrame):
             self.matrixStore.add_voltage(event)
             self.stats.record_frame()
@@ -282,9 +372,31 @@ class SensorArrayRuntime:
             self.commands.apply(event)
             if event.newRows is not None and event.newRows != old:
                 self.invalidate_baseline("ROWS applied")
+        elif isinstance(event, CommandTransactionEvent):
+            previous_mode = self.commands.appliedMode
+            result = self.commands.handle(event)
+            if result.get("modeApplied"):
+                self.matrixStore.apply_measurement_mode(
+                    self.commands.appliedMode,
+                    self.commands.modeGeneration,
+                    self.commands.modeRequestId,
+                    self.commands.modeFrameSeq,
+                )
+                if self.commands.appliedMode != previous_mode:
+                    self.invalidate_baseline("measurement mode changed")
+                self._measurement_mode_visual_reset()
+            if result.get("railApplied") and self.commands.desiredModeAfterRail:
+                desired_mode = self.commands.desiredModeAfterRail
+                self.commands.desiredModeAfterRail = None
+                try:
+                    self.commands.request_mode(desired_mode, self.transport.send_command)
+                    self._host_log("Commands", "info", f"External rail applied; MODE={desired_mode} sent")
+                except Exception as exc:
+                    self.commands.transitionState = "error"
+                    self.commands.modeError = str(exc)
         elif isinstance(event, ParserErrorEvent):
             self.stats.record_reject(event.reason)
-            if event.reason == "crc":
+            if "crc" in event.reason.lower():
                 self.stats.crcFailures += 1
             self.rawLogs.add(
                 LogRecord(
@@ -300,6 +412,16 @@ class SensorArrayRuntime:
                     sessionGeneration=event.sessionGeneration,
                 )
             )
+
+    def _measurement_mode_visual_reset(self) -> None:
+        """Hook for the backend runtime's quantity-specific colour cache."""
+
+    def _frame_drop_log(self, mode: str, seq: int, generation: int | None, request_id: int | None) -> None:
+        self._host_log(
+            "FRAME_DROP",
+            "warning",
+            f"Dropped stale/wrong-mode frame mode={mode},seq={seq},gen={generation},rid={request_id}",
+        )
 
     def _complete_baseline_if_due(self) -> None:
         session = self._baseline_session

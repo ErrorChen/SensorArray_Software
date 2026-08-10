@@ -30,7 +30,16 @@ class TransportManager:
             self.current.stop()
         self.current = None
         generation = self.sessions.next_generation()
-        self.status.update({"transport": "none", "state": "DISCONNECTED", "sessionGeneration": generation})
+        self.status.update(
+            {
+                "transport": "none",
+                "state": "DISCONNECTED",
+                "device": "",
+                "sessionGeneration": generation,
+                "message": "",
+                "error": "",
+            }
+        )
 
     def connect_serial(self, port: str, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = False) -> int:
         if not str(port or "").strip():
@@ -39,7 +48,16 @@ class TransportManager:
         generation = self.sessions.generation
         self.current = SerialTransport(self.outputQueue, generation, port, baud, auto_reconnect=auto_reconnect)
         self.current.start()
-        self.status.update({"transport": "serial", "state": "CONNECTING", "device": port, "sessionGeneration": generation})
+        self.status.update(
+            {
+                "transport": "serial",
+                "state": "CONNECTING",
+                "device": port,
+                "sessionGeneration": generation,
+                "message": "",
+                "error": "",
+            }
+        )
         return generation
 
     def connect_replay(self, path: str | Path, speed: float = 1.0) -> int:
@@ -47,7 +65,16 @@ class TransportManager:
         generation = self.sessions.generation
         self.current = ReplayTransport(self.outputQueue, generation, path, speed=speed)
         self.current.start()
-        self.status.update({"transport": "replay", "state": "STREAMING", "device": str(path), "sessionGeneration": generation})
+        self.status.update(
+            {
+                "transport": "replay",
+                "state": "STREAMING",
+                "device": str(path),
+                "sessionGeneration": generation,
+                "message": "",
+                "error": "",
+            }
+        )
         return generation
 
     def connect_ble(self, address: str, device_id: str = "") -> int:
@@ -55,7 +82,16 @@ class TransportManager:
         generation = self.sessions.generation
         self.current = BleTransport(self.outputQueue, generation, address, device_id=device_id)
         self.current.start()
-        self.status.update({"transport": "ble", "state": "CONNECTING", "device": address, "sessionGeneration": generation})
+        self.status.update(
+            {
+                "transport": "ble",
+                "state": "CONNECTING",
+                "device": address,
+                "sessionGeneration": generation,
+                "message": "",
+                "error": "",
+            }
+        )
         return generation
 
     def connect_wifi(self, host: str) -> int:
@@ -63,7 +99,16 @@ class TransportManager:
         generation = self.sessions.generation
         self.current = WifiUdpTransport(self.outputQueue, generation, host)
         self.current.start()
-        self.status.update({"transport": "wifi", "state": "STREAMING", "device": host, "sessionGeneration": generation})
+        self.status.update(
+            {
+                "transport": "wifi",
+                "state": "STREAMING",
+                "device": host,
+                "sessionGeneration": generation,
+                "message": "",
+                "error": "",
+            }
+        )
         return generation
 
     def send_command(self, command: str) -> None:
@@ -85,4 +130,17 @@ class TransportManager:
     def apply_state_event(self, event: TransportStateEvent) -> None:
         if event.sessionGeneration != self.status.get("sessionGeneration"):
             return
-        self.status.update({"transport": event.source, "state": event.state, "error": event.message})
+        # State events carry both informational messages (for example the
+        # replay path in STREAMING, or a serial port in CONNECTED) and actual
+        # failures.  Keeping those concepts separate prevents a healthy
+        # connection from rendering its device/path as a red GUI error.
+        normalizedState = str(event.state).upper()
+        errorMessage = event.message if normalizedState in {"ERROR", "FAILED"} else ""
+        self.status.update(
+            {
+                "transport": event.source,
+                "state": event.state,
+                "message": event.message,
+                "error": errorMessage,
+            }
+        )

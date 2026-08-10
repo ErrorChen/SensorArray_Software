@@ -76,7 +76,9 @@ export function SavePathPanel({ directory, runtimeDirectory, onDirectoryChange, 
 
   return (
     <div className="savePathPanel">
-      {!apiStatus.ok ? <div className="inlineError compactMessage">{apiStatus.message}</div> : null}
+      {!apiStatus.ok ? (
+        <div className={apiStatus.expectedInBrowser ? "modeOnlyNotice" : "inlineError compactMessage"}>{apiStatus.message}</div>
+      ) : null}
       <label>
         Default save directory
         <input value={directory} onChange={(event) => onDirectoryChange(event.target.value)} />
@@ -99,19 +101,21 @@ export function SavePathPanel({ directory, runtimeDirectory, onDirectoryChange, 
   );
 }
 
-type DesktopApiStatus = { ok: true; api: DesktopBridge } | { ok: false; message: string };
+type DesktopApiStatus = { ok: true; api: DesktopBridge } | { ok: false; message: string; expectedInBrowser: boolean };
 
 function desktopApiStatus(methods: (keyof DesktopBridge)[]): DesktopApiStatus {
   const api = window.sensorarrayDesktop;
   if (!api) {
+    const expectedInBrowser = !isElectronUserAgent();
     return {
       ok: false,
-      message: isElectronUserAgent() ? "Electron preload failure: window.sensorarrayDesktop is missing." : "Desktop file APIs are only available in Electron."
+      message: expectedInBrowser ? "Desktop file APIs are available in the Electron app." : "Electron preload failure: window.sensorarrayDesktop is missing.",
+      expectedInBrowser
     };
   }
   const missing = methods.find((method) => typeof api[method] !== "function");
   if (missing) {
-    return { ok: false, message: `Electron preload API is incomplete: missing ${String(missing)}.` };
+    return { ok: false, message: `Electron preload API is incomplete: missing ${String(missing)}.`, expectedInBrowser: false };
   }
   return { ok: true, api };
 }

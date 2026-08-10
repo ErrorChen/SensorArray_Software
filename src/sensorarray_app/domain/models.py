@@ -63,6 +63,64 @@ class CapacitanceFrame:
 
 
 @dataclass(frozen=True)
+class MeasurementFrame:
+    """One CRC-verified current-firmware VOLT or RES text frame.
+
+    ``rawFixedValues`` retains the firmware's integer fixed-point quantity and
+    uses NaN only where the wire carried an ``Xhh`` token. ``physicalValues``
+    is expressed in the SI unit named by ``unit`` (volts for VOLT and ohms for
+    RES). The three masks are deliberately independent: a value can be valid
+    but stale, and consumers must not infer freshness from validity.
+    """
+
+    mode: str
+    seq: int
+    timestampUs: int
+    durationUs: int
+    rows: int
+    cells: int
+    generation: int
+    requestId: int
+    unit: str
+    scale: int
+    format: str
+    rawFixedValues: np.ndarray
+    physicalValues: np.ndarray
+    validMask: np.ndarray
+    freshMask: np.ndarray
+    errorMask: np.ndarray
+    errorCodes: np.ndarray
+    errorReasons: tuple[str, ...]
+    pgaValues: np.ndarray
+    pgaBypassMask: np.ndarray
+    reference: str
+    railValid: bool
+    railAgeFrames: int
+    avddUv: int
+    avssUv: int
+    matrixReferenceUv: int
+    referenceResistorOhms: int
+    transitionDurationUs: int
+    gainChangeCount: int
+    overrangeCount: int
+    autorangeAttemptCount: int
+    autorangeFallbackCount: int
+    recoveredRetryCount: int
+    drdyTimeoutCount: int
+    staleCount: int
+    spiErrorCount: int
+    badCellCount: int
+    sourceTransport: str
+    sessionGeneration: int
+    receivedTime: float
+    receivedMonotonicNs: int
+    deviceId: str = ""
+    rawHeader: str = ""
+    rawTrailer: str = ""
+    rawFields: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class VoltageFrame:
     seq: int
     timestampUs: int
@@ -112,6 +170,33 @@ class BatteryTelemetry:
     adsChipId: int | None
     receivedTime: float
     rawFields: dict[str, str] = field(default_factory=dict)
+    valid: bool | None = None
+    ageMs: int | None = None
+    periodMs: int | None = None
+    due: bool | None = None
+    runCount: int | None = None
+    validRunCount: int | None = None
+    invalidRunCount: int | None = None
+    skipCount: int | None = None
+    deferCount: int | None = None
+    boundaryCount: int | None = None
+    restoreFailureCount: int | None = None
+    retryCount: int | None = None
+    retryLimit: int | None = None
+    retryLastCount: int | None = None
+    retryTotalCount: int | None = None
+    unstableCount: int | None = None
+    timeoutCount: int | None = None
+    spreadRaw: int | None = None
+    spreadMaximumRaw: int | None = None
+    rawAdc: int | None = None
+    batteryDividerNumerator: int | None = None
+    batteryDividerDenominator: int | None = None
+    vbiasEnabled: bool | None = None
+    sampleCount: int | None = None
+    sampleAverageUs: int | None = None
+    sampleMaximumUs: int | None = None
+    restoreResult: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +233,57 @@ class CommandApplied:
     generation: int | None
     sessionGeneration: int
     rawText: str
+
+
+@dataclass(frozen=True)
+class CommandTransactionEvent:
+    """Protocol-neutral accepted/applied/failed command transaction update."""
+
+    commandType: str
+    phase: str
+    requestId: int | None = None
+    state: str | None = None
+    oldValue: Any | None = None
+    requestedValue: Any | None = None
+    appliedValue: Any | None = None
+    generation: int | None = None
+    frameSeq: int | None = None
+    error: str | None = None
+    rawFields: dict[str, str] = field(default_factory=dict)
+    sessionGeneration: int = 0
+    rawText: str = ""
+
+
+@dataclass(frozen=True)
+class AdsDiagnosticEvent:
+    """Structured ADS identity or active-check diagnostic event.
+
+    The chip remains a string so ``chip=unknown,valid=0`` cannot accidentally
+    become an ADS1262 identity through a numeric default.
+    """
+
+    eventType: str
+    state: str
+    requestId: int | None = None
+    chip: str = "unknown"
+    identityValid: bool | None = None
+    ok: bool | None = None
+    requestedSamples: int | None = None
+    freshSamples: int | None = None
+    changedSamples: int | None = None
+    periodMinUs: int | None = None
+    periodAverageUs: int | None = None
+    periodMaxUs: int | None = None
+    spiErrors: int | None = None
+    drdyTimeouts: int | None = None
+    staleSamples: int | None = None
+    statusErrors: int | None = None
+    resetCount: int | None = None
+    restoreResult: str | None = None
+    durationUs: int | None = None
+    rawFields: dict[str, str] = field(default_factory=dict)
+    sessionGeneration: int = 0
+    rawText: str = ""
 
 
 @dataclass(frozen=True)
@@ -188,12 +324,15 @@ class DiagnosticSummary:
 
 DomainEvent = (
     CapacitanceFrame
+    | MeasurementFrame
     | VoltageFrame
     | ResistanceFrame
     | BatteryTelemetry
     | LogRecord
     | CommandAccepted
     | CommandApplied
+    | CommandTransactionEvent
+    | AdsDiagnosticEvent
     | TransportStateEvent
     | ParserErrorEvent
     | DiagnosticSummary

@@ -3,6 +3,8 @@ import type {
   BleScanResponse,
   DisplayMode,
   HistoryPayload,
+  MeasurementModeRequest,
+  MeasurementModeResponse,
   OffsetResponse,
   OffsetScope,
   RowsResponse,
@@ -24,8 +26,16 @@ export class BackendHttpClient {
     this.baseUrl = normaliseBackendUrl(baseUrl);
   }
 
-  async setMode(mode: TransportMode): Promise<void> {
+  async setTransportMode(mode: TransportMode): Promise<void> {
     await this.post("/api/transport/mode", { mode });
+  }
+
+  async getMeasurementMode(): Promise<MeasurementModeResponse> {
+    return this.get<MeasurementModeResponse>("/api/measurement/mode");
+  }
+
+  async setMeasurementMode(request: MeasurementModeRequest): Promise<MeasurementModeResponse> {
+    return this.post<MeasurementModeResponse>("/api/measurement/mode", request);
   }
 
   async listSerialPorts(): Promise<SerialPortsResponse> {
