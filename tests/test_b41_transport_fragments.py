@@ -3,14 +3,29 @@ from __future__ import annotations
 import asyncio
 import queue
 
+import pytest
+
+from sensorarray_app.constants import BLE_CTRL_TX_UUID, BLE_DATA_TX_UUID, BLE_LOG_TX_UUID
+from sensorarray_app.domain.models import CommandTransactionEvent
 from sensorarray_app.protocol.ble_fragments import BleFragmentReassembler
 from sensorarray_app.protocol.crc import crc32_reflected
+from sensorarray_app.protocol.registry import ProtocolRegistry
+from sensorarray_app.services.command_service import CommandService
 from sensorarray_app.transport.ble_transport import BleTransport
 
 
 def make_fragment(channel: str, message_id: int, payload: bytes, index: int = 0, count: int = 1) -> bytes:
     crc = crc32_reflected(payload)
     return f"G,{channel},{message_id},{index},{count},{len(payload)},{len(payload)},{crc:08X}\n".encode() + payload
+
+
+def make_fragments(channel: str, message_id: int, payload: bytes, split: int) -> list[bytes]:
+    chunks = (payload[:split], payload[split:])
+    crc = crc32_reflected(payload)
+    return [
+        f"G,{channel},{message_id},{index},2,{len(chunk)},{len(payload)},{crc:08X}\n".encode() + chunk
+        for index, chunk in enumerate(chunks)
+    ]
 
 
 def test_ble_single_fragment_reassembles_and_normalizes_channel():
@@ -105,3 +120,82 @@ def test_ble_write_without_ctrl_characteristic_is_clear_error():
         assert "ctrl characteristic" in str(exc)
     else:
         raise AssertionError("BLE write without ctrl characteristic succeeded")
+
+
+@pytest.mark.parametrize("fragmented_mack", [False, True])
+def test_ff11_mack_and_fragmented_ff30_mapp_reach_strict_command_transaction(fragmented_mack: bool):
+    """Exercise the real BLE notify/reassembly/registry/log/service path."""
+
+    output = queue.Queue()
+    transport = BleTransport(output, 7, "AA:BB")
+    registry = ProtocolRegistry()
+    service = CommandService()
+    service.reset_session(7)
+    sent: list[str] = []
+    service.request_mode("RES", sent.append)
+
+    # FF11 is registered as the existing ctrl notify and FF30 as the existing
+    # log notify. No second client or duplicate subscription is involved.
+    class Characteristic:
+        def __init__(self, uuid: str):
+            self.uuid = uuid
+            self.properties = ["notify"]
+
+    class Service:
+        characteristics = [Characteristic(BLE_DATA_TX_UUID), Characteristic(BLE_LOG_TX_UUID), Characteristic(BLE_CTRL_TX_UUID)]
+
+    mapping = transport._resolve_notify_characteristics([Service()])
+    assert mapping["ctrl"] == BLE_CTRL_TX_UUID
+    assert mapping["log"] == BLE_LOG_TX_UUID
+
+    mack = b"MACK,id=42,old=CAP,new=RES,state=accepted\n"
+    if fragmented_mack:
+        for packet in make_fragments("ctrl", 10, mack, 15):
+            transport._notify("ctrl", packet)
+    else:
+        transport._notify("ctrl", mack)
+    while not output.empty():
+        for event in registry.feed(output.get_nowait()):
+            if isinstance(event, CommandTransactionEvent):
+                service.handle(event)
+    assert sent == ["MODE=RES"]
+    assert service.pendingMode == "RES"
+    assert service.appliedMode == "CAP"
+    assert service.modeRequestId == 42
+
+    mapp = b"MAPP,id=42,gen=9,old=CAP,new=RES,seq=301,state=applied\n"
+    packets = make_fragments("log", 11, mapp, 21)
+    transport._notify("log", packets[0])
+    assert output.empty()
+    transport._notify("log", packets[1])
+    for event in registry.feed(output.get_nowait()):
+        if isinstance(event, CommandTransactionEvent):
+            service.handle(event)
+    assert service.pendingMode is None
+    assert service.appliedMode == "RES"
+    assert service.modeRequestId == 42
+    assert service.modeGeneration == 9
+    assert service.modeFrameSeq == 301
+
+
+def test_fragmented_ff30_wrong_id_mapp_is_rejected_end_to_end():
+    output = queue.Queue()
+    transport = BleTransport(output, 4, "AA:BB")
+    registry = ProtocolRegistry()
+    service = CommandService()
+    service.reset_session(4)
+    service.request_mode("VOLT", lambda _command: None)
+    transport._notify("ctrl", b"MACK,id=7,old=CAP,new=VOLT,state=accepted\n")
+    for event in registry.feed(output.get_nowait()):
+        if isinstance(event, CommandTransactionEvent):
+            service.handle(event)
+
+    wrong = b"MAPP,id=99,gen=3,old=CAP,new=VOLT,seq=44,state=applied\n"
+    for packet in make_fragments("log", 12, wrong, 18):
+        transport._notify("log", packet)
+    for event in registry.feed(output.get_nowait()):
+        if isinstance(event, CommandTransactionEvent):
+            service.handle(event)
+    assert service.appliedMode == "CAP"
+    assert service.pendingMode == "VOLT"
+    assert service.modeRequestId == 7

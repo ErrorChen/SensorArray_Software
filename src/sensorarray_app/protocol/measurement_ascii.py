@@ -18,9 +18,9 @@ MAX_CHUNK_VALUES = 16
 PENDING_TIMEOUT_NS = 2_000_000_000
 VALID_PGA_LITERALS = frozenset({0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20})
 
-# These values are the production sensorarrayCellError_t values in firmware
-# HEAD 22b7709. Unknown values must remain visible rather than being coerced to
-# zero or causing a parser failure.
+# These values are the production sensorarrayCellError_t values retained by
+# firmware 331c445. Unknown values must remain visible rather than being
+# coerced to zero or causing a parser failure.
 CELL_ERROR_REASONS = {
     0x00: "No firmware cell error",
     0x01: "Matrix route error",

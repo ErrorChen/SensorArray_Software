@@ -114,7 +114,7 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
     await expect(page.getByRole("button", { name: "Set baseline" })).toBeVisible();
     await expect(page.locator(".trendPanel canvas").first()).toBeVisible();
     await page.getByRole("tab", { name: "Advanced" }).click();
-    await expect(page.getByText("User offset pF")).toBeVisible();
+    await expect(page.getByText("User offset pF", { exact: true })).toBeVisible();
     await page.getByRole("tab", { name: "Setup" }).click();
     await page.getByText("Capacitance display").scrollIntoViewIfNeeded();
     await saveScreenshot(page, "G02_cap.png");
@@ -171,12 +171,19 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
     expect(status.matrix.values[0][0]).toBeCloseTo(-0.00125, 9);
 
     await expect(page.getByTestId("measurement-applied-mode")).toHaveText("VOLT");
-    await expect(page.getByText("8x8 Voltage Heatmap")).toBeVisible();
-    await expect(page.locator('[aria-label="Measurement heatmap; colour scale unit V"]')).toBeVisible();
+    await expect(page.getByText("2x8 Voltage Heatmap")).toBeVisible();
+    await expect(page.locator('[aria-label="Measurement heatmap; colour scale units V"]')).toBeVisible();
     await expect(page.locator(".trendPanel .panelHeader").first()).toContainText("Voltage");
-    await expect(page.getByText("Baseline, Delta C/C0, and capacitance offsets are available in capacitance mode only.")).toBeVisible();
-    await expect(page.getByText("Voltage measurement rails")).toBeVisible();
-    await page.getByText("Baseline, Delta C/C0, and capacitance offsets are available in capacitance mode only.").scrollIntoViewIfNeeded();
+    await expect(page.getByText("Baseline, Delta C/C0, and capacitance offsets are available for active CAP rows only.")).toBeVisible();
+    await expect(page.getByText("ADS analogue rail span")).toBeVisible();
+    await expect(page.getByTestId("rail-telemetry")).toContainText("AVDD \u2212 AVSS: 5.126 V");
+    await expect(page.getByTestId("rail-telemetry")).toContainText("fresh");
+    await expect(page.getByTestId("rail-telemetry")).toContainText("source: internal monitor");
+    await expect(page.getByLabel("Measured AVDD to GND")).toHaveCount(0);
+    await expect(page.getByLabel("Measured AVSS to GND")).toHaveCount(0);
+    await page.getByText("ADS analogue rail span").scrollIntoViewIfNeeded();
+    await saveScreenshot(page, "rail-readonly.png");
+    await page.getByText("Baseline, Delta C/C0, and capacitance offsets are available for active CAP rows only.").scrollIntoViewIfNeeded();
     await saveScreenshot(page, "G05_volt.png");
     expect(fatalErrors, fatalErrors.join("\n")).toEqual([]);
   });
@@ -267,11 +274,11 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
     expect(status.matrix.values[0][0]).toBeCloseTo(1, 9);
     expect(status.matrix.pgaBypass[0][0]).toBe(true);
     await expect(page.getByTestId("measurement-applied-mode")).toHaveText("RES");
-    await expect(page.getByText("8x8 Resistance Heatmap")).toBeVisible();
-    await expect(page.locator('[aria-label="Measurement heatmap; colour scale unit Ω"]')).toBeVisible();
+    await expect(page.getByText("1x8 Resistance Heatmap")).toBeVisible();
+    await expect(page.locator('[aria-label="Measurement heatmap; colour scale units Ω"]')).toBeVisible();
     await expect(page.locator(".trendPanel .panelHeader").first()).toContainText("Resistance");
-    await expect(page.getByText("Baseline, Delta C/C0, and capacitance offsets are available in capacitance mode only.")).toBeVisible();
-    await expect(page.getByText("Voltage measurement rails")).toHaveCount(0);
+    await expect(page.getByText("Baseline, Delta C/C0, and capacitance offsets are available for active CAP rows only.")).toBeVisible();
+    await expect(page.getByText("ADS analogue rail span")).toBeVisible();
     await page.getByTestId("measurement-mode-control").scrollIntoViewIfNeeded();
     await hoverHeatmapCell(page, 0, 0);
     await expect(page.locator("body")).toContainText("Raw integer mΩ: 1000");
@@ -281,9 +288,9 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
     expect(fatalErrors, fatalErrors.join("\n")).toEqual([]);
   });
 
-  test("G11 dynamic rows 1/2/4/8 have no phantom cells", async () => {
+  test("G11 dynamic rows 1..8 have no phantom cells", async () => {
     await openApp(page);
-    for (const rows of [1, 2, 4, 8] as const) {
+    for (const rows of [1, 2, 3, 4, 5, 6, 7, 8] as const) {
       await startReplay(page, fixtures.rows[rows]);
       await waitForStatus(page, (status) => status.measurement.appliedMode === "CAP" && status.frame.rows === rows && status.frame.valid);
       const status = await backendStatus(page);
@@ -293,18 +300,20 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
         expect(status.matrix.values[row].every((value) => value === null)).toBe(true);
       }
       await expect(page.locator(".rowsStatus")).toContainText(`applied ${rows}`);
+      await expect(page.locator(".heatmapCanvas")).toHaveAttribute("aria-rowcount", String(rows));
+      await expect(page.getByText(`${rows}x8 Capacitance Heatmap`)).toBeVisible();
     }
   });
 
   test("G12 RES to CAP restores capacitance controls", async () => {
     await openApp(page);
     await startReplay(page, fixtures.capReturn);
-    await waitForStatus(page, (status) => status.measurement.appliedMode === "CAP" && status.frame.seq === 8);
+    await waitForStatus(page, (status) => status.measurement.appliedMode === "CAP" && status.frame.seq === 1);
 
     const status = await backendStatus(page);
     expect(status.matrix.quantity).toBe("capacitance");
     expect(status.matrix.unit).toBe("pF");
-    expect(status.frame.rows).toBe(8);
+    expect(status.frame.rows).toBe(1);
     await expect(page.getByTestId("measurement-applied-mode")).toHaveText("CAP");
     await expect(page.getByText("Capacitance display")).toBeVisible();
     await expect(page.getByRole("option", { name: "Delta C/C0 %" })).toHaveCount(1);
@@ -333,7 +342,13 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
     expect(status.ads?.label).toBe("ADS identity unconfirmed");
     expect(status.ads?.chip).toBe("unknown");
     expect(status.battery?.batteryText).toBe("4.012 V");
-    expect(status.battery?.fresh).toBe(true);
+    // Replay has ended by the time the snapshot is asserted.  The typed store
+    // retains the successful attempt, while the authoritative top-level state
+    // correctly marks the displayed last-good value connection-stale.
+    expect(status.battery?.latestAttempt?.fresh).toBe(true);
+    expect(status.battery?.lastGood?.batteryMv).toBe(4012);
+    expect(status.battery?.fresh).toBe(false);
+    expect(status.battery?.reason).toBe("connection_stale");
     expect(status.battery?.retryCount).toBe(0);
     expect(status.battery?.unstableCount).toBe(1);
     expect(status.battery?.spreadRaw).toBe(5);
@@ -423,6 +438,87 @@ test.describe.serial("SensorArray real backend + Replay GUI acceptance", () => {
     await page.screenshot({ path: path.join(screenshotRoot, "G16_electron.png") });
     expect(fatalErrors, fatalErrors.join("\n")).toEqual([]);
   });
+
+  test("G17 ROWS=1 RES has one visible row and a non-neutral single-value scale", async () => {
+    await openApp(page);
+    await startReplay(page, fixtures.rows1Res);
+    await waitForStatus(page, (status) => status.frame.seq === 91 && status.frame.rows === 1 && status.matrix.modeByRow?.[0] === "RES");
+    const status = await backendStatus(page);
+    expect(status.matrix.displayValues[0][0]).toBeCloseTo(10_025, 6);
+    expect(status.matrix.valid[0].filter(Boolean)).toHaveLength(1);
+    expect(status.matrix.fresh[0].filter(Boolean)).toHaveLength(1);
+    expect(usableActiveCells(status)).toBe(1);
+    expect(status.display.colourRanges?.resistance?.max).toBeGreaterThan(status.display.colourRanges?.resistance?.min ?? 0);
+    const range = status.display.colourRanges?.resistance;
+    expect(range && range.min !== null && range.max !== null ? (10_025 - range.min) / (range.max - range.min) : 0).toBeGreaterThan(0.5);
+    await expect(page.getByText("1x8 Resistance Heatmap")).toBeVisible();
+    await expect(page.locator(".heatmapCanvas")).toHaveAttribute("aria-rowcount", "1");
+    await expect(page.locator('[aria-label="Measurement heatmap; colour scale units Ω"]')).toBeVisible();
+    await expect
+      .poll(async () => (await sampleHeatmapCellColours(page, 0, 0, 1)).some(isRedDominant), {
+        timeout: 5_000,
+        intervals: [50, 100, 200]
+      })
+      .toBe(true);
+    await saveScreenshot(page, "rows1-res.png");
+  });
+
+  test("G18 ROWS=3 CAP renders only S1..S3", async () => {
+    await openApp(page);
+    await startReplay(page, fixtures.rows[3]);
+    await waitForStatus(page, (status) => status.frame.rows === 3 && status.frame.valid && status.matrix.modeByRow?.[0] === "CAP");
+    await expect(page.getByText("3x8 Capacitance Heatmap")).toBeVisible();
+    await expect(page.locator(".heatmapCanvas")).toHaveAttribute("aria-rowcount", "3");
+    await saveScreenshot(page, "rows3-cap.png");
+  });
+
+  test("G19 ROWS=5 mixed replay isolates row semantics and colour domains", async () => {
+    await openApp(page);
+    await startReplay(page, fixtures.mixed5);
+    await waitForStatus(page, (status) => status.frame.seq === 201 && status.frame.layout === "MIXED" && status.frame.rows === 5);
+    const status = await backendStatus(page);
+    expect(status.frame.rowModes).toEqual(["CAP", "RES", "VOLT", "CAP", "RES", "VOLT", "CAP", "RES"]);
+    expect(status.matrix.modeByRow?.slice(0, 5)).toEqual(["CAP", "RES", "VOLT", "CAP", "RES"]);
+    expect(status.matrix.unitByRow?.slice(0, 5)).toEqual(["pF", "ohm", "V", "pF", "ohm"]);
+    expect(Object.keys(status.display.colourRanges ?? {})).toEqual(expect.arrayContaining(["cap_absolute", "voltage", "resistance"]));
+    await expect(page.getByText("5x8 Mixed Measurement Heatmap")).toBeVisible();
+    await expect(page.locator('[aria-label="Measurement heatmap; colour scale units pF, V, Ω"]')).toBeVisible();
+    const profile = page.getByTestId("row-mode-status");
+    await expect(profile).toContainText("CRVCRVCR");
+    await expect(page.getByText("Inactive with current ROWS setting")).toHaveCount(3);
+    await profile.scrollIntoViewIfNeeded();
+    await saveScreenshot(page, "rows5-mixed.png");
+  });
+
+  test("G20 ROWS=8 mixed replay shows RVVCCVVR and three independent units", async () => {
+    await openApp(page);
+    await startReplay(page, fixtures.mixed8);
+    await waitForStatus(page, (status) => status.frame.seq === 202 && status.frame.layout === "MIXED" && status.frame.rows === 8);
+    const status = await backendStatus(page);
+    expect(status.frame.rowModes).toEqual(["RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES"]);
+    expect(status.frame.profileGeneration).toBe(11);
+    expect(status.frame.profileRequestId).toBe(62);
+    await expect(page.getByText("8x8 Mixed Measurement Heatmap")).toBeVisible();
+    await expect(page.locator('[aria-label="Measurement heatmap; colour scale units pF, V, Ω"]')).toBeVisible();
+    const profile = page.getByTestId("row-mode-status");
+    await expect(profile).toContainText("RVVCCVVR");
+    await profile.scrollIntoViewIfNeeded();
+    await saveScreenshot(page, "rows8-mixed.png");
+  });
+
+  test("G21 battery last-good remains visible after an invalid attempt", async () => {
+    await openApp(page);
+    await startReplay(page, fixtures.batteryStale);
+    await waitForStatus(page, (status) =>
+      status.battery?.latestAttempt?.valid === false &&
+      status.battery?.lastGood?.batteryMv === 4092 &&
+      status.battery?.lastGood?.firmwareAuthoritative === true
+    );
+    const status = await backendStatus(page);
+    expect(status.battery?.lastGood?.source).toBe("firmware");
+    await expect(page.locator(".statusItems")).toContainText("Battery 4.092 V (last known · adc_timeout)");
+    await saveScreenshot(page, "battery-stale.png");
+  });
 });
 
 async function openApp(page: Page): Promise<void> {
@@ -489,6 +585,58 @@ function numericDiagnostic(status: BackendSnapshotPayload, key: string): number 
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function usableActiveCells(status: BackendSnapshotPayload): number {
+  let usable = 0;
+  const rows = Math.max(1, Math.min(8, Math.trunc(status.frame.rows)));
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < 8; col += 1) {
+      const value = status.matrix.displayValues?.[row]?.[col];
+      if (
+        status.matrix.valid?.[row]?.[col] &&
+        status.matrix.fresh?.[row]?.[col] &&
+        !status.matrix.error?.[row]?.[col] &&
+        typeof value === "number" &&
+        Number.isFinite(value)
+      ) {
+        usable += 1;
+      }
+    }
+  }
+  return usable;
+}
+
+async function sampleHeatmapCellColours(
+  page: Page,
+  row: number,
+  col: number,
+  rows: number
+): Promise<Array<[number, number, number, number]>> {
+  return page.locator(".heatmapCanvas").evaluate((host, coordinates) => {
+    const canvases = Array.from(host.querySelectorAll("canvas"));
+    const canvas = canvases.at(-1);
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context || canvas.clientWidth <= 0 || canvas.clientHeight <= 0) {
+      return [];
+    }
+    const gridWidth = canvas.clientWidth - 64 - 28;
+    const gridHeight = canvas.clientHeight - 28 - 72;
+    const cellWidth = gridWidth / 8;
+    const cellHeight = gridHeight / coordinates.rows;
+    const scaleX = canvas.width / canvas.clientWidth;
+    const scaleY = canvas.height / canvas.clientHeight;
+    const fractions = [[0.2, 0.2], [0.75, 0.2], [0.2, 0.75], [0.75, 0.75]];
+    return fractions.map(([xFraction, yFraction]) => {
+      const x = (64 + (coordinates.col + xFraction) * cellWidth) * scaleX;
+      const y = (28 + (coordinates.row + yFraction) * cellHeight) * scaleY;
+      return Array.from(context.getImageData(Math.floor(x), Math.floor(y), 1, 1).data) as [number, number, number, number];
+    });
+  }, { row, col, rows });
+}
+
+function isRedDominant([red, green, blue, alpha]: [number, number, number, number]): boolean {
+  return alpha > 0 && red > green + 30 && red > blue + 30;
+}
+
 async function hoverHeatmapCell(page: Page, row: number, col: number): Promise<void> {
   // The selected-cell scatter overlay is intentionally silent and can cover
   // the underlying heatmap series. Move selection to the opposite FDC group
@@ -506,9 +654,11 @@ async function hoverHeatmapCell(page: Page, row: number, col: number): Promise<v
   const heatmap = page.locator(".heatmapCanvas");
   const box = await requiredBox(heatmap);
   const gridWidth = box.width - 64 - 28;
-  const gridHeight = box.height - 28 - 52;
+  const status = await backendStatus(page);
+  const rows = Math.max(1, Math.min(8, status.frame.rows));
+  const gridHeight = box.height - 28 - 72;
   const x = box.x + 64 + ((col + 0.5) * gridWidth) / 8;
-  const y = box.y + 28 + ((row + 0.5) * gridHeight) / 8;
+  const y = box.y + 28 + ((row + 0.5) * gridHeight) / rows;
   await page.mouse.move(x, y);
 }
 

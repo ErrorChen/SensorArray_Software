@@ -38,27 +38,78 @@ export function snapshotForDisplay(
 }
 
 export function measurementMatrixIsCurrent(incoming: BackendSnapshotPayload, currentVisual: BackendSnapshotPayload | null): boolean {
-  const appliedMode = appliedMeasurementMode(incoming);
+  if (incoming.frame.layout === "MIXED") {
+    const profile = incoming.measurement?.rowProfile;
+    if (
+      typeof profile?.generation === "number" &&
+      typeof incoming.frame.profileGeneration === "number" &&
+      incoming.frame.profileGeneration !== profile.generation
+    ) {
+      return false;
+    }
+    if (
+      typeof profile?.requestId === "number" &&
+      typeof incoming.frame.profileRequestId === "number" &&
+      incoming.frame.profileRequestId !== profile.requestId
+    ) {
+      return false;
+    }
+    if (
+      typeof profile?.frameSeq === "number" &&
+      typeof incoming.frame.seq === "number" &&
+      incoming.frame.seq < profile.frameSeq
+    ) {
+      return false;
+    }
+    const currentGeneration = currentVisual?.frame.profileGeneration;
+    if (
+      currentVisual?.frame.layout === "MIXED" &&
+      typeof currentGeneration === "number" &&
+      typeof incoming.frame.profileGeneration === "number" &&
+      incoming.frame.profileGeneration < currentGeneration
+    ) {
+      return false;
+    }
+    return true;
+  }
+  const profileAuthority = homogeneousProfileAuthority(incoming);
+  const appliedMode = profileAuthority?.mode ?? appliedMeasurementMode(incoming);
   if (measurementQuantity(incoming) !== quantityForMode(appliedMode)) {
     return false;
+  }
+  if (profileAuthority) {
+    if (
+      typeof profileAuthority.generation === "number" &&
+      typeof incoming.frame.profileGeneration === "number" &&
+      incoming.frame.profileGeneration !== profileAuthority.generation
+    ) {
+      return false;
+    }
+    if (
+      typeof profileAuthority.requestId === "number" &&
+      typeof incoming.frame.profileRequestId === "number" &&
+      incoming.frame.profileRequestId !== profileAuthority.requestId
+    ) {
+      return false;
+    }
   }
   if (appliedMode === "CAP") {
     // CAP frame gen/rid belongs to ROWS, not to the MODE transaction.  The
     // MAPP sequence is the only authoritative mode boundary for CAP.
-    const boundarySeq = incoming.measurement?.frameSeq;
+    const boundarySeq = profileAuthority?.frameSeq ?? incoming.measurement?.frameSeq;
     if (typeof boundarySeq === "number" && typeof incoming.frame.seq === "number" && incoming.frame.seq < boundarySeq) {
       return false;
     }
     const currentSeq = currentVisual?.frame.seq;
     return !(
       currentVisual &&
-      appliedMeasurementMode(currentVisual) === "CAP" &&
+      effectiveHomogeneousMode(currentVisual) === "CAP" &&
       typeof currentSeq === "number" &&
       typeof incoming.frame.seq === "number" &&
       incoming.frame.seq < currentSeq
     );
   }
-  const appliedGeneration = incoming.measurement?.generation;
+  const appliedGeneration = profileAuthority?.generation ?? incoming.measurement?.generation;
   const matrixGeneration = incoming.matrix.generation;
   if (typeof appliedGeneration === "number" && matrixGeneration !== appliedGeneration) {
     return false;
@@ -66,7 +117,7 @@ export function measurementMatrixIsCurrent(incoming: BackendSnapshotPayload, cur
   const currentGeneration = currentVisual?.matrix.generation;
   if (
     currentVisual &&
-    appliedMeasurementMode(currentVisual) === appliedMode &&
+    effectiveHomogeneousMode(currentVisual) === appliedMode &&
     typeof currentGeneration === "number" &&
     typeof matrixGeneration === "number" &&
     matrixGeneration < currentGeneration
@@ -74,6 +125,42 @@ export function measurementMatrixIsCurrent(incoming: BackendSnapshotPayload, cur
     return false;
   }
   return true;
+}
+
+type HomogeneousProfileAuthority = {
+  mode: "CAP" | "VOLT" | "RES";
+  generation: number | null;
+  requestId: number | null;
+  frameSeq: number | null;
+};
+
+function homogeneousProfileAuthority(snapshot: BackendSnapshotPayload | null): HomogeneousProfileAuthority | null {
+  const profile = snapshot?.measurement?.rowProfile;
+  const modes = profile?.appliedModes;
+  // Firmware 331c445 chooses the legacy versus mixed frame grammar from the
+  // complete persisted eight-row profile. Inactive configured rows therefore
+  // remain semantically relevant: ROWS=4 + CCCCRVVR is mixed, not CAP.
+  const savedModes = Array.isArray(modes) && modes.length === 8 ? modes : [];
+  if (savedModes.length !== 8 || savedModes.some((mode) => mode !== savedModes[0])) {
+    return null;
+  }
+  const mode = savedModes[0];
+  if (mode !== "CAP" && mode !== "VOLT" && mode !== "RES") {
+    return null;
+  }
+  if (!profile) {
+    return null;
+  }
+  return {
+    mode,
+    generation: profile.generation,
+    requestId: profile.requestId,
+    frameSeq: profile.frameSeq
+  };
+}
+
+function effectiveHomogeneousMode(snapshot: BackendSnapshotPayload | null): "CAP" | "VOLT" | "RES" {
+  return homogeneousProfileAuthority(snapshot)?.mode ?? appliedMeasurementMode(snapshot);
 }
 
 function frozenVisualWithCurrentStatus(incoming: BackendSnapshotPayload, currentVisual: BackendSnapshotPayload): BackendSnapshotPayload {

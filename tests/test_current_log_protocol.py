@@ -9,6 +9,7 @@ from sensorarray_app.domain.models import (
     CommandApplied,
     CommandTransactionEvent,
     LogRecord,
+    RailTelemetry,
     TransportEnvelope,
 )
 from sensorarray_app.protocol.log_protocol import TextLogProtocol
@@ -62,6 +63,50 @@ def test_mode_ack_apply_and_error_are_generic_correlated_transactions():
     assert failed.commandType == "mode"
     assert failed.phase == "failed"
     assert failed.error == "0x103"
+
+
+def test_row_mode_ack_apply_and_error_are_typed_atomic_transactions():
+    protocol = TextLogProtocol()
+    accepted = transactions(
+        protocol.feed_line(
+            "RMACK,id=62,old=CCCCCCCC,new=RVVCCVVR,state=accepted",
+            envelope(),
+        )
+    )[0]
+    assert (accepted.commandType, accepted.phase, accepted.requestId) == ("row_modes", "accepted", 62)
+    assert accepted.oldValue == ("CAP",) * 8
+    assert accepted.requestedValue == ("RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES")
+    assert accepted.appliedValue is None
+
+    applied = transactions(
+        protocol.feed_line(
+            "RMAPP,id=62,gen=11,seq=201,profile=RVVCCVVR,state=applied",
+            envelope(),
+        )
+    )[0]
+    assert (applied.commandType, applied.phase, applied.requestId) == ("row_modes", "applied", 62)
+    assert (applied.generation, applied.frameSeq) == (11, 201)
+    assert applied.appliedValue == accepted.requestedValue
+
+    failed = transactions(
+        protocol.feed_line(
+            "RMERR,id=63,gen=12,seq=202,profile=CRVCRVCR,err=0x108,state=rejected,route=SAFE",
+            envelope(),
+        )
+    )[0]
+    assert (failed.commandType, failed.phase, failed.requestId) == ("row_modes", "failed", 63)
+    assert failed.requestedValue == ("CAP", "RES", "VOLT", "CAP", "RES", "VOLT", "CAP", "RES")
+    assert (failed.generation, failed.frameSeq) == (12, 202)
+    assert failed.error == "0x108"
+
+
+def test_malformed_row_mode_profile_stays_observable_but_cannot_advance_typed_state():
+    events = TextLogProtocol().feed_line(
+        "RMAPP,id=62,gen=11,seq=201,new=RVV,state=applied",
+        envelope(),
+    )
+    assert len([event for event in events if isinstance(event, LogRecord)]) == 1
+    assert not transactions(events)
 
 
 def test_rows_legacy_events_are_retained_alongside_generic_transactions():
@@ -212,6 +257,66 @@ def test_battery_telemetry_preserves_current_scheduler_and_restore_fields():
     assert telemetry.rawFields["railState"] == "ok"
     assert telemetry.railState == "ok"
     assert telemetry.railValid is True
+
+
+def test_battery_telemetry_preserves_firmware_authoritative_last_good_fields():
+    events = TextLogProtocol().feed_line(
+        "ABAT,bt=-1,valid=0,fresh=0,reason=adc_timeout,lastGoodMv=4092,lastGoodValid=1,"
+        "lastGoodFresh=1,lastGoodAgeMs=1800,lastGoodFrame=88",
+        envelope(),
+    )
+    telemetry = [event for event in events if isinstance(event, BatteryTelemetry)][0]
+    assert telemetry.batteryMv is None
+    assert telemetry.valid is False
+    assert telemetry.lastGoodBatteryMv == 4092
+    assert telemetry.lastGoodValid is True
+    assert telemetry.lastGoodFresh is True
+    assert telemetry.lastGoodAgeMs == 1800
+    assert telemetry.lastGoodFrame == 88
+    # Firmware 331c445 has no last-good-specific source/reason fields; the
+    # store labels their provenance as firmware after detecting lastGood*.
+    assert telemetry.lastGoodSource is None
+    assert telemetry.lastGoodReason is None
+
+
+def test_firmware_battery_error_is_a_typed_failed_attempt_with_last_good():
+    events = TextLogProtocol().feed_line(
+        "BATERR,seq=89,err=0x107,reason=adc_timeout,valid=0,lastGoodMv=4088,"
+        "lastGoodValid=1,sampleUs=820,restore=ok,action=report_continue",
+        envelope(),
+    )
+    telemetry = [event for event in events if isinstance(event, BatteryTelemetry)][0]
+    assert telemetry.batteryMv is None
+    assert telemetry.valid is False
+    assert telemetry.reason == "adc_timeout"
+    assert telemetry.lastGoodBatteryMv == 4088
+    assert telemetry.lastGoodValid is True
+
+
+def test_internal_monitor_rail_log_becomes_read_only_typed_span_telemetry():
+    events = TextLogProtocol().feed_line(
+        "ARL,src=monitor,raw=123,mon=5126000,rail=5126000,rv=1,rs=ok,age=2,ref=avdd-avss",
+        envelope(),
+    )
+    telemetry = [event for event in events if isinstance(event, RailTelemetry)][0]
+    assert telemetry.railSpanUv == 5_126_000
+    assert telemetry.valid is True
+    assert telemetry.fresh is True
+    assert telemetry.age == 2
+    assert telemetry.source == "internal_monitor"
+    assert telemetry.reason == "ok"
+    assert telemetry.rawFields["ref"] == "avdd-avss"
+
+
+def test_stale_rail_state_is_never_marked_fresh():
+    events = TextLogProtocol().feed_line(
+        "RAIL,source=internal_monitor,spanUv=5126000,valid=1,state=stale,ageMs=12000",
+        envelope(),
+    )
+    telemetry = [event for event in events if isinstance(event, RailTelemetry)][0]
+    assert telemetry.valid is True
+    assert telemetry.fresh is False
+    assert telemetry.ageMs == 12000
 
 
 def test_abat_non_ok_production_rail_states_are_not_reported_valid():

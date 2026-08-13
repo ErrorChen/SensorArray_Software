@@ -19,7 +19,7 @@ describe("StatusBar telemetry availability", () => {
     };
 
     const html = renderToStaticMarkup(createElement(StatusBar, { snapshot, socketState: "connected" }));
-    expect(html).not.toContain("Battery N/A (fresh)");
+    expect(html).toContain("Battery —");
     expect(html).not.toContain("ADS identity unconfirmed");
   });
 
@@ -36,7 +36,42 @@ describe("StatusBar telemetry availability", () => {
     };
 
     const html = renderToStaticMarkup(createElement(StatusBar, { snapshot, socketState: "connected" }));
-    expect(html).toContain("Battery 4.012 V (stale)");
+    expect(html).toContain("Battery 4.012 V (last known · stale)");
     expect(html).toContain("ADS identity unconfirmed");
+  });
+
+  it("keeps last-good voltage visible after an invalid attempt and updates on the next fresh attempt", () => {
+    const snapshot = createBackendSnapshot();
+    snapshot.battery = {
+      available: true,
+      latestAttempt: { batteryMv: null, valid: false, fresh: false, reason: "adc_timeout" },
+      lastGood: { batteryMv: 4092, batteryText: "4.092 V", valid: true, fresh: false }
+    };
+    let html = renderToStaticMarkup(createElement(StatusBar, { snapshot, socketState: "connected" }));
+    expect(html).toContain("Battery 4.092 V (last known · adc_timeout)");
+
+    snapshot.battery.latestAttempt = { batteryMv: 4088, batteryText: "4.088 V", valid: true, fresh: true };
+    snapshot.battery.lastGood = snapshot.battery.latestAttempt;
+    html = renderToStaticMarkup(createElement(StatusBar, { snapshot, socketState: "connected" }));
+    expect(html).toContain("Battery 4.088 V (fresh)");
+  });
+
+  it("uses top-level connection staleness even when latestAttempt was fresh", () => {
+    const snapshot = createBackendSnapshot();
+    snapshot.battery = {
+      available: true,
+      state: "stale",
+      batteryText: "4.092 V",
+      batteryMv: 4092,
+      valid: true,
+      fresh: false,
+      reason: "connection_stale",
+      latestAttempt: { batteryMv: 4092, batteryText: "4.092 V", valid: true, fresh: true, reason: "ok" },
+      lastGood: { batteryMv: 4092, batteryText: "4.092 V", valid: true, fresh: false }
+    };
+
+    const html = renderToStaticMarkup(createElement(StatusBar, { snapshot, socketState: "connected" }));
+    expect(html).toContain("Battery 4.092 V (last known \u00B7 connection_stale)");
+    expect(html).not.toContain("Battery 4.092 V (fresh)");
   });
 });

@@ -19,7 +19,13 @@ def snapshot_payload(runtime) -> dict[str, Any]:
     selection = runtime.current_selection_payload(matrix.activeRows)
     display_matrix = _display_matrix(runtime, matrix)
     usable = np.asarray(matrix.valid, dtype=bool) & np.asarray(matrix.fresh, dtype=bool) & ~np.asarray(matrix.error, dtype=bool)
-    color_min, color_max = runtime.color_range(display_matrix, usable)
+    active_mask = np.zeros((8, 8), dtype=bool)
+    active_mask[: max(1, min(8, int(matrix.activeRows))), :] = True
+    usable &= active_mask & np.isfinite(display_matrix)
+    colour_ranges = runtime.colour_ranges(matrix, display_matrix, usable)
+    primary_domain = _primary_colour_domain(runtime, matrix)
+    primary_range = colour_ranges[primary_domain]
+    color_min, color_max = primary_range["min"], primary_range["max"]
     transport = dict(runtime.transport.status)
     active_transport = str(transport.get("transport", "none") or "none")
     transport_mode = runtime.selectedMode if active_transport == "none" else active_transport
@@ -32,6 +38,8 @@ def snapshot_payload(runtime) -> dict[str, Any]:
         }
     )
     measurement = runtime.commands.measurement_snapshot()
+    rail_telemetry = runtime.telemetry.rail_snapshot(time.time())
+    measurement["railTelemetry"] = rail_telemetry
     battery = runtime.telemetry.battery_snapshot(time.time())
     ads = _ads_snapshot(runtime)
     rates = _rate_snapshot(runtime)
@@ -60,6 +68,10 @@ def snapshot_payload(runtime) -> dict[str, Any]:
             "revision": matrix.revision,
             "generation": matrix.firmwareGeneration,
             "requestId": matrix.requestId,
+            "layout": matrix.layout,
+            "rowModes": list(matrix.rowModes),
+            "profileGeneration": matrix.profileGeneration,
+            "profileRequestId": matrix.profileRequestId,
         },
         "matrix": {
             "rows": list(ROW_LABELS),
@@ -92,13 +104,25 @@ def snapshot_payload(runtime) -> dict[str, Any]:
             "rawPf": _matrix_to_json(matrix.rawPf),
             "userOffsetPf": _matrix_to_json(runtime.user_offsets_array()),
             "domain": matrix.domain,
+            "modeByRow": list(matrix.rowModes),
+            "unitByRow": list(matrix.rowUnits),
+            "scaleByRow": list(matrix.rowScales),
+            "capValues": _matrix_to_json(matrix.capValues),
+            "voltValues": _matrix_to_json(matrix.voltValues),
+            "resValues": _matrix_to_json(matrix.resValues),
         },
         "capacitance": {
-            "available": matrix.mode == "CAP",
+            "available": any(mode == "CAP" for mode in matrix.rowModes[: matrix.activeRows]),
             "rawPf": _matrix_to_json(matrix.rawPf),
             "correctedPf": _matrix_to_json(matrix.correctedPf),
             "userOffsetPf": _matrix_to_json(runtime.user_offsets_array()),
-            "displayPf": _matrix_to_json(display_matrix) if matrix.mode == "CAP" else _matrix_to_json(np.full((8, 8), np.nan)),
+            "displayPf": _matrix_to_json(
+                np.where(
+                    np.asarray([mode == "CAP" for mode in matrix.rowModes], dtype=bool).reshape(8, 1),
+                    display_matrix,
+                    np.nan,
+                )
+            ),
             "displayMode": runtime.ui.displayMode.value,
         },
         "selection": selection,
@@ -113,6 +137,7 @@ def snapshot_payload(runtime) -> dict[str, Any]:
             "circuitOffsetPf": runtime.ui.circuitOffsetPf,
             "trendLatestN": runtime.ui.trendLatestN,
             "colorRange": {"min": color_min, "max": color_max, "frozen": runtime.ui.freezeColor},
+            "colourRanges": colour_ranges,
         },
         "baseline": runtime.baseline_payload(),
         "commands": runtime.commands.snapshot(),
@@ -127,14 +152,33 @@ def snapshot_payload(runtime) -> dict[str, Any]:
 
 def _display_matrix(runtime, matrix) -> np.ndarray:
     values = np.asarray(matrix.matrix, dtype=np.float64).copy()
-    if matrix.mode != "CAP":
+    if matrix.mode not in {"CAP", "MIXED"}:
         # CAP offsets and Delta C/C0 are never applied to voltage/resistance.
         return values
-    display = values - runtime.user_offsets_array()
+    cap_rows = np.asarray([mode == "CAP" for mode in matrix.rowModes], dtype=bool)
+    display = values.copy()
+    display[cap_rows, :] -= runtime.user_offsets_array()[cap_rows, :]
     if runtime.ui.displayMode == DisplayMode.DELTA_PERCENT and runtime.ui.baseline is not None:
-        flat = delta_percent(display.reshape(64), runtime.ui.baseline)
-        return flat.reshape(8, 8)
+        delta = delta_percent(display.reshape(64), runtime.ui.baseline).reshape(8, 8)
+        display[cap_rows, :] = delta[cap_rows, :]
     return display
+
+
+def _primary_colour_domain(runtime, matrix) -> str:
+    if matrix.mode == "CAP":
+        return "cap_delta" if runtime.ui.displayMode == DisplayMode.DELTA_PERCENT else "cap_absolute"
+    if matrix.mode == "VOLT":
+        return "voltage"
+    if matrix.mode == "RES":
+        return "resistance"
+    for mode in matrix.rowModes[: matrix.activeRows]:
+        if mode == "CAP":
+            return "cap_delta" if runtime.ui.displayMode == DisplayMode.DELTA_PERCENT else "cap_absolute"
+        if mode == "VOLT":
+            return "voltage"
+        if mode == "RES":
+            return "resistance"
+    return "cap_absolute"
 
 
 def _ads_snapshot(runtime) -> dict[str, Any]:

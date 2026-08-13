@@ -21,7 +21,9 @@ from sensorarray_app.domain.models import (
     DisplayMode,
     LogRecord,
     MeasurementFrame,
+    MixedMeasurementFrame,
     ParserErrorEvent,
+    RailTelemetry,
     ResistanceFrame,
     TransportEnvelope,
     TransportStateEvent,
@@ -68,22 +70,27 @@ class SensorArrayRuntime:
 
     def connect_serial(self, port: str, baud: int, auto_reconnect: bool) -> None:
         self.invalidate_baseline("session changed")
+        self.telemetry.begin_device(f"serial:{str(port).strip().lower()}")
         self.transport.connect_serial(port, baud, auto_reconnect)
 
     def connect_replay(self, path: str, speed: float = 1.0) -> None:
         self.invalidate_baseline("replay restart")
+        self.telemetry.begin_device(f"replay:{str(path)}")
         self.transport.connect_replay(path, speed)
 
     def connect_ble(self, address: str, device_id: str = "") -> None:
         self.invalidate_baseline("session changed")
+        self.telemetry.begin_device(f"ble:{str(device_id or address).strip().lower()}")
         self.transport.connect_ble(address, device_id)
 
     def connect_wifi(self, host: str) -> None:
         self.invalidate_baseline("session changed")
+        self.telemetry.begin_device(f"wifi:{str(host).strip().lower()}")
         self.transport.connect_wifi(host)
 
     def disconnect(self) -> None:
         self.invalidate_baseline("disconnect")
+        self.telemetry.mark_connection_stale()
         self.transport.disconnect()
 
     def request_rows(self, rows: int) -> None:
@@ -100,46 +107,15 @@ class SensorArrayRuntime:
         normalized = {"CAPACITANCE": "CAP", "VOLTAGE": "VOLT", "RESISTANCE": "RES"}.get(normalized, normalized)
         if normalized not in {"CAP", "VOLT", "RES"}:
             raise ValueError("measurement mode must be CAP, VOLT, or RES")
-        if normalized == "VOLT":
-            if (measured_avdd_v is None or measured_avss_v is None) and not self.commands.railConfigured:
-                raise ValueError("Voltage mode requires measured AVDD/AVSS rail configuration.")
-            if measured_avdd_v is not None and measured_avss_v is not None:
-                avdd_uv = int(round(float(measured_avdd_v) * 1_000_000.0))
-                avss_uv = int(round(float(measured_avss_v) * 1_000_000.0))
-                applied_avdd_uv = (
-                    int(round(self.commands.measuredAvddV * 1_000_000.0))
-                    if self.commands.measuredAvddV is not None
-                    else None
-                )
-                applied_avss_uv = (
-                    int(round(self.commands.measuredAvssV * 1_000_000.0))
-                    if self.commands.measuredAvssV is not None
-                    else None
-                )
-                requested_rail_is_applied = (
-                    self.commands.railConfigured
-                    and applied_avdd_uv == avdd_uv
-                    and applied_avss_uv == avss_uv
-                )
-                if not requested_rail_is_applied:
-                    if self.commands.appliedMode == "VOLT":
-                        raise ValueError(
-                            "Cannot replace measured AVDD/AVSS while VOLT is applied; switch to CAP or RES first."
-                        )
-                    self.commands.request_rail(
-                        avdd_uv,
-                        avss_uv,
-                        self.transport.send_command,
-                        desired_mode="VOLT",
-                    )
-                    self._host_log(
-                        "Commands",
-                        "info",
-                        f"RAILCFG={avdd_uv},{avss_uv} requested; waiting for RACK/RAPP before MODE=VOLT",
-                    )
-                    return
+        # Firmware now owns its ADS analogue-rail monitor. Keep the optional
+        # arguments only as a source-compatible API shim for older callers;
+        # MODE must never be sequenced behind a production RAILCFG transaction.
         self.commands.request_mode(normalized, self.transport.send_command)
         self._host_log("Commands", "info", f"MODE={normalized} requested; waiting for MACK/MAPP")
+
+    def request_row_modes(self, modes: Any) -> None:
+        record = self.commands.request_row_modes(modes, self.transport.send_command)
+        self._host_log("Commands", "info", f"{record.command} requested; waiting for RMACK/RMAPP")
 
     def send_command(self, command: str) -> None:
         self.transport.send_command(command)
@@ -147,13 +123,16 @@ class SensorArrayRuntime:
 
     def capture_baseline(self) -> None:
         snap = self.matrixStore.snapshot()
-        if snap.mode != "CAP" or snap.seq is None or snap.firmwareGeneration is None or snap.requestId is None:
+        has_cap_rows = any(mode == "CAP" for mode in snap.rowModes[: snap.activeRows])
+        baseline_generation = snap.profileGeneration if snap.layout == "MIXED" else snap.firmwareGeneration
+        baseline_request_id = snap.profileRequestId if snap.layout == "MIXED" else snap.requestId
+        if not has_cap_rows or snap.seq is None or baseline_generation is None or baseline_request_id is None:
             self._baseline_session = None
             self.ui.pendingDisplayMode = None
             self.ui.baseline = None
             self.ui.displayMode = DisplayMode.ABSOLUTE_C
             self.ui.baselineStatus = "No data"
-            self.ui.baselineInvalidReason = "Available in capacitance mode only" if snap.mode != "CAP" else "No capacitance frame yet"
+            self.ui.baselineInvalidReason = "Available when an active row uses CAP" if not has_cap_rows else "No capacitance frame yet"
             return
         if self.ui.displayMode == DisplayMode.DELTA_PERCENT:
             self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
@@ -164,8 +143,8 @@ class SensorArrayRuntime:
             transport=self.transport.status.get("transport", "none"),
             deviceId=self.transport.status.get("device", ""),
             activeRows=snap.activeRows,
-            firmwareGeneration=snap.firmwareGeneration,
-            requestId=snap.requestId,
+            firmwareGeneration=baseline_generation,
+            requestId=baseline_request_id,
             measurementDomain="capacitance",
             circuitOffsetPf=self.registry.cap.circuit_offset_pf,
             startMonotonicNs=time.monotonic_ns(),
@@ -306,9 +285,17 @@ class SensorArrayRuntime:
                 if item.sessionGeneration != self.commands.sessionGeneration:
                     self.registry.reset_session()
                     self.commands.reset_session(item.sessionGeneration)
-                    self.matrixStore.clear()
-                    self.telemetry.reset()
+                    self.matrixStore.reset_session()
+                    # connect_* registers a stable target identity before the
+                    # generation changes. With no such identity, fail closed:
+                    # the state event could belong to a different board.
+                    if self.telemetry.deviceIdentity:
+                        self.telemetry.mark_connection_stale()
+                    else:
+                        self.telemetry.reset()
                     self.matrixStore.apply_measurement_mode("CAP", None, None, None)
+                if str(item.state).upper() in {"DISCONNECTED", "ERROR", "FAILED", "RECONNECTING"}:
+                    self.telemetry.mark_connection_stale()
                 self.transport.apply_state_event(item)
                 self._host_log("Transport", "info", f"{item.source} {item.state} {item.message}".strip())
                 continue
@@ -342,8 +329,16 @@ class SensorArrayRuntime:
             first_session_measurement = self.matrixStore.snapshot().seq is None
             if (
                 self.commands.pendingMode is None
+                and self.commands.pendingRowModes is None
+                and self.commands.transitionState == "applied"
+                and self.commands.rowModeTransitionState == "applied"
+                and self.commands.modeRequestId is None
+                and self.commands.rowModeRequestId is None
+                and not self.commands.modeError
+                and not self.commands.rowModeError
                 and self.commands.appliedMode != event.mode
                 and self.commands.modeGeneration is None
+                and self.commands.rowModeGeneration is None
                 and first_session_measurement
             ):
                 changed = self.commands.observe_mode_frame(event.mode, event.generation, event.requestId, event.seq)
@@ -353,8 +348,68 @@ class SensorArrayRuntime:
                     self._measurement_mode_visual_reset()
             if self.matrixStore.add_measurement(event):
                 self.stats.record_frame()
+                rail_span_uv = (
+                    int(event.avddUv) - int(event.avssUv)
+                    if event.avddUv is not None and event.avssUv is not None
+                    else None
+                )
+                self.telemetry.update_rail(
+                    RailTelemetry(
+                        railSpanUv=rail_span_uv,
+                        valid=bool(event.railValid),
+                        # Firmware has already applied its maximum-age policy
+                        # when it publishes rail=1.  A non-zero age is useful
+                        # provenance (and normal for a cached monitor result),
+                        # not proof that the span is stale.  Host connection
+                        # gaps and elapsed wall time are handled separately by
+                        # TelemetryStore; treating every age>0 as stale made a
+                        # valid VOLT frame such as rail=1,age=1 fail the GUI
+                        # read-only rail acceptance.
+                        fresh=bool(event.railValid),
+                        age=int(event.railAgeFrames),
+                        ageMs=None,
+                        source="internal_monitor",
+                        reason="ok" if event.railValid else "rail_invalid",
+                        timestamp=float(event.receivedTime),
+                        rawFields=dict(event.rawFields),
+                    )
+                )
             else:
                 self._frame_drop_log(event.mode, event.seq, event.generation, event.requestId)
+        elif isinstance(event, MixedMeasurementFrame):
+            first_session_measurement = self.matrixStore.snapshot().seq is None
+            if (
+                self.commands.pendingRowModes is None
+                and self.commands.pendingMode is None
+                and self.commands.rowModeTransitionState == "applied"
+                and self.commands.transitionState == "applied"
+                and self.commands.rowModeRequestId is None
+                and self.commands.modeRequestId is None
+                and not self.commands.rowModeError
+                and not self.commands.modeError
+                and self.commands.rowModeGeneration is None
+                and self.commands.modeGeneration is None
+                and first_session_measurement
+            ):
+                changed = self.commands.observe_row_modes_frame(
+                    event.profile,
+                    event.profileGeneration,
+                    event.profileRequestId,
+                    event.seq,
+                )
+                if changed:
+                    self.matrixStore.apply_row_modes(
+                        event.profile,
+                        event.profileGeneration,
+                        event.profileRequestId,
+                        event.seq,
+                    )
+            if self.matrixStore.add_mixed(event):
+                self.stats.record_frame()
+                if self._baseline_session is not None:
+                    self._add_mixed_baseline_frame(event)
+            else:
+                self._frame_drop_log("MIXED", event.seq, event.profileGeneration, event.profileRequestId)
         elif isinstance(event, VoltageFrame):
             self.matrixStore.add_voltage(event)
             self.stats.record_frame()
@@ -363,14 +418,29 @@ class SensorArrayRuntime:
             self.stats.record_frame()
         elif isinstance(event, BatteryTelemetry):
             self.telemetry.update_battery(event)
+        elif isinstance(event, RailTelemetry):
+            self.telemetry.update_rail(event)
         elif isinstance(event, LogRecord):
             self.rawLogs.add(event)
         elif isinstance(event, CommandAccepted):
             self.commands.accept(event)
         elif isinstance(event, CommandApplied):
-            old = self.commands.activeRows
+            pending_rows = self.commands.pendingRows
+            pending_request_id = self.commands.rowsRequestId
             self.commands.apply(event)
-            if event.newRows is not None and event.newRows != old:
+            rows_applied = (
+                pending_rows is not None
+                and event.newRows == pending_rows
+                and event.commandId == pending_request_id
+                and self.commands.pendingRows is None
+            )
+            if rows_applied:
+                self.matrixStore.apply_rows(
+                    self.commands.activeRows,
+                    event.generation,
+                    event.commandId,
+                    event.seq,
+                )
                 self.invalidate_baseline("ROWS applied")
         elif isinstance(event, CommandTransactionEvent):
             previous_mode = self.commands.appliedMode
@@ -384,6 +454,15 @@ class SensorArrayRuntime:
                 )
                 if self.commands.appliedMode != previous_mode:
                     self.invalidate_baseline("measurement mode changed")
+                self._measurement_mode_visual_reset()
+            if result.get("rowModesApplied"):
+                self.matrixStore.apply_row_modes(
+                    self.commands.appliedRowModes,
+                    self.commands.rowModeGeneration,
+                    self.commands.rowModeRequestId,
+                    self.commands.rowModeFrameSeq,
+                )
+                self.invalidate_baseline("row measurement modes changed")
                 self._measurement_mode_visual_reset()
             if result.get("railApplied") and self.commands.desiredModeAfterRail:
                 desired_mode = self.commands.desiredModeAfterRail
@@ -415,6 +494,45 @@ class SensorArrayRuntime:
 
     def _measurement_mode_visual_reset(self) -> None:
         """Hook for the backend runtime's quantity-specific colour cache."""
+
+    def _add_mixed_baseline_frame(self, frame: MixedMeasurementFrame) -> bool:
+        """Capture only CAP cells from one mixed frame with per-cell freshness."""
+
+        session = self._baseline_session
+        if session is None or session.cancelled:
+            return False
+        if frame.receivedMonotonicNs < session.startMonotonicNs or frame.receivedMonotonicNs >= session.endMonotonicNs:
+            return False
+        matches = (
+            frame.sessionGeneration == session.sessionGeneration
+            and frame.sourceTransport == session.transport
+            and (not session.deviceId or frame.deviceId == session.deviceId)
+            and frame.rows == session.activeRows
+            and frame.profileGeneration == session.firmwareGeneration
+            and frame.profileRequestId == session.requestId
+        )
+        if not matches:
+            session.rejectedFrameCount += 1
+            return False
+        session.frameCount += 1
+        offsets = (
+            np.asarray(session.userOffsetsPf, dtype=np.float64).reshape(64)
+            if session.userOffsetsPf is not None
+            else np.zeros(64, dtype=np.float64)
+        )
+        for row_frame in frame.rowFrames:
+            if row_frame.mode != "CAP":
+                continue
+            row_index = int(row_frame.row) - 1
+            values = np.asarray(row_frame.physicalValues, dtype=np.float64).reshape(8)
+            valid = np.asarray(row_frame.validMask, dtype=bool).reshape(8)
+            fresh = np.asarray(row_frame.freshMask, dtype=bool).reshape(8)
+            for col_index in range(8):
+                cell_index = row_index * 8 + col_index
+                value = float(values[col_index] - offsets[cell_index])
+                if valid[col_index] and fresh[col_index] and np.isfinite(value):
+                    session._samples[cell_index].append(value)
+        return True
 
     def _frame_drop_log(self, mode: str, seq: int, generation: int | None, request_id: int | None) -> None:
         self._host_log(

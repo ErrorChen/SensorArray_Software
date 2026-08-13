@@ -1,47 +1,92 @@
 # SensorArray Desktop Host
 
 SensorArray Desktop Host is the Electron/React/FastAPI application for the
-SensorArray 8x8 measurement matrix. It supports three measurement quantities
-without replacing the existing transport and desktop architecture:
+SensorArray 8x8 measurement matrix. It preserves the existing capacitance path
+and adds two ways to select the measurement quantity:
 
-- `CAP`: capacitance in pF, including circuit correction, per-cell offsets,
-  baseline capture, and Delta C/C0 %.
-- `VOLT`: signed fixed-point microvolts converted to volts.
-- `RES`: fixed-point milliohms converted to ohms.
+- `MODE=CAP|VOLT|RES` is the backwards-compatible quick action that sets all
+  eight row modes at one frame boundary.
+- `ROWMODES=<8 characters>` atomically applies an eight-row profile, where
+  `C`, `V`, and `R` mean capacitance, voltage, and resistance.
+
+For example, `ROWMODES=RVVCCVVR` configures S1/S8 as RES, S2/S3/S6/S7 as
+VOLT, and S4/S5 as CAP. A homogeneous saved eight-row profile continues to use
+the established single-quantity frame families. Firmware `331c445` selects the
+mixed `M/MR/K` family whenever the complete saved profile is heterogeneous,
+even if the currently active `ROWS` prefix happens to contain one mode.
 
 Serial, Bluetooth LE, Wi-Fi UDP, and Replay all feed the same content-routed
-protocol layer, typed measurement state, WebSocket snapshot, heatmap, and trend
-charts. Replay validates the software path; it is not evidence that a hardware
-transport passed.
+protocol layer, typed command/domain state, stores, WebSocket snapshot, and
+React UI. Replay validates that software path; it is not evidence that a real
+Serial, BLE, or Wi-Fi link passed.
 
-## Protocol authority
+## Firmware authority and compatibility status
 
 The sibling [SensorArray firmware repository](https://github.com/ErrorChen/SensorArray)
-is authoritative for the measurement and command wire protocol. Host fixtures
-are compatibility copies, not a second protocol specification. When firmware
-documentation disagrees with production formatter/command code and its tests,
-the implementation and tests take precedence.
+is authoritative for production wire bytes. Formatter and command code plus
+their tests outrank copied host fixtures and prose.
 
-The current host understands:
+This host upgrade targets exact firmware commit
+`331c44589318db9ba642cf3ab33bb08ca3dd8a34`, which adds:
 
-- CAP `C` headers, `D` value chunks, and `K` CRC trailers.
-- VOLT/RES `V` or `R` headers, `D` value/error chunks, packed `P` PGA chunks,
-  and `K` CRC trailers.
-- `MODE?`, `STATE?`, `MODE=CAP|VOLT|RES`, and the strict `MACK` accepted / `MAPP`
-  applied transaction.
-- `ROWS`, `RCMD`, and `RAPP`.
-- external measured-rail `RAILCFG`, `RACK`, `RAPP`, and `RERR`.
-- ADS identity and `ADSCHK` diagnostics.
-- battery cache, immediate transaction, scheduler, and diagnostic telemetry.
+- `ROWMODES?`, `ROWMODES=...`, `RMACK`, `RMAPP`, and `RMERR`;
+- heterogeneous `M/MR/K` measurement frames;
+- `MAPP` and `RMAPP` publication on BLE LOG `FF30`;
+- automatic internal ADS analogue rail-span telemetry.
 
-VOLT data is signed integer microvolts (`unit=V,scale=-6`); RES data is integer
-milliohms (`unit=ohm,scale=-3`). A value such as `-1250` is a valid negative
-voltage. `Xhh` is an invalid cell carrying firmware error code `0xHH`; it is
-never converted to zero. PGA literals are `01/02/04/08/10/20` for x1 through
-x32, while `00` means verified PGA bypass.
+The Python mixed assembler and Replay fixtures follow the exact formatter in
+`main/output/sensorarrayTextProtocol.c`: short identity keys
+`rgen/rrid/pgen/prid`, `MR,s=...,m=C|V|R`, comma-separated `D=` values, and CRC
+over the exact `M` and `MR` lines including LF.
 
-For the exact frame, mask, CRC, transaction, and diagnostic contracts, see
-[Host measurement protocol compatibility notes](docs/measurement-protocol.md).
+Firmware `331c445` has one source-level transaction blocker that the Host must
+not conceal: a homogeneous `ROWMODES=CCCCCCCC`, `VVVVVVVV`, or `RRRRRRRR`
+request emits `RMACK` and enters the legacy frame path, but that path contains
+no row-profile `CompleteTransition`, `RMAPP`, or `RMERR`. The strict Host
+therefore times out and keeps the prior applied profile. Data frames are not
+used as an applied-event substitute. Homogeneous row-profile transaction and
+the requested switching-stress acceptance remain firmware-blocked until that
+completion path is fixed; the global `MODE=` set-all action remains supported.
+
+See [measurement protocol compatibility notes](docs/measurement-protocol.md)
+for the exact target schema and the firmware evidence boundary.
+
+## Protocol summary
+
+Existing homogeneous formats remain supported:
+
+- CAP: `C` header, `D` chunks, and `K` CRC trailer.
+- VOLT: `V` header, `D` value/error chunks, `P` PGA chunks, and `K`.
+- RES: `R` header, `D` value/error chunks, `P` PGA chunks, and `K`.
+
+VOLT data is signed integer microvolts (`unit=V,scale=-6`); RES data is
+integer milliohms (`unit=ohm,scale=-3`). `Xhh` carries a firmware cell error
+and is never converted to zero. `PGA=00` means verified bypass.
+
+Mode and row-profile transactions are independent and strict:
+
+```text
+MODE=RES
+MACK,id=41,old=CAP,new=RES,state=accepted
+MAPP,id=41,gen=7,old=CAP,new=RES,seq=120,state=applied,...
+
+ROWMODES=RVVCCVVR
+RMACK,id=62,old=CCCCCCCC,new=RVVCCVVR,state=accepted
+RMAPP,id=62,gen=11,seq=201,profile=RVVCCVVR,state=applied
+```
+
+`MACK` and `RMACK` mean queued/accepted only. The host keeps the last applied
+state until the matching `MAPP` or `RMAPP` supplies the generation and frame
+boundary. A wrong-ID applied event is rejected. A data frame never completes a
+pending transaction; timeout or `MERR`/`RMERR` exposes an error without
+fabricating application.
+
+On BLE the existing single client subscribes once to CTRL TX `FF11`, DATA
+`FF20`, and LOG `FF30`. Fragment reassembly precedes content routing. `MACK` or
+`RMACK` may arrive through `FF11`; `MAPP` or `RMAPP` must arrive through
+`FF30`, then traverse `BleTransport -> BleFragmentReassembler ->
+ProtocolRegistry -> TextLogProtocol -> CommandService`. There is no second BLE
+client, duplicate `FF30` subscription, UI-side parser, or data-frame shortcut.
 
 ## Install and run
 
@@ -56,10 +101,9 @@ npm.cmd install
 npm.cmd run desktop
 ```
 
-`npm.cmd run desktop` starts Vite and Electron. Electron starts the Python
-backend sidecar, probes `127.0.0.1` ports `8888` through `8988`, waits for a
-successful `GET /health`, and supplies the selected backend URL to the renderer
-through the existing preload bridge. Backend-only development remains available:
+Electron starts the Python backend sidecar, probes loopback ports `8888`
+through `8988`, waits for `GET /health`, and supplies the selected backend URL
+through the preload bridge. Backend-only development remains available:
 
 ```powershell
 .\.venv\Scripts\python.exe -m sensorarray_backend --host 127.0.0.1 --port 8888
@@ -73,125 +117,105 @@ Serial / BLE / Wi-Fi / Replay
              v
       ProtocolRegistry
              |
-       C / V / R parser
+  C/V/R parser | mixed M/MR/K parser | TextLogProtocol
              |
-   typed measurement + command events
+    typed frames and command transactions
              |
-     MatrixStore / history / telemetry
+ MatrixStore / history / telemetry / CommandService
              |
-       FastAPI + WebSocket
+        FastAPI + WebSocket
              |
-       React UI in Electron
+         React + ECharts
 ```
 
-The existing BLE service and characteristics remain `00FF`, `FF10`, `FF11`,
-`FF20`, and `FF30`. Wi-Fi UDP remains DATA `3333`, LOG `3334`, and CTRL `3335`.
-BLE fragmentation/reassembly occurs before content routing. A complete
-measurement packet received on a log channel is still routed by its `C`, `V`,
-or `R` content.
+The logical backing geometry remains 8x8. `frame.rows` is the active geometry
+authority and can be any integer from 1 through 8. Canonical `331c445` mixed
+rows keep explicit row mode, unit, scale, validity, freshness, error, `fmt`, and
+eight fixed-point/error tokens. The store also keeps separate CAP, VOLT, and RES value caches so
+an ohm value cannot later be interpreted as pF. A row mode change starts a new
+visible trend segment rather than drawing a line across incompatible units.
 
-Transport mode and measurement mode are deliberately separate:
+## Measurement and row-mode API
 
-- `connection.transportMode`: `serial`, `ble`, `wifi`, or `replay`.
-- `measurement.appliedMode`: `CAP`, `VOLT`, or `RES`.
-
-The UI does not optimistically commit a measurement mode on `MACK`. It shows a
-pending transition until a matching `MAPP` supplies the generation and frame
-sequence boundary. Old-generation VOLT/RES frames and pre-boundary CAP frames
-are rejected.
-
-## Voltage rail configuration
-
-VOLT requires a paired, externally measured rail snapshot from the current
-power, wiring, and load condition:
+Key measurement endpoints are:
 
 ```text
-RAILCFG=<positive_AVDD_uV>,<negative_AVSS_uV>
-```
-
-Enter the readings as volts in Setup; the host converts them to integer uV. Do
-not use nominal supply values, battery voltage, `RAIL?`, or the ADS supply
-monitor as a substitute for an external DMM reading. The host applies
-`RAILCFG` while in CAP/RES, waits for matching `RACK` and
-`RAPP,source=external,state=applied`, and only then sends `MODE=VOLT`.
-
-RES does not require this external rail workflow. CAP-only offset, baseline,
-and Delta controls are not applied to VOLT or RES.
-
-## API and snapshots
-
-Key endpoints include:
-
-```text
-GET  /health
-GET  /api/status
-GET  /api/history
-
-POST /api/transport/mode
-GET  /api/transport/serial/ports
-POST /api/transport/serial/connect
-GET  /api/transport/ble/scan
-POST /api/transport/ble/connect
-GET  /api/transport/wifi/discover
-POST /api/transport/wifi/connect
-POST /api/transport/write
-POST /api/transport/disconnect
-
 GET  /api/measurement/mode
 POST /api/measurement/mode
-POST /api/measurement/rail
+GET  /api/measurement/row-modes
+POST /api/measurement/row-modes
+POST /api/measurement/rail       deprecated/debug compatibility only
 POST /api/rows
-
-POST /api/replay/open
-POST /api/replay/start
-POST /api/replay/stop
-POST /api/replay/seek
-
-GET  /api/export/session?format=csv|xlsx|mat|h5
-POST /api/import/session
-GET  /api/setup/profile
-POST /api/setup/profile
-WS   /ws
 ```
 
-Snapshots keep connection and measurement state distinct. Generic matrix data
-includes quantity, unit, scale, values, raw fixed values, valid/fresh/error
-masks, error codes, and PGA. CAP-specific raw/corrected/display pF, offsets,
-baseline, and Delta data remain under capacitance-specific fields.
+The row-mode POST body is typed and always has eight entries:
 
-Session CSV/XLSX/MAT/H5 export records measurement mode and quantity rather than
-placing VOLT or RES values into pF-named fields. Legacy CAP session and replay
-files remain supported where their schema is unambiguous. Setup profiles default
-missing legacy `acquisition.measurementMode` to `CAP`; configured external rail
-fields are explicitly named `voltageRail.measuredAvddV` and
-`voltageRail.measuredAvssV` so they are not mistaken for live telemetry.
+```json
+{
+  "modes": ["RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES"]
+}
+```
+
+The backend encodes that request once as `ROWMODES=RVVCCVVR`. It never emits
+eight separate row commands. The snapshot exposes global and profile
+transactions separately, including applied/pending modes, state, error,
+request ID, generation, and boundary sequence.
+
+Setup profiles store `acquisition.rows` in the full `1..8` range and
+`acquisition.rowModes` as exactly eight modes. An older profile without
+`rowModes` is migrated by repeating its legacy `measurementMode` (or CAP) for
+all rows. Legacy `voltageRail` values remain readable for compatibility but
+are not sent by the normal setup or measurement workflow.
 
 ## Desktop behavior
 
-The single workspace retains the 8x8 heatmap, selection, trends, resizable
-splitters, Write / Command panel, Raw Log, and Status. Presentation changes by
-quantity:
+The Measurement Mode panel provides:
 
-- CAP shows pF or Delta C/C0 %, offsets, and baseline controls.
-- VOLT shows engineering voltage units and signed values.
-- RES shows engineering resistance units.
-- VOLT/RES tooltips show raw fixed values, physical values, PGA/bypass,
-  validity, freshness, error reason, frame sequence, generation, request ID,
-  source transport, and available rail/reference/retry diagnostics.
+- **Set all rows: CAP | VOLT | RES**, using the legacy `MODE` transaction;
+- eight S1-S8 row selectors with a draft profile and one **Apply row modes**
+  button;
+- distinct applied profile, pending profile, transaction state, and error;
+- a read-only **ADS analogue rail span** readout.
 
-Invalid and inactive cells are `null`, not zero. Invalid or stale values do not
-enter auto colour ranges, baseline calculations, statistics, or valid trend
-series. Colour domains reset when the quantity changes, and trend history is
-filtered by mode so pF, V, and ohm values never share an axis.
+All eight row selectors remain visible when `ROWS < 8`. Rows outside the active
+geometry are dimmed and labelled `Inactive with current ROWS setting`; their
+saved profile is retained for later use.
 
-`ADS,chip=unknown,valid=0` is shown as **ADS identity unconfirmed**, never as a
-guessed ADS1262. Battery telemetry is shown with validity, freshness, age,
-reason, restore, retry, unstable, timeout, spread, and run diagnostics where
-present; the host does not invent a battery state-of-charge percentage.
+The heatmap renders only S1 through S`frame.rows`, so `ROWS=1` is a 1x8 matrix
+without ghost rows. A mixed matrix remains one physical Nx8 heatmap, but CAP,
+VOLT, and RES are separate ECharts series with separate colour scales and
+units. Axis labels and tooltips include the row mode. CAP Delta C/C0 affects
+only CAP rows; VOLT and RES rows remain absolute.
+
+Backend colour ranges are authoritative and isolated as `cap_absolute`,
+`cap_delta`, `voltage`, and `resistance`. Only finite, valid, fresh, non-error
+cells in active rows participate. Frozen and last-good ranges are stored per
+domain. When usable data has no span, the deterministic fallback is:
+
+- positive CAP/RES: zero to at least `value * 1.05`;
+- VOLT and CAP delta: a zero-centred symmetric extent.
+
+This fixes the single-value midpoint-white bug without a `ROWS==1` colour
+special case.
+
+## Rail and battery telemetry
+
+Normal VOLT and row-profile requests no longer depend on `RAILCFG`. Firmware
+owns the internal rail monitor, and the UI displays only the measured
+`AVDD - AVSS` span, validity, freshness/age, source, reason, and timestamp.
+Unknown telemetry is shown as **Rail unavailable**. The legacy rail endpoint
+and parser remain available only for explicit debug/raw-command compatibility.
+
+Battery state is also backend-owned. `TelemetryStore` keeps the latest attempt
+and the last known good voltage separately. Firmware-provided last-good fields
+take priority; older firmware falls back to a valid measurement from the same
+host device session. An invalid later attempt changes the status/reason but
+does not erase the voltage. A device identity change clears the cache, while a
+temporary reconnect to the same device retains it as stale.
 
 ## Validation
 
-Run the complete software gates from the repository root:
+Run the software gates from the repository root:
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall src tests scripts
@@ -206,37 +230,20 @@ npm.cmd run build
 npm.cmd run test:e2e
 ```
 
-Formal GUI acceptance launches the locally built renderer in Electron; the
-Electron main process starts the repository `.venv` Python sidecar and the
-preload bridge supplies its dynamic loopback port. It does not use Chrome,
-Vite, or a LAN renderer. Replay still traverses Transport -> Registry -> Parser
--> Store -> WebSocket -> React, and screenshots are saved under
-`validation_artifacts/gui/`. Passing Vitest alone is not GUI acceptance.
+Electron Replay E2E must use the built local renderer, real Electron preload,
+Python sidecar, REST/WebSocket path, and retained screenshots. It must not be
+reported as BLE HIL.
 
-Real hardware GUI acceptance uses the same full local application:
-
-```powershell
-cd desktop
-npm.cmd run test:hardware
-```
-
-Hardware results are reported independently as Serial GUI, BLE GUI, and Wi-Fi
-GUI PASS/FAIL/BLOCKED. A transport is PASS only after real hardware ran through
-the GUI for the required scenarios. VOLT hardware validation is BLOCKED when a
-current paired external DMM rail measurement is unavailable; no nominal or
-monitor value may be fabricated. See [validation](docs/validation.md).
-
-### Current firmware transport limitation
-
-In the authoritative firmware implementation, accepted control responses reach
-the initiating transport, but frame-boundary applied events such as `MAPP`, rail
-and rows `RAPP`, `ADSCHK`/`ADSCHKSTAT`, and `BAPP` are currently printed on the
-Serial event path and are not published to BLE `FF30` or Wi-Fi LOG. Therefore a
-strict BLE-only or Wi-Fi-only host cannot prove a transaction applied. It must
-remain pending and eventually show a timeout; it must not infer success from a
-new data frame. BLE/Wi-Fi transaction HIL requires a Serial observation sidecar
-or a firmware change that broadcasts applied events. This is a firmware
-capability blocker, not a Replay PASS or host PASS.
+Real-hardware acceptance requires the full Electron application and the exact
+firmware artifact under test. Each CAP, VOLT, RES, and
+`RVVCCVVR` mixed run is 120 seconds. Switching stress includes at least ten
+cycles of the global CAP/RES/CAP and CAP/VOLT/CAP sequences plus the requested
+row-profile sequence. BLE acceptance must observe accepted responses on `FF11`
+and matching applied events on `FF30`; Serial is not an applied-event sidecar.
+The known homogeneous `ROWMODES` completion defect must be reported as a
+firmware BLOCKED/FAIL result rather than bypassed in Host code.
+See [validation](docs/validation.md) for the complete evidence checklist and
+required screenshots.
 
 ## Windows packaging
 
@@ -252,17 +259,7 @@ installer. The packaged application uses the PyInstaller backend sidecar under
 `process.resourcesPath\backend`; end users do not need Python, Node.js, npm, or
 the source tree.
 
-The retained packaged-app smoke launches that executable directly with
-Playwright Electron, rejects non-`file:` renderers, and verifies the packaged
-backend health and preload bridge:
-
 ```powershell
 cd desktop
 npm.cmd run test:packaged
-```
-
-The root `icon.png` remains the source for generated desktop icons:
-
-```powershell
-.\.venv\Scripts\python.exe scripts\generate_icons.py
 ```

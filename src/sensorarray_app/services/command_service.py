@@ -54,6 +54,14 @@ class CommandService:
         self.modeFrameSeq: int | None = None
         self.modeError = ""
         self.modePendingSince: float | None = None
+        self.appliedRowModes: tuple[str, ...] = ("CAP",) * 8
+        self.pendingRowModes: tuple[str, ...] | None = None
+        self.rowModeRequestId: int | None = None
+        self.rowModeGeneration: int | None = None
+        self.rowModeFrameSeq: int | None = None
+        self.rowModeTransitionState = "applied"
+        self.rowModeError = ""
+        self.rowModePendingSince: float | None = None
         self.deviceState = "CAPACITANCE"
         self.railConfigured = False
         self.railState = "unconfigured"
@@ -89,6 +97,14 @@ class CommandService:
         self.modeFrameSeq = None
         self.modeError = ""
         self.modePendingSince = None
+        self.appliedRowModes = ("CAP",) * 8
+        self.pendingRowModes = None
+        self.rowModeRequestId = None
+        self.rowModeGeneration = None
+        self.rowModeFrameSeq = None
+        self.rowModeTransitionState = "applied"
+        self.rowModeError = ""
+        self.rowModePendingSince = None
         self.deviceState = "CAPACITANCE"
         self.railConfigured = False
         self.railState = "unconfigured"
@@ -116,12 +132,39 @@ class CommandService:
 
     def request_mode(self, mode: str, sender: Callable[[str], None]) -> CommandRecord:
         normalized = _normalize_mode(mode)
+        if self.pendingMode is not None:
+            raise RuntimeError("a measurement mode transaction is already pending")
+        if self.pendingRowModes is not None:
+            raise RuntimeError("a row-mode profile transaction is already pending")
         record = self._new_record("mode", f"MODE={normalized}", normalized)
         self.pendingMode = normalized
         self.transitionState = "requested"
         self.modeRequestId = None
         self.modeError = ""
         self.modePendingSince = time.time()
+        self._send(record, sender)
+        return record
+
+    def request_row_modes(self, modes: Any, sender: Callable[[str], None]) -> CommandRecord:
+        """Request one atomic eight-row measurement profile transaction.
+
+        Draft editing belongs to the caller. This method emits exactly one
+        ``ROWMODES=`` command and does not change ``appliedRowModes`` until a
+        matching RMAPP is observed.
+        """
+
+        normalized = _normalize_row_modes(modes)
+        if self.pendingRowModes is not None:
+            raise RuntimeError("a row-mode profile transaction is already pending")
+        if self.pendingMode is not None:
+            raise RuntimeError("a measurement mode transaction is already pending")
+        encoded = "".join({"CAP": "C", "VOLT": "V", "RES": "R"}[mode] for mode in normalized)
+        record = self._new_record("row_modes", f"ROWMODES={encoded}", normalized)
+        self.pendingRowModes = normalized
+        self.rowModeRequestId = None
+        self.rowModeTransitionState = "requested"
+        self.rowModeError = ""
+        self.rowModePendingSince = time.time()
         self._send(record, sender)
         return record
 
@@ -197,6 +240,69 @@ class CommandService:
             return {"modeApplied": False, "railApplied": False, "ignoredOldSession": True}
         command_type = str(event.commandType).lower()
         phase = str(event.phase).lower()
+
+        # MACK/MAPP and RMACK/RMAPP are correlated transactions, not general
+        # state announcements.  In particular, ``None == None`` must never
+        # allow a malformed event without a firmware request ID to accept or
+        # commit a locally pending request.
+        if (
+            command_type in {"mode", "row_modes"}
+            and phase in {"accepted", "applied"}
+            and event.requestId is None
+        ):
+            return {
+                "modeApplied": False,
+                "rowModesApplied": False,
+                "railApplied": False,
+                "rejectedMissingRequestId": True,
+            }
+        if (
+            command_type in {"mode", "row_modes"}
+            and phase == "applied"
+            and (
+                event.generation is None
+                or event.frameSeq is None
+                or int(event.generation) < 0
+                or int(event.frameSeq) < 0
+            )
+        ):
+            return {
+                "modeApplied": False,
+                "rowModesApplied": False,
+                "railApplied": False,
+                "rejectedMissingBoundary": True,
+            }
+
+        # Validate the transaction identity and requested value before the
+        # generic CommandRecord is mutated.  Otherwise an RMAPP carrying the
+        # right ID but the wrong profile could make the audit record say
+        # APPLIED even though the strict row-profile state machine rejected it.
+        if command_type == "mode" and phase in {"accepted", "applied", "failed", "rejected", "error"}:
+            event_mode_value = event.appliedValue or event.requestedValue
+            if event_mode_value is not None:
+                try:
+                    event_mode = _normalize_mode(str(event_mode_value))
+                except ValueError:
+                    return _rejected_transaction_result("rejectedInvalidValue")
+                if self.pendingMode is not None and event_mode != self.pendingMode:
+                    return _rejected_transaction_result("rejectedMismatchedValue")
+            if self.modeRequestId is not None and self.pendingMode is not None and event.requestId != self.modeRequestId:
+                return _rejected_transaction_result("rejectedMismatchedRequestId")
+        if command_type == "row_modes" and phase in {"accepted", "applied", "failed", "rejected", "error"}:
+            event_profile_value = event.appliedValue or event.requestedValue
+            if event_profile_value is not None:
+                try:
+                    event_profile = _normalize_row_modes(event_profile_value)
+                except ValueError:
+                    return _rejected_transaction_result("rejectedInvalidValue")
+                if self.pendingRowModes is not None and event_profile != self.pendingRowModes:
+                    return _rejected_transaction_result("rejectedMismatchedValue")
+            if (
+                self.rowModeRequestId is not None
+                and self.pendingRowModes is not None
+                and event.requestId != self.rowModeRequestId
+            ):
+                return _rejected_transaction_result("rejectedMismatchedRequestId")
         record = self._match_record(command_type, event)
         now = time.time()
         if record is not None:
@@ -216,11 +322,13 @@ class CommandService:
                 record.state = "ERROR"
                 record.error = str(event.error or event.state or "firmware rejected command")
 
-        result: dict[str, Any] = {"modeApplied": False, "railApplied": False}
+        result: dict[str, Any] = {"modeApplied": False, "rowModesApplied": False, "railApplied": False}
         if command_type == "rows":
             self._handle_rows(event)
         elif command_type == "mode":
             result["modeApplied"] = self._handle_mode(event)
+        elif command_type == "row_modes":
+            result["rowModesApplied"] = self._handle_row_modes(event)
         elif command_type == "rail":
             result["railApplied"] = self._handle_rail(event)
         elif command_type == "ads_check":
@@ -244,6 +352,34 @@ class CommandService:
             self.modePendingSince = None
         return changed
 
+    def observe_row_modes_frame(
+        self,
+        modes: Any,
+        generation: int | None,
+        request_id: int | None,
+        seq: int,
+    ) -> bool:
+        """Synchronise a first-attach profile without bypassing RMAPP.
+
+        This is allowed only when no ROWMODES transaction is pending. A mixed
+        data frame can therefore establish initial attach state, but can never
+        complete a requested transaction or replace a mismatched RMAPP.
+        """
+
+        normalized = _normalize_row_modes(modes)
+        if self.pendingRowModes is not None:
+            return False
+        changed = normalized != self.appliedRowModes
+        if changed or self.rowModeGeneration is None:
+            self.appliedRowModes = normalized
+            self.rowModeGeneration = generation
+            self.rowModeRequestId = request_id
+            self.rowModeFrameSeq = int(seq)
+            self.rowModeTransitionState = "synced" if changed else "applied"
+            self.rowModeError = ""
+            self.rowModePendingSince = None
+        return changed
+
     def timeout_old(self, seconds: float = 5.0) -> None:
         now = time.time()
         for record in self._commands.values():
@@ -254,6 +390,9 @@ class CommandService:
             if record.commandType == "mode" and self.pendingMode == record.requestedValue:
                 self.transitionState = "timeout"
                 self.modeError = record.error
+            if record.commandType == "row_modes" and self.pendingRowModes == record.requestedValue:
+                self.rowModeTransitionState = "timeout"
+                self.rowModeError = "Timed out waiting for firmware apply (RMAPP)"
             if record.commandType == "rail" and self.railState in {"requested", "accepted"}:
                 self.railState = "timeout"
                 if self.desiredModeAfterRail:
@@ -268,6 +407,14 @@ class CommandService:
         ):
             self.transitionState = "timeout"
             self.modeError = "Timed out waiting for firmware apply (MAPP)"
+        if (
+            self.pendingRowModes is not None
+            and self.rowModePendingSince is not None
+            and self.rowModeTransitionState in {"requested", "accepted"}
+            and now - self.rowModePendingSince > seconds
+        ):
+            self.rowModeTransitionState = "timeout"
+            self.rowModeError = "Timed out waiting for firmware apply (RMAPP)"
 
     def measurement_snapshot(self) -> dict[str, Any]:
         self.timeout_old()
@@ -280,6 +427,15 @@ class CommandService:
             "frameSeq": self.modeFrameSeq,
             "error": self.modeError,
             "deviceState": self.deviceState,
+            "rowProfile": {
+                "appliedModes": list(self.appliedRowModes),
+                "pendingModes": list(self.pendingRowModes) if self.pendingRowModes is not None else None,
+                "transitionState": self.rowModeTransitionState,
+                "requestId": self.rowModeRequestId,
+                "generation": self.rowModeGeneration,
+                "frameSeq": self.rowModeFrameSeq,
+                "error": self.rowModeError,
+            },
             "rail": {
                 "configured": self.railConfigured,
                 "state": self.railState,
@@ -318,6 +474,11 @@ class CommandService:
                 self.modeError = str(exc)
                 self.pendingMode = None
                 self.modePendingSince = None
+            if record.commandType == "row_modes":
+                self.rowModeTransitionState = "error"
+                self.rowModeError = str(exc)
+                self.pendingRowModes = None
+                self.rowModePendingSince = None
             if record.commandType == "rail":
                 self.railState = "error"
                 if self.desiredModeAfterRail:
@@ -344,6 +505,8 @@ class CommandService:
                 return None
         for record in reversed(list(self._commands.values())):
             if record.commandType != command_type or record.state not in {"REQUESTED", "ACCEPTED"}:
+                continue
+            if event.requestId is not None and record.firmwareId is not None and record.firmwareId != event.requestId:
                 continue
             if event.requestedValue is None or _values_match(record.requestedValue, event.requestedValue):
                 return record
@@ -398,9 +561,31 @@ class CommandService:
             self.modeError = ""
             self.modePendingSince = None
             self.deviceState = {"CAP": "CAPACITANCE", "VOLT": "VOLTAGE", "RES": "RESISTANCE"}[applied]
+            # Legacy MODE is the firmware's backwards-compatible "set all
+            # rows" action, so its authoritative MAPP also commits the row
+            # profile. Cross-kind requests are rejected at send time, but a
+            # remote controller may still create an overlapping transaction;
+            # never let its MAPP steal the identity of a pending ROWMODES.
+            self.appliedRowModes = (applied,) * 8
+            if self.pendingRowModes is None:
+                self.rowModeRequestId = event.requestId
+                # Firmware 331c445 completes its independent RowModeProfile
+                # state after MODE succeeds, but MAPP.gen belongs only to the
+                # MeasurementMode context.  The two counters can already have
+                # diverged after prior RMAPP transactions, so never forge a
+                # row-profile generation from MAPP.
+                self.rowModeGeneration = None
+                self.rowModeFrameSeq = event.frameSeq
+                self.rowModeTransitionState = "applied"
+                self.rowModeError = ""
+                self.rowModePendingSince = None
             return True
         if event.phase in {"error", "failed", "rejected"}:
-            if self.modeRequestId is None or event.requestId in {None, self.modeRequestId}:
+            if self.modeRequestId is None:
+                matches_error = event.requestId is None
+            else:
+                matches_error = event.requestId == self.modeRequestId
+            if matches_error:
                 self.transitionState = "error"
                 self.pendingMode = None
                 self.modePendingSince = None
@@ -411,6 +596,49 @@ class CommandService:
                     self.modeError = f"Firmware entered {device_state}: {detail}"
                 else:
                     self.modeError = detail
+            return False
+        return False
+
+    def _handle_row_modes(self, event: CommandTransactionEvent) -> bool:
+        phase = str(event.phase).lower()
+        if phase == "accepted":
+            requested = _normalize_row_modes(event.requestedValue)
+            if self.pendingRowModes is not None and requested != self.pendingRowModes:
+                return False
+            if self.rowModeRequestId is not None and self.pendingRowModes is not None and event.requestId != self.rowModeRequestId:
+                return False
+            if self.pendingRowModes is None and self.rowModeRequestId is not None:
+                old_modes = _normalize_row_modes(event.oldValue) if event.oldValue is not None else None
+                if event.requestId == self.rowModeRequestId or old_modes != self.appliedRowModes:
+                    return False
+            self.pendingRowModes = requested
+            self.rowModeRequestId = event.requestId
+            self.rowModeTransitionState = "accepted"
+            self.rowModeError = ""
+            self.rowModePendingSince = time.time()
+            return False
+        if phase == "applied":
+            applied = _normalize_row_modes(event.appliedValue or event.requestedValue)
+            if self.pendingRowModes != applied or self.rowModeRequestId != event.requestId:
+                return False
+            self.appliedRowModes = applied
+            self.pendingRowModes = None
+            self.rowModeTransitionState = "applied"
+            self.rowModeGeneration = event.generation
+            self.rowModeFrameSeq = event.frameSeq
+            self.rowModeError = ""
+            self.rowModePendingSince = None
+            return True
+        if phase in {"error", "failed", "rejected"}:
+            if self.rowModeRequestId is None:
+                matches_error = event.requestId is None
+            else:
+                matches_error = event.requestId == self.rowModeRequestId
+            if matches_error:
+                self.rowModeTransitionState = "error"
+                self.pendingRowModes = None
+                self.rowModePendingSince = None
+                self.rowModeError = str(event.error or event.state or "row mode transition failed")
             return False
         return False
 
@@ -484,6 +712,22 @@ def _normalize_mode(mode: str) -> str:
     return normalized
 
 
+def _normalize_row_modes(modes: Any) -> tuple[str, ...]:
+    if isinstance(modes, str):
+        compact = modes.strip().upper()
+        if len(compact) == 8 and set(compact) <= {"C", "V", "R"}:
+            modes = tuple({"C": "CAP", "V": "VOLT", "R": "RES"}[item] for item in compact)
+        else:
+            raise ValueError("row modes must contain exactly 8 CAP, VOLT, or RES entries")
+    try:
+        normalized = tuple(_normalize_mode(str(mode)) for mode in modes)
+    except TypeError as exc:
+        raise ValueError("row modes must contain exactly 8 CAP, VOLT, or RES entries") from exc
+    if len(normalized) != 8:
+        raise ValueError("row modes must contain exactly 8 CAP, VOLT, or RES entries")
+    return normalized
+
+
 def _values_match(left: Any, right: Any) -> bool:
     if isinstance(left, str) and isinstance(right, str):
         return left.upper() == right.upper()
@@ -500,3 +744,12 @@ def _record_payload(record: CommandRecord) -> dict[str, Any]:
     payload = asdict(record)
     payload["requestedRows"] = record.requestedRows
     return payload
+
+
+def _rejected_transaction_result(reason: str) -> dict[str, Any]:
+    return {
+        "modeApplied": False,
+        "rowModesApplied": False,
+        "railApplied": False,
+        reason: True,
+    }

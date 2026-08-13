@@ -26,7 +26,7 @@ export function StatusBar({ snapshot, socketState }: Props): JSX.Element {
         <span className="statusItem">{connection?.deviceLabel || "No device"}</span>
         <span className="statusItem">
           <Activity size={16} /> Measurement: {appliedMode}
-          {pendingMode ? ` → ${pendingMode} (${snapshot?.measurement.transitionState ?? "requested"})` : ""}
+          {pendingMode ? ` \u2192 ${pendingMode} (${snapshot?.measurement.transitionState ?? "requested"})` : ""}
         </span>
         <span className="statusItem">seq {frame?.seq ?? "-"}</span>
         {rateItems(snapshot).map((item) => (
@@ -35,7 +35,7 @@ export function StatusBar({ snapshot, socketState }: Props): JSX.Element {
           </span>
         ))}
         {!snapshot?.rates && typeof frame?.fps === "number" ? <span className="statusItem">Host frames {frame.fps.toFixed(1)} fps</span> : null}
-        {battery ? <span className="statusItem">{battery}</span> : null}
+        <span className="statusItem">{battery}</span>
         {adsUnconfirmed ? <span className="statusWarning">ADS identity unconfirmed</span> : null}
         <span className={`socketState ${socketState}`}>{socketState}</span>
       </div>
@@ -80,17 +80,42 @@ function isAdsIdentityUnconfirmed(snapshot: BackendSnapshotPayload | null): bool
   return (valid === false || valid === 0 || valid === "0") && (!chip || chip === "unknown");
 }
 
-function batteryStatus(snapshot: BackendSnapshotPayload | null): string {
+export function batteryStatus(snapshot: BackendSnapshotPayload | null): string {
   const battery = snapshot?.battery;
-  if (
-    !battery ||
-    battery.available === false ||
-    (String(battery.state ?? "").toLowerCase() === "unknown" && battery.batteryMv == null) ||
-    (!battery.batteryText && battery.batteryMv === undefined)
-  ) {
-    return "";
+  if (!battery) {
+    return "Battery \u2014";
   }
-  const voltage = battery.batteryText || (typeof battery.batteryMv === "number" ? `${(battery.batteryMv / 1000).toFixed(3)} V` : "N/A");
-  const state = battery.valid === false ? `invalid${battery.reason ? `: ${battery.reason}` : ""}` : battery.fresh === false ? "stale" : "fresh";
-  return `Battery ${voltage} (${state})`;
+  const latest = battery.latestAttempt;
+  const lastGood = battery.lastGood;
+  const latestMv = finiteNumber(latest?.batteryMv);
+  const goodMv = finiteNumber(lastGood?.batteryMv) ?? (battery.valid !== false ? finiteNumber(battery.batteryMv) : null);
+  const displayedMv = latest?.valid !== false && latestMv !== null ? latestMv : goodMv ?? finiteNumber(battery.batteryMv);
+  const displayedText = latest?.valid !== false && latest?.batteryText
+    ? latest.batteryText
+    : lastGood?.batteryText || battery.batteryText || (displayedMv !== null ? `${(displayedMv / 1000).toFixed(3)} V` : "");
+  if (!displayedText || displayedText.toUpperCase() === "N/A") {
+    return "Battery \u2014";
+  }
+  // The top-level battery state is computed at snapshot time, so it carries
+  // connection/session staleness that the retained latest attempt cannot
+  // know about.  latestAttempt remains useful for a failed-attempt reason and
+  // numeric fallback, but must never relabel a connection-stale value fresh.
+  const valid = battery.valid ?? latest?.valid;
+  const fresh = battery.fresh
+    ?? (battery.state === "fresh" ? true : battery.state ? false : latest?.fresh);
+  const snapshotReason = String(battery.reason ?? "").trim();
+  const reason = snapshotReason && snapshotReason !== "ok"
+    ? snapshotReason
+    : String(latest?.reason ?? snapshotReason).trim();
+  if (valid === false) {
+    return `Battery ${displayedText} (last known \u00B7 ${reason || "measurement failed"})`;
+  }
+  if (fresh === false) {
+    return `Battery ${displayedText} (last known \u00B7 ${reason || "stale"})`;
+  }
+  return `Battery ${displayedText} (fresh)`;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }

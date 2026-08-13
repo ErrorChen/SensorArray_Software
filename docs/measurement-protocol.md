@@ -1,56 +1,99 @@
 # Host measurement protocol compatibility notes
 
-This document records how SensorArray Desktop Host consumes the current
-firmware protocol. It is an implementation/compatibility guide, not an
-independent wire-protocol specification. The SensorArray firmware repository is
-authoritative; in particular, its production formatter and command
-implementation plus golden/reference tests outrank prose documentation.
+This document describes how SensorArray Desktop Host consumes the measurement
+and command protocol. It is a host compatibility contract, not an independent
+firmware specification. Production firmware formatter/command code and golden
+tests remain authoritative for real wire bytes.
 
-The host keeps legacy import and parser plugins where required, but the modern
-firmware ASCII measurement path is the `C|V|R` frame family described here.
-Modern `V` and `R` frames must not be routed through legacy binary voltage or
-MAT parsers.
+## Contract status
 
-## Stream and routing
+The host baseline for this change is
+`b86bdcf9d5f7d8cd7ca8bbfa8d2fe9bdad976c4f`. The firmware baseline is
+`331c44589318db9ba642cf3ab33bb08ca3dd8a34`.
 
-All live and replay transports carry the same logical channels:
+That firmware revision provides the established homogeneous CAP/VOLT/RES
+families, `MODE`, `ROWMODES`, heterogeneous `M/MR/K`, FF30 lifecycle events,
+internal rail telemetry, and battery last-good fields. The production C
+formatter in `main/output/sensorarrayTextProtocol.c` is the byte-level
+authority. In particular, it emits short mixed identity keys, single-letter
+row modes, and comma-separated row data; copied firmware prose and its Python
+tool currently contain stale long-mode examples and do not override the C
+formatter.
+
+There is one known source-level incompatibility in `331c445`: homogeneous
+`ROWMODES` requests enter the legacy frame path, but row-profile completion and
+`RMAPP`/`RMERR` are implemented only in the mixed branch. The Host preserves
+strict transaction semantics and times out rather than treating a data frame
+as application. This is a firmware blocker for homogeneous row-profile and
+switching-stress acceptance, not a reason to weaken correlation.
+
+The firmware schema is consumed once by
+`sensorarray_app.protocol.mixed_ascii.MixedMeasurementAsciiParser`. Replay
+contains exact compatibility copies; React does not parse or redefine it.
+
+## Streams, routing, and BLE
+
+All transports expose the same logical channels:
 
 ```text
 DATA -> measurement packets
-LOG  -> telemetry and asynchronous events
-CTRL -> command request/response
+LOG  -> telemetry and asynchronous applied events
+CTRL -> command requests and immediate/accepted responses
 ```
 
-Routing is by payload content. A complete `C`, `V`, or `R` packet received on a
-LOG characteristic still enters the measurement assembler. BLE reassembly and
-its envelope length/CRC checks happen before protocol routing.
+Routing is by payload content. A complete measurement packet received on a LOG
+channel still enters the appropriate frame assembler. BLE envelope length/CRC
+checks and `BleFragmentReassembler` run before content routing.
 
-The protocol is line-oriented ASCII. Production frames use LF (`\n`). A
-measurement packet starts with one header, contains all required chunks in
-contiguous index order, and ends at its `K` trailer. The assembler derives the
-required chunk count from `cells`, rejects the entire malformed frame without
-updating state, and must resynchronize on the next header.
+The BLE service and characteristics remain:
 
-Firmware accepts `rows=1..8`; `cells` and `n` must both equal `rows * 8`.
-Compatibility and GUI acceptance explicitly exercise rows 1, 2, 4, and 8.
-Each `D` or `P` chunk represents at most 16 cells, so the required chunk count
-is `ceil(cells / 16)`. The final chunk may be short.
+| Item | UUID suffix | Role |
+| --- | --- | --- |
+| service | `00FF` | SensorArray service |
+| CTRL RX | `FF10` | host command writes |
+| CTRL TX | `FF11` | command response notify |
+| DATA | `FF20` | measurement notify |
+| LOG | `FF30` | log/asynchronous event notify |
 
-The assembler rejects at least:
+`BleTransport` uses one BLE client and one subscription for each required
+characteristic. The strict target transaction pipeline is:
 
-- missing, duplicate, out-of-order, or extra `D` chunks;
-- missing, duplicate, out-of-order, or extra `P` chunks in VOLT/RES;
-- wrong value count or a non-contiguous chunk index;
-- header/trailer `seq`, `gen`, or `rid` disagreement;
-- malformed fixed values, malformed `Xhh`, or malformed packed PGA data;
-- CRC mismatch.
+```text
+FF11 fragmented or single MACK/RMACK
+FF30 fragmented MAPP/RMAPP
+ -> BleTransport
+ -> BleFragmentReassembler
+ -> ProtocolRegistry
+ -> TextLogProtocol
+ -> CommandTransactionEvent
+ -> CommandService
+```
 
-No values from a rejected frame are committed. The diagnostic is preserved for
-Status/Raw Log, and a following correct frame can still be parsed.
+The frontend never parses raw `MAPP`/`RMAPP`, and the host does not add a second
+BLE client or duplicate `FF30` subscription. A data frame on `FF20` is not a
+substitute for an applied event on `FF30`.
 
-## CAP frame
+## Common line and CRC rules
 
-Production CAP output has this structure:
+The protocol is ASCII and line oriented. Production frames use LF (`\n`). A
+frame begins with one header and ends at its `K` trailer. The complete frame is
+emitted to domain/store state only after all required records and identities
+are present and its CRC is correct.
+
+CRC uses the firmware reflected CRC-32. Its input is the exact encoded bytes of
+the header and all body lines, including each LF and excluding the `K` line.
+CRLF input is normalized to LF by the mixed host assembler before CRC. A bad
+frame updates parser diagnostics but never MatrixStore; the next valid header
+can recover.
+
+`ROWS=n` accepts every integer `n` from 1 through 8. `cells` must equal
+`rows * 8`; legacy homogeneous headers also carry `n=cells`, while canonical
+mixed headers do not. Inactive high mask bits are ignored and inactive cells
+remain null.
+
+## Homogeneous CAP frame
+
+CAP output retains its established form:
 
 ```text
 C,seq=...,ts=...,rows=...,cells=...,gen=...,rid=...,rf=...,pf=...,sf=...,bad=.../.../...,fmt=pf6,n=...
@@ -60,165 +103,46 @@ D1,...
 K,seq=...,gen=...,rid=...,crc=<8 hexadecimal digits>
 ```
 
-The `D` values are pF scaled by 1,000,000. The current invalid sentinel is
-`-1000000`; it is detected before conversion and never treated as a real
--1 pF value. Existing circuit correction, per-cell user offset, baseline, and
-Delta C/C0 % remain CAP-specific host operations.
+`D` values are pF scaled by 1,000,000. The CAP invalid sentinel is detected
+before conversion and is never treated as a physical negative pF value.
+Circuit correction, user offset, baseline, and Delta C/C0 remain CAP-only host
+operations. `rf`, `pf`, and `sf` retain row/primary/secondary freshness.
 
-`rf`, `pf`, and `sf` are row/primary/secondary freshness masks. `bad` contains
-the frame stale, mixed-epoch, and invalid-count diagnostics. These fields remain
-part of the CAP compatibility contract.
+The `gen/rid` in a legacy C frame belong to the ROWS/configuration snapshot,
+not the global mode transaction. After matching `MAPP` applies CAP, the host
+uses its boundary `seq` plus the C frame type to reject pre-boundary data.
 
-### CAP generation caveat
+## Homogeneous VOLT and RES frames
 
-The `gen` and `rid` fields in a `C` header/trailer are the ROWS/configuration
-snapshot generation/request ID. They are not measurement-mode generation and
-request ID. After a matching `MAPP` applies CAP, the authoritative mode boundary
-is `MAPP.seq` plus the `C` frame tag. The host rejects older pre-boundary CAP
-frames but does not compare `C.gen/rid` to the mode transaction.
-
-This is deliberately different from modern VOLT/RES frames, whose `gen/rid`
-are measurement-mode state.
-
-## VOLT and RES frames
-
-Production VOLT/RES output has this structure:
+VOLT and RES retain this form:
 
 ```text
-V|R,seq=...,ts=...,rows=...,cells=...,gen=...,rid=...,mode=...,unit=...,scale=...,valid=...,fresh=...,error=...,ref=...,rail=...,age=...,avdd=...,avss=...,vexc=...,rref=...,dur=...,tr=...,gc=...,ov=...,aa=...,fb=...,ir=...,to=...,st=...,spi=...,fmt=...,n=...,bad=...
+V|R,seq=...,ts=...,rows=...,cells=...,gen=...,rid=...,mode=...,unit=...,scale=...,valid=...,fresh=...,error=...,ref=...,rail=...,age=...,...,fmt=...,n=...,bad=...
 D0,<signed integer or Xhh>,...
 ...
-P0,<two packed hex digits per cell>
+P0,<two packed hexadecimal digits per cell>
 ...
 K,seq=...,gen=...,rid=...,crc=<8 hexadecimal digits>
 ```
 
-The host retains all header fields, including fields not needed for immediate
-value conversion:
-
-| Field | Meaning |
-| --- | --- |
-| `seq`, `ts` | frame sequence and firmware timestamp in microseconds |
-| `rows`, `cells`, `n` | active geometry and declared value count |
-| `gen`, `rid` | applied measurement-mode generation and request ID |
-| `mode`, `unit`, `scale`, `fmt` | explicit quantity contract |
-| `valid`, `fresh`, `error` | independent 64-bit cell masks |
-| `ref` | ADS reference source |
-| `rail`, `age`, `avdd`, `avss` | rail validity, age in frames, and uV snapshot |
-| `vexc`, `rref` | matrix reference/excitation uV and reference resistor ohms |
-| `dur`, `tr` | frame and transition duration in us |
-| `gc`, `ov` | gain-change and overrange counts |
-| `aa`, `fb` | autorange attempts and fallback count |
-| `ir` | bounded I/O retries that recovered this frame |
-| `to`, `st`, `spi` | timeout, stale, and SPI diagnostic counts |
-| `bad` | invalid-cell count |
-
-`ir` is a recovered retry diagnostic; it is not an invalid flag.
-
-### Quantity and scale
-
-The quantity is selected only from the header contract, never from numeric
-magnitude:
-
-| Frame | Header contract | Raw `D` integer | Physical host value |
+| Frame | Required header contract | Raw `D` value | Host physical value |
 | --- | --- | --- | --- |
-| VOLT | `V`, `mode=VOLT`, `unit=V`, `scale=-6`, `fmt=uv-x` | microvolts | `raw * 10^-6 V` |
-| RES | `R`, `mode=RES`, `unit=ohm`, `scale=-3`, `fmt=mohm-x` | milliohms | `raw * 10^-3 ohm` |
+| VOLT | `V,mode=VOLT,unit=V,scale=-6` | signed uV | `raw * 10^-6 V` |
+| RES | `R,mode=RES,unit=ohm,scale=-3` | mOhm | `raw * 10^-3 ohm` |
 
-Signed decimal input is valid. For example, VOLT raw `-1250` is -0.00125 V,
-not an error marker. The UI may select engineering prefixes such as uV, mV,
-V, mOhm, ohm, kOhm, or MOhm without changing the stored quantity.
+`valid`, `fresh`, and `error` are independent masks. Only finite cells that are
+valid, fresh, and not in error can enter live colour, baseline, statistics, or
+trend calculations. `Xhh` is an invalid cell with firmware error code `0xHH`;
+the token, code, and reason are retained. Unknown codes remain unknown rather
+than becoming zero.
 
-### Valid, fresh, and error semantics
+Each `P<n>` body is packed, not comma separated. Each cell has two hexadecimal
+digits: `01/02/04/08/10/20` for PGA x1/x2/x4/x8/x16/x32 and `00` for verified
+bypass. VOLT/RES CRC scope includes all `P` records.
 
-`valid`, `fresh`, and `error` are separate bit masks and are parsed independently
-from the textual `D` token. A cell can be invalid yet fresh, or valid but stale.
-The host preserves the exact combination for every active cell.
+## Global measurement-mode transaction
 
-- Valid and fresh finite values participate in live display and trends.
-- Invalid values are `null` in the heatmap and never become zero.
-- Stale values remain diagnosable but do not enter the valid live series,
-  baseline/statistics, or automatic colour range.
-- Inactive cells outside `rows * 8` are `null`; high unused mask bits are ignored.
-- Error code/reason is exported and shown in tooltips/status.
-
-### `Xhh` cell errors
-
-When a VOLT/RES cell is not valid, its `D` token is `Xhh`, where `hh` is an
-unsigned hexadecimal firmware error code. The host preserves the numeric code,
-the raw token, and a human-readable reason:
-
-| Code | Firmware name | Host meaning |
-| --- | --- | --- |
-| `00` | `ok` | no reported cell error |
-| `01` | `route` | route/configuration failure |
-| `02` | `spi` | SPI failure |
-| `03` | `timeout` | DRDY timeout |
-| `04` | `stale` | stale conversion |
-| `05` | `ref_alarm` | reference alarm |
-| `06` | `pga_abs` | PGA absolute-input alarm |
-| `07` | `pga_diff` | PGA differential-input alarm |
-| `08` | `saturated` | saturated measurement |
-| `09` | `common_mode` | common-mode violation |
-| `0A` | `rail` | rail invalid |
-| `0B` | `reference` | reference invalid |
-| `0C` | `denominator` | denominator too close to zero |
-| `0D` | `open` | open circuit |
-| `0E` | `short` | short circuit |
-| `0F` | `negative` | invalid negative resistance/result |
-| `10` | `range` | out of supported range |
-| `11` | `overflow` | conversion overflow |
-| `12` | `unstable` | unstable sample set |
-| `13` | `autorange` | autorange failure |
-| `14` | `unsupported` | unsupported measurement/path |
-| `15` | `readback` | route/register readback mismatch |
-
-Any other two-digit code is retained and displayed as
-`Unknown firmware cell error 0xHH`. An unknown code must not crash parsing or
-default to zero.
-
-### Packed PGA chunks
-
-PGA data is not comma-separated. Each `P<n>,` line contains exactly two
-hexadecimal digits per cell, packed continuously, for example:
-
-```text
-P0,01020408102000010204081020000102
-```
-
-The chunk covers the same cell range as `D<n>`. Literal values are:
-
-| Wire | Presentation |
-| --- | --- |
-| `01` | PGA x1 |
-| `02` | PGA x2 |
-| `04` | PGA x4 |
-| `08` | PGA x8 |
-| `10` | PGA x16 |
-| `20` | PGA x32 |
-| `00` | verified PGA bypass |
-
-`00` is not missing data and must not be rendered as x0 or unknown.
-
-## CRC-32
-
-The firmware computes the reflected CRC-32 implemented by its production
-formatter. The CRC input is the exact encoded bytes of every line before `K`,
-including the LF after each line and excluding the `K` line itself:
-
-```text
-CAP:  C header + all D lines
-V/R:  V or R header + all D lines + all P lines
-```
-
-The host must not reuse a CAP-only accumulator that omits `P`. `K.seq/gen/rid`
-must match the header in addition to the CRC. A mismatch rejects the complete
-frame, leaves MatrixStore unchanged, records a parser diagnostic, and resets
-the assembler so the next header can recover.
-
-## Measurement-mode transaction
-
-Commands are asynchronous frame-boundary transactions:
+The legacy command remains the quick action for setting all eight rows:
 
 ```text
 MODE=CAP|VOLT|RES
@@ -228,163 +152,199 @@ MAPP,id=<requestId>,gen=<generation>,old=<mode>,new=<mode>,seq=<frameSeq>,state=
 
 The host state machine is strict:
 
-1. Send one mode request.
-2. Correlate `MACK` by request ID and requested mode. `MACK` means queued only.
-3. Keep `appliedMode` unchanged and expose `pendingMode`/waiting state.
-4. Commit only on matching `MAPP.id`; retain `gen`, `rid`, and boundary `seq`.
-5. Reject older frames after the boundary. For VOLT/RES, also require frame
-   tag/mode and mode `gen/rid`; for CAP use the boundary rule above.
-6. On timeout, `ERR`, or `MERR`, retain the last historical confirmation but
-   expose the transition error and actual device SAFE/DEGRADED state. Never
-   claim that the old quantity is still active solely because it was last seen.
+1. Send one `MODE` request.
+2. Match `MACK` by request ID and requested mode; expose accepted/pending state.
+3. Keep `appliedMode` and the applied all-row profile unchanged.
+4. Commit only a matching `MAPP`; retain its generation, request ID, and frame
+   boundary sequence.
+5. Reject old/mismatched frames after that boundary.
+6. On timeout, `ERR`, or `MERR`, expose the error without fabricating applied
+   state.
 
-A same-mode request can still create a new generation and must follow the same
-transaction. A queued command may also be superseded or dropped in the bounded
-firmware mailbox, which is why an explicit host timeout is required.
+`CommandService.observe_mode_frame()` returns false while a mode transaction is
+pending. Seeing a RES/VOLT/CAP frame cannot complete the transaction. A
+same-mode request can still create a new generation and follows the same rules.
 
-If transition application fails, current firmware emits `MERR` and moves its
-active mode to `NONE` with a SAFE state. This production behavior takes
-precedence over any older prose implying the old mode remains active.
+## Atomic row-mode profile transaction
 
-## External rail transaction for VOLT
-
-VOLT requires an externally measured rail split. Measurements must be taken
-with a DMM against GND under the current supply, wiring, and load:
+The profile always contains eight characters, independently of active `ROWS`:
 
 ```text
-RAILCFG=<AVDD_uV>,<negative_AVSS_uV>
-RACK,id=...,avdd=...,avss=...,source=external,state=accepted
-RAPP,id=...,gen=...,seq=...,avdd=...,avss=...,source=external,state=applied
+ROWMODES?
+ROWMODES=RVVCCVVR
+RMACK,id=62,old=CCCCCCCC,new=RVVCCVVR,state=accepted
+RMAPP,id=62,gen=11,seq=201,profile=RVVCCVVR,state=applied
+RMERR,id=63,gen=12,seq=202,profile=CRVCRVCR,err=0x108,state=rejected,route=SAFE
 ```
 
-Firmware validation requires AVDD to be positive, AVSS negative, and total
-span to be within the supported 3,500,000 to 6,000,000 uV range. `RAILCFG` is
-rejected in VOLT with `ERR,cmd=RAILCFG,reason=apply_before_volt`.
+Characters map as `C -> CAP`, `V -> VOLT`, and `R -> RES`. The frontend edits
+an eight-entry draft but **Apply row modes** sends exactly one command. There
+are no per-row command loops.
 
-The host workflow is therefore:
+Row-profile state is independent of the global mode state:
 
 ```text
-CAP or RES
- -> obtain paired current external DMM readings
- -> RAILCFG in integer uV
- -> matching RACK (accepted)
- -> matching rail RAPP (applied)
- -> MODE=VOLT
- -> matching MACK
- -> matching MAPP
- -> first matching CRC-valid VOLT frame
+appliedRowModes
+pendingRowModes
+rowModeRequestId
+rowModeGeneration
+rowModeFrameSeq
+rowModeTransitionState
+rowModeError
 ```
 
-The host never invents defaults. Nominal supply values, battery voltage, and
-the ADS supply-monitor rail are not substitutes for external DMM measurements.
-RES does not require `RAILCFG`.
+`RMACK` establishes accepted/pending state only. Matching requires the same
+request ID and profile. Only matching `RMAPP` commits the profile and boundary.
+A wrong-ID/profile `RMAPP` is rejected. `RMERR` or timeout leaves the last
+applied profile intact; a UI draft may remain for retry.
 
-`RAPP` is overloaded by firmware. A rail transaction is identified by
-`source=external,avdd,avss,state=applied`; a ROWS transaction carries
-`old,new,status=applied`. Correlation uses event type plus request ID, not tag
-alone.
+A complete mixed frame can synchronize the profile on first attachment only
+when no row-profile request is pending. It cannot complete a pending request or
+override a mismatched `RMAPP`.
 
-## ROWS transaction
+For firmware `331c445`, heterogeneous profiles have the complete path above.
+A homogeneous profile receives `RMACK`, but the firmware source does not emit a
+matching terminal row-profile event or clear the profile transition. The Host
+must retain its prior applied state and report timeout. Use the legacy
+`MODE=CAP|VOLT|RES` transaction for the supported set-all quick action until
+the firmware completion defect is corrected.
 
-`ROWS=n` supports `n=1..8`. `RCMD` acknowledges acceptance; only matching
-`RAPP` confirms application at its frame boundary. Matrix geometry is then
-verified against complete frames. Mode and ROWS transactions use different
-generation semantics even though both produce frames with `gen/rid` fields.
+## Canonical firmware mixed M/MR/K frame
 
-## ADS identity and diagnostics
+Firmware `331c445` chooses this family from the complete saved eight-row
+profile. Therefore `ROWS=4` plus `CCCCRVVR` still emits `M/MR/K`, even though
+the active prefix is all CAP. Only a fully homogeneous saved profile emits the
+corresponding legacy C/D/K or V|R/D/P/K family.
 
-`ADS?` returns the actual identity/validity state. In particular:
+The exact C source formatter schema is:
 
 ```text
-ADS,chip=unknown,valid=0,...
+M,seq=201,ts=201000,rows=5,cells=40,rgen=4,rrid=31,pgen=11,prid=62,profile=RVVCCVVR,fmt=mix1
+MR,s=1,m=R,unit=ohm,scale=-3,valid=FF,fresh=FF,error=00,fmt=mohm-x,D=10025000,...,...
+MR,s=2,m=V,unit=V,scale=-6,valid=FF,fresh=FF,error=00,fmt=uv-x,D=-1250,...,...
+MR,s=3,m=V,unit=V,scale=-6,valid=FF,fresh=FF,error=00,fmt=uv-x,D=...,...
+MR,s=4,m=C,unit=pF,scale=-6,valid=FF,fresh=FF,error=00,fmt=pf6,D=6315000,...,...
+MR,s=5,m=C,unit=pF,scale=-6,valid=FF,fresh=FF,error=00,fmt=pf6,D=...,...
+K,seq=201,rgen=4,rrid=31,pgen=11,prid=62,crc=<8 hexadecimal digits>
 ```
 
-means **ADS identity unconfirmed**. The host must not replace it with ADS1262
-based on expected board population.
+Header identities have distinct meanings:
 
-`ADSCHK[=<samples>]` produces an accepted command response followed by
-asynchronous `ADSCHK` and `ADSCHKSTAT` records. The host correlates all of them
-by request ID and exposes checking/completed/failed state plus the firmware
-fields for sample count, fresh count, timing/period, SPI/DRDY/errors, changed
-samples, and restore result. Restore failure can also produce `MFAULT` and is
-not swallowed as a generic log line.
+- `rgen/rrid` identify the active ROWS/configuration state;
+- `pgen/prid` identify the applied row-mode profile;
+- `profile` always contains all eight saved row modes, even when `rows < 8`.
 
-Unknown log tags remain visible as `Unknown firmware log (TAG)` and never stop
-the parser.
+Each one-based `MR.s` identifies a physical S row and `D=` contains exactly
+eight comma-separated signed decimal or `Xhh` tokens. Its single-letter `m`
+must match `profile[s-1]`; its unit, scale, and format must be:
 
-## Battery telemetry
+| `m` | Host mode | Unit | Scale | `fmt` |
+| --- | --- | --- | --- | --- |
+| `C` | CAP | `pF` | `-6` | `pf6` |
+| `V` | VOLT | `V` | `-6` | `uv-x` |
+| `R` | RES | `ohm` | `-3` | `mohm-x` |
 
-The current battery command/log family includes:
+Canonical `331c445` mixed rows do not carry PGA, reference, rail, or age
+fields. They remain optional in the typed row model for legacy Replay and
+future additive metadata, but the Host never infers or fabricates them when
+the canonical frame omits them.
 
-- `BAT?` -> current `ABAT` cache snapshot.
-- `BATNOW` -> accepted `ACK`, then asynchronous `BAPP`; query `BAT?` for the
-  resulting full snapshot rather than assuming `ACK` or `BAPP` contains it.
-- `BATD` -> accepted diagnostic transaction and `BATD`/`BAPP` outcome.
-- `BATPERIOD?` and `BATPERIOD=...` -> scheduler state/configuration.
-- `ABAT` -> current battery snapshot.
-- `AB50` -> periodic battery scheduler/result summary.
+The parser accepts a frame only after all of these checks pass:
 
-The host retains voltage, `valid`, `fresh`, `ageMs`, reason, restore state,
-rail validity, run counters, retry, unstable, timeout, `spreadRaw`,
-`spreadMaxRaw`, `validRun`, and `invalidRun` where present. Invalid battery
-voltage is not converted into a real zero value. No state-of-charge percentage
-is inferred without a chemistry/SOC model.
+- one M header, then exactly one MR for every physical row S1 through
+  S`rows`, in ascending order, then one K trailer;
+- no duplicate, missing, inactive, or reordered rows;
+- `cells=rows*8`, `fmt=mix1`, and a valid heterogeneous saved profile of eight
+  characters;
+- row mode/profile, unit/scale/format, eight-value, mask, and `Xhh` consistency;
+- matching M/K sequence, ROWS identities, and profile identities;
+- CRC over exact M and ordered MR bytes including LF, excluding K.
 
-In `AB50`, `bs` describes battery freshness. A separate later ADS `fresh`
-field describes the ADS cache and must not overwrite battery freshness.
+Only then is a typed `MixedMeasurementFrame` emitted. It contains separate
+`RowMeasurement` objects; there is no synthetic `unit="mixed"`. An incomplete,
+duplicate-row, profile-mismatched, or bad-CRC frame is atomic rejection and
+cannot partially update MatrixStore.
 
-## Rate telemetry
+The Host additionally reads the former long-key/pipe-separated Replay schema as
+a compatibility alias, but it never emits that alias as canonical `331c445`
+traffic. Any future divergence is resolved against firmware formatter source,
+not patched independently in React.
 
-Firmware exposes several rates with different meanings:
+## ROWS transaction and geometry
 
-- capture/physical rate (`cfps` or the corresponding physical capture field);
-- emitted measurement-frame rate (`efps`);
-- per-sink output/packet rate (`ofps` for USB/Serial, BLE, and Wi-Fi views);
-- configured target/budget rate.
+`ROWS=n` supports every integer in `1..8`. `RCMD` acknowledges acceptance; only
+a matching ROWS `RAPP` confirms application at its frame boundary. `frame.rows`
+is the snapshot and heatmap geometry authority. The row-mode profile always
+retains eight entries, so inactive S rows recover their saved modes if ROWS is
+later increased.
 
-`OUTCAP` and sink `ofps` are output policy/throughput, not acquisition FPS.
-The Status UI labels Capture, Emitted, Serial, BLE, Wi-Fi, and Target
-independently and does not substitute one for another.
+ROWS, global MODE, row profile, and deprecated rail configuration are separate
+transaction types even if firmware records reuse an `RAPP` tag. Correlation
+uses typed event plus request ID and expected values, never the tag alone.
 
-## Transport constants and applied-event limitation
+## Rail telemetry and debug compatibility
 
-Current transport constants are unchanged:
+Normal `MODE=VOLT` sends only `MODE=VOLT`; a profile containing VOLT sends only
+one `ROWMODES=...`. Neither production path sends or waits for `RAILCFG`.
+Firmware owns the automatic internal rail monitor.
 
-| Transport | Contract |
-| --- | --- |
-| Serial | 115200 baud, shared line protocol |
-| BLE | service `00FF`; `FF10` CTRL RX, `FF11` CTRL TX, `FF20` DATA, `FF30` LOG |
-| Wi-Fi UDP | DATA 3333, LOG 3334, CTRL 3335 |
-| Replay | same registry/parser/store/snapshot/UI path as live data |
+The host parses `ARL`/`RAIL` telemetry into a typed `RailTelemetry`:
 
-There is an important current firmware limitation. Accepted responses are
-returned to the initiating command transport, but frame-boundary applied events
-(`MAPP`, rail/rows `RAPP`, `ADSCHK`, `ADSCHKSTAT`, and `BAPP`) are emitted by the
-production Serial event path and are not broadcast on BLE `FF30` or Wi-Fi LOG.
+```text
+railSpanUv, valid, fresh, age/ageMs, source, reason, timestamp
+```
 
-Consequences:
+The normal UI shows the analogue span `AVDD - AVSS` as read-only telemetry. It
+does not reinterpret that span as separate rails or present editable AVDD/AVSS
+fields.
 
-- Serial-only GUI transactions can be fully correlated.
-- A BLE-only or Wi-Fi-only strict GUI can observe `MACK`/`RACK`/`ACK`, but it
-  cannot prove application; it must remain pending and time out.
-- The host must not infer application from a `V`, `R`, or later CAP frame,
-  because the required transaction event is the matching `MAPP`/`RAPP`.
-- Full BLE/Wi-Fi transaction HIL currently needs a Serial observation sidecar,
-  or a future firmware change that publishes applied events to those LOG paths.
+Legacy `RAILCFG`, `RACK`, rail `RAPP`, `RERR`, the `/api/measurement/rail`
+endpoint, parser support, and old setup-profile fields remain available for
+explicit debug/raw-command and replay compatibility. The endpoint is
+deprecated and is never invoked automatically by a normal measurement request.
 
-This limitation must be reported as a firmware capability BLOCKED/FAIL result,
-not hidden by Replay, optimistic UI state, or a data-frame heuristic.
+## Battery latest-attempt and last-good state
 
-## Host compatibility tests
+Battery tags such as `ABAT` and `AB50` are parsed into typed telemetry. A
+measurement attempt and a displayable last-good voltage are separate:
 
-Firmware-derived fixtures are kept in the host test tree so routine tests do
-not depend on GitHub or a sibling checkout. Compatibility tests cover CAP,
-VOLT, RES, signed voltage, `Xhh`, unknown error codes, all PGA literals,
-dynamic rows, CRC scope including `P`, malformed-frame recovery, MACK/MAPP,
-generation rejection, rail/ADS/battery transactions, Replay end to end, and
-session round trips.
+```text
+latestBatteryAttempt
+lastGoodBattery
+```
 
-When a sibling firmware checkout is available, cross-repository checks should
-feed the same bytes through the firmware reference parser and desktop parser
-and compare mode, sequence, geometry, generation/request ID, unit/scale,
-values, masks, error codes, PGA, and CRC acceptance.
+Firmware `331c445` publishes `lastGoodMv`, `lastGoodValid`, `lastGoodFresh`,
+`lastGoodAgeMs`, and `lastGoodFrame`; those fields are authoritative. The Host
+also reads the earlier short `bl*` aliases. If neither schema is present, it
+retains the last valid measurement seen in the current device session. For
+example:
+
+```text
+ABAT,bt=-1,valid=0,fresh=0,ageMs=12,lastGoodMv=4092,lastGoodValid=1,lastGoodFresh=0,lastGoodAgeMs=1800,lastGoodFrame=77,...,reason=adc_timeout
+```
+
+produces a failed latest attempt and a 4.092 V last-known value. It must not
+produce zero or erase the voltage. The next fresh valid sample replaces the
+last-good value. A device identity change clears both caches; a transient gap
+or reconnect to the same identity retains the value but marks it stale.
+
+## Compatibility tests
+
+Offline host fixtures cover established CAP/VOLT/RES parsing and the target
+row/mixed contract. Required cases include:
+
+- fragmented/single FF11 accepted events and fragmented FF30 applied events;
+- wrong-ID MAPP/RMAPP rejection and no data-frame completion;
+- RMACK/RMAPP/RMERR and timeout behavior;
+- valid, incomplete, duplicate-row, profile-mismatched, and bad-CRC M/MR/K;
+- ROWS and setup profiles for all integers 1 through 8;
+- typed row identity, per-domain stores/history, and snapshot metadata;
+- active-row colour masks, single-value RES, signed VOLT, and CAP delta;
+- firmware/host battery last-good behavior and device-session reset;
+- normal VOLT and row-profile commands emitting no `RAILCFG`;
+- old rail config/profile and all legacy CAP fixtures remaining readable.
+
+Cross-repository review and exact-source fixtures must compare
+sequence, geometry, identities, profile, row modes/units/scales, values, masks,
+errors, formats, and CRC acceptance. Replay proves the Host pipeline, while
+real BLE evidence remains a separately reported HIL result.

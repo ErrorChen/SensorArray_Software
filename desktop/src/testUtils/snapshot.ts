@@ -35,9 +35,38 @@ export function createBackendSnapshot(options: SnapshotOptions = {}): BackendSna
         requestId: null,
         measuredAvddV: null,
         measuredAvssV: null
+      },
+      railTelemetry: {
+        railSpanUv: null,
+        valid: false,
+        fresh: false,
+        age: null,
+        source: "internal_monitor",
+        reason: "not_measured",
+        timestamp: null
+      },
+      rowProfile: {
+        appliedModes: Array.from({ length: 8 }, () => mode),
+        pendingModes: null,
+        transitionState: "applied",
+        requestId: null,
+        generation: 1,
+        frameSeq: 1,
+        error: ""
       }
     },
-    frame: { seq: 1, fps: 20, rows: 8, valid: true, timestampUs: 1000, revision: 1 },
+    frame: {
+      seq: 1,
+      fps: 20,
+      rows: 8,
+      valid: true,
+      timestampUs: 1000,
+      revision: 1,
+      layout: "HOMOGENEOUS",
+      rowModes: Array.from({ length: 8 }, () => mode),
+      profileGeneration: 1,
+      profileRequestId: null
+    },
     matrix: {
       rows: Array.from({ length: 8 }, (_, index) => `S${index + 1}`),
       cols: Array.from({ length: 8 }, (_, index) => `D${index + 1}`),
@@ -49,6 +78,7 @@ export function createBackendSnapshot(options: SnapshotOptions = {}): BackendSna
       rawFixed: numbers.map((row) => [...row]),
       valid: booleans.map((row) => [...row]),
       fresh: booleans.map((row) => [...row]),
+      error: booleanMatrix(false),
       errorCodes: nullableNumberMatrix(),
       errorReasons: nullableStringMatrix(),
       pga: nullableNumberMatrix(),
@@ -61,7 +91,10 @@ export function createBackendSnapshot(options: SnapshotOptions = {}): BackendSna
       rawPf: numbers.map((row) => [...row]),
       userOffsetPf: numbers.map((row) => [...row]),
       validMask: booleans.map((row) => [...row]),
-      domain: quantity
+      domain: quantity,
+      modeByRow: Array.from({ length: 8 }, () => mode),
+      unitByRow: Array.from({ length: 8 }, () => unit),
+      scaleByRow: Array.from({ length: 8 }, () => mode === "RES" ? -3 : -6)
     },
     selection: {
       rowIndex: 0,

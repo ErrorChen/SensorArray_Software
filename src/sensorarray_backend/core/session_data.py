@@ -169,6 +169,7 @@ def frames_to_measurement_ascii_bytes(frames: list[SessionFrame]) -> bytes:
 
     out = bytearray()
     previous_mode: str | None = None
+    previous_rows: int | None = None
     for frame in frames:
         rows = max(1, min(8, int(frame.rows)))
         cells = rows * 8
@@ -181,6 +182,19 @@ def frames_to_measurement_ascii_bytes(frames: list[SessionFrame]) -> bytes:
         generation = int(frame.generation if frame.generation is not None else 1)
         request_id = int(frame.requestId if frame.requestId is not None else 1)
         timestamp_us = int(float(frame.timeSeconds) * 1_000_000)
+        if previous_rows is not None and rows != previous_rows:
+            # Geometry is independently transactional. Reconstruct the RAPP
+            # boundary too, otherwise a replayed ROWS change can leave the
+            # authoritative store gate at the previous geometry.
+            out.extend(
+                f"RCMD,id={request_id},old={previous_rows},req={rows},generation={generation},status=accepted\n".encode(
+                    "ascii"
+                )
+            )
+            out.extend(
+                f"RAPP,id={request_id},seq={int(frame.seq)},old={previous_rows},new={rows},"
+                f"gen={generation},status=applied\n".encode("ascii")
+            )
         if previous_mode is not None and mode != previous_mode:
             # Exported measurement frames do not carry the asynchronous mode
             # events that originally surrounded them.  Recreate an explicit
@@ -253,6 +267,7 @@ def frames_to_measurement_ascii_bytes(frames: list[SessionFrame]) -> bytes:
         body.extend(f"K,seq={int(frame.seq)},gen={generation},rid={request_id},crc={crc:08X}\n".encode("ascii"))
         out.extend(body)
         previous_mode = mode
+        previous_rows = rows
     return bytes(out)
 
 

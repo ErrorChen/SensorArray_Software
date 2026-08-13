@@ -274,33 +274,16 @@ def test_rail_configuration_rejects_bad_sign_or_span(avdd_uv: int, avss_uv: int)
         CommandService().request_rail(avdd_uv, avss_uv, lambda _command: None)
 
 
-def test_voltage_request_sequences_rail_apply_before_mode_and_mapp_before_commit() -> None:
+def test_voltage_request_sends_only_mode_and_mapp_remains_the_commit_boundary() -> None:
     runtime = BackendRuntime(AppConfiguration())
     transport = _CommandTransport()
     runtime.transport.current = transport
     runtime.transport.status.update({"transport": "serial", "state": "STREAMING", "sessionGeneration": 0})
 
-    with pytest.raises(ValueError, match="requires measured AVDD/AVSS"):
-        runtime.request_measurement_mode_api("VOLT")
-    assert transport.commands == []
-
-    runtime.request_measurement_mode_api("VOLT", measured_avdd_v=3.391, measured_avss_v=-2.5)
-    assert transport.commands == ["RAILCFG=3391000,-2500000"]
+    runtime.request_measurement_mode_api("VOLT")
+    assert transport.commands == ["MODE=VOLT"]
     assert runtime.commands.appliedMode == "CAP"
-    assert runtime.commands.transitionState == "configuring_rail"
-
-    _dispatch_log(runtime, "RACK,id=51,avdd=3391000,avss=-2500000,source=external,state=accepted")
-    assert transport.commands == ["RAILCFG=3391000,-2500000"]
-    assert not runtime.commands.railConfigured
-
-    _dispatch_log(runtime, "RAPP,id=99,gen=6,seq=7,avdd=3391000,avss=-2500000,source=external,state=applied")
-    assert transport.commands == ["RAILCFG=3391000,-2500000"]
-    assert not runtime.commands.railConfigured
-
-    _dispatch_log(runtime, "RAPP,id=51,gen=6,seq=7,avdd=3391000,avss=-2500000,source=external,state=applied")
-    assert transport.commands == ["RAILCFG=3391000,-2500000", "MODE=VOLT"]
-    assert runtime.commands.railConfigured
-    assert runtime.commands.appliedMode == "CAP"
+    assert runtime.commands.transitionState == "requested"
 
     _dispatch_log(runtime, "MACK,id=42,old=CAP,new=VOLT,state=accepted")
     assert runtime.commands.appliedMode == "CAP"
@@ -314,7 +297,7 @@ def test_voltage_request_sequences_rail_apply_before_mode_and_mapp_before_commit
     assert runtime.matrixStore.snapshot().seq is None
 
 
-def test_new_explicit_voltage_rails_replace_an_old_applied_snapshot_before_mode() -> None:
+def test_legacy_rail_fields_on_mode_request_are_ignored_by_production_flow() -> None:
     runtime = BackendRuntime(AppConfiguration())
     transport = _CommandTransport()
     runtime.transport.current = transport
@@ -325,13 +308,13 @@ def test_new_explicit_voltage_rails_replace_an_old_applied_snapshot_before_mode(
     runtime.commands.measuredAvssV = -2.5
 
     runtime.request_measurement_mode_api("VOLT", measured_avdd_v=3.45, measured_avss_v=-2.45)
-    assert transport.commands == ["RAILCFG=3450000,-2450000"]
-    assert runtime.commands.transitionState == "configuring_rail"
-    assert runtime.commands.measuredAvddV == pytest.approx(3.45)
-    assert runtime.commands.measuredAvssV == pytest.approx(-2.45)
+    assert transport.commands == ["MODE=VOLT"]
+    assert runtime.commands.transitionState == "requested"
+    assert runtime.commands.measuredAvddV == pytest.approx(3.391)
+    assert runtime.commands.measuredAvssV == pytest.approx(-2.5)
 
 
-def test_voltage_reuses_only_the_same_applied_rail_and_rejects_live_replacement() -> None:
+def test_explicit_debug_rail_configuration_remains_available() -> None:
     runtime = BackendRuntime(AppConfiguration())
     transport = _CommandTransport()
     runtime.transport.current = transport
@@ -341,16 +324,9 @@ def test_voltage_reuses_only_the_same_applied_rail_and_rejects_live_replacement(
     runtime.commands.measuredAvddV = 3.391
     runtime.commands.measuredAvssV = -2.5
 
-    runtime.request_measurement_mode_api("VOLT", measured_avdd_v=3.391, measured_avss_v=-2.5)
-    assert transport.commands == ["MODE=VOLT"]
-
-    runtime.commands.appliedMode = "VOLT"
-    runtime.commands.pendingMode = None
-    with pytest.raises(ValueError, match="switch to CAP or RES"):
-        runtime.request_measurement_mode_api("VOLT", measured_avdd_v=3.45, measured_avss_v=-2.45)
-    assert transport.commands == ["MODE=VOLT"]
-    assert runtime.measuredAvddV == pytest.approx(3.391)
-    assert runtime.measuredAvssV == pytest.approx(-2.5)
+    runtime.configure_voltage_rail(3.45, -2.45)
+    assert transport.commands == ["RAILCFG=3450000,-2450000"]
+    assert runtime.commands.railState == "requested"
 
 
 def test_rail_apply_timeout_releases_voltage_transition_for_retry() -> None:
@@ -445,8 +421,8 @@ def test_snapshot_is_quantity_typed_and_excludes_invalid_stale_cells_from_displa
 
     runtime.capture_baseline()
     assert runtime.ui.baseline is None
-    assert runtime.ui.baselineInvalidReason == "Available in capacitance mode only"
-    with pytest.raises(ValueError, match="capacitance mode only"):
+    assert runtime.ui.baselineInvalidReason == "Available when an active row uses CAP"
+    with pytest.raises(ValueError, match="active row uses CAP"):
         runtime.set_display_mode("delta_percent")
 
 

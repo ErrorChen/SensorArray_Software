@@ -11,6 +11,7 @@ export type CellMeasurementState = {
   rawFixed: number | null;
   valid: boolean;
   fresh: boolean;
+  error: boolean;
   errorCode: number | null;
   errorReason: string | null;
   pga: number | null;
@@ -30,7 +31,9 @@ const quantityLabels: Record<MeasurementQuantity, string> = {
 };
 
 export function appliedMeasurementMode(snapshot: BackendSnapshotPayload | null | undefined): MeasurementMode {
-  return snapshot?.measurement?.appliedMode ?? modeFromQuantity(snapshot?.matrix?.quantity) ?? "CAP";
+  const quantity = snapshot?.matrix?.quantity;
+  const homogeneousQuantity = quantity === "capacitance" || quantity === "voltage" || quantity === "resistance" ? quantity : undefined;
+  return snapshot?.measurement?.appliedMode ?? modeFromQuantity(homogeneousQuantity) ?? "CAP";
 }
 
 export function pendingMeasurementMode(snapshot: BackendSnapshotPayload | null | undefined): MeasurementMode | null {
@@ -38,7 +41,10 @@ export function pendingMeasurementMode(snapshot: BackendSnapshotPayload | null |
 }
 
 export function measurementQuantity(snapshot: BackendSnapshotPayload | null | undefined): MeasurementQuantity {
-  return snapshot?.matrix?.quantity ?? modeQuantity[appliedMeasurementMode(snapshot)];
+  const quantity = snapshot?.matrix?.quantity;
+  return quantity === "capacitance" || quantity === "voltage" || quantity === "resistance"
+    ? quantity
+    : modeQuantity[modeForRow(snapshot, 0)];
 }
 
 export function quantityForMode(mode: MeasurementMode): MeasurementQuantity {
@@ -50,7 +56,33 @@ export function quantityLabel(quantity: MeasurementQuantity): string {
 }
 
 export function isCapacitanceMode(snapshot: BackendSnapshotPayload | null | undefined): boolean {
+  const rowModes = snapshot?.frame?.rowModes ?? snapshot?.matrix?.modeByRow ?? snapshot?.measurement?.rowProfile?.appliedModes;
+  if (Array.isArray(rowModes) && rowModes.length) {
+    const activeRows = Math.max(1, Math.min(8, Math.trunc(snapshot?.frame?.rows ?? 8)));
+    return rowModes.slice(0, activeRows).includes("CAP");
+  }
   return appliedMeasurementMode(snapshot) === "CAP";
+}
+
+export function modeForRow(snapshot: BackendSnapshotPayload | null | undefined, row: number): MeasurementMode {
+  return snapshot?.matrix?.modeByRow?.[row]
+    ?? snapshot?.frame?.rowModes?.[row]
+    ?? snapshot?.measurement?.rowProfile?.appliedModes?.[row]
+    ?? appliedMeasurementMode(snapshot);
+}
+
+export function quantityForRow(snapshot: BackendSnapshotPayload | null | undefined, row: number): MeasurementQuantity {
+  return quantityForMode(modeForRow(snapshot, row));
+}
+
+export function unitForRow(snapshot: BackendSnapshotPayload, row: number): string {
+  const mode = modeForRow(snapshot, row);
+  if (mode === "CAP" && snapshot.display.displayMode === "delta_percent") {
+    return "%";
+  }
+  const unit = snapshot.matrix.unitByRow?.[row]
+    ?? (mode === "CAP" ? "pF" : mode === "VOLT" ? "V" : "ohm");
+  return unit === "ohm" ? "\u03A9" : unit;
 }
 
 export function isTransitionPending(state: MeasurementTransitionState | undefined): boolean {
@@ -93,6 +125,7 @@ export function cellMeasurementState(matrix: MatrixSnapshot, row: number, col: n
     rawFixed: finiteOrNull(matrix.rawFixed?.[row]?.[col]),
     valid,
     fresh,
+    error: Boolean(matrix.error?.[row]?.[col]),
     errorCode,
     errorReason: errorReason(errorCode, providedReason),
     pga: finiteNonNegativeOrNull(matrix.pga?.[row]?.[col]),
@@ -101,14 +134,14 @@ export function cellMeasurementState(matrix: MatrixSnapshot, row: number, col: n
 }
 
 export function isCellDisplayable(cell: CellMeasurementState): boolean {
-  return cell.valid && cell.fresh && typeof cell.value === "number" && Number.isFinite(cell.value);
+  return cell.valid && cell.fresh && !cell.error && typeof cell.value === "number" && Number.isFinite(cell.value);
 }
 
 export function matrixDisplayUnit(snapshot: BackendSnapshotPayload): string {
   if (measurementQuantity(snapshot) === "capacitance" && snapshot.display.displayMode === "delta_percent") {
     return "%";
   }
-  return snapshot.matrix.unit === "ohm" ? "Ω" : snapshot.matrix.unit;
+  return snapshot.matrix.unit === "ohm" ? "\u03A9" : snapshot.matrix.unit;
 }
 
 export function formatMeasurementValue(
@@ -126,21 +159,21 @@ export function formatMeasurementValue(
     return formatEngineering(value, [
       { threshold: 1, multiplier: 1, unit: "V" },
       { threshold: 1e-3, multiplier: 1e3, unit: "mV" },
-      { threshold: 0, multiplier: 1e6, unit: "µV" }
+      { threshold: 0, multiplier: 1e6, unit: "\u00B5V" }
     ], options.compact);
   }
   if (quantity === "resistance") {
     const absolute = Math.abs(value);
     if (absolute >= 1e6) {
-      return `${formatNumber(value / 1e6, options.compact ? 2 : 3)} MΩ`;
+      return `${formatNumber(value / 1e6, options.compact ? 2 : 3)} M\u03A9`;
     }
     if (absolute >= 1e3) {
-      return `${formatNumber(value / 1e3, options.compact ? 2 : 3)} kΩ`;
+      return `${formatNumber(value / 1e3, options.compact ? 2 : 3)} k\u03A9`;
     }
     if (absolute > 0 && absolute < 1) {
-      return `${formatNumber(value * 1e3, options.compact ? 1 : 3)} mΩ`;
+      return `${formatNumber(value * 1e3, options.compact ? 1 : 3)} m\u03A9`;
     }
-    return `${formatNumber(value, options.compact ? 2 : 3)} Ω`;
+    return `${formatNumber(value, options.compact ? 2 : 3)} \u03A9`;
   }
   return `${formatNumber(value, options.compact ? 2 : 3)} pF`;
 }
@@ -152,7 +185,7 @@ export function pgaLabel(pga: number | null | undefined, bypass: boolean): strin
   if (typeof pga !== "number" || !Number.isFinite(pga) || pga < 0) {
     return "PGA unavailable";
   }
-  return `PGA ×${pga}`;
+  return `PGA \u00D7${pga}`;
 }
 
 export function formatErrorCode(code: number | null | undefined): string {
@@ -174,10 +207,10 @@ export function errorReason(code: number | null | undefined, provided: string | 
 
 export function rawFixedLabel(mode: MeasurementMode): string {
   if (mode === "VOLT") {
-    return "Raw integer µV";
+    return "Raw integer \u00B5V";
   }
   if (mode === "RES") {
-    return "Raw integer mΩ";
+    return "Raw integer m\u03A9";
   }
   return "Raw fixed value";
 }

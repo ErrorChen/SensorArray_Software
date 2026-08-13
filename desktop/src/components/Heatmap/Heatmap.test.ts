@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createBackendSnapshot } from "../../testUtils/snapshot";
 import {
+  activeRows,
   buildDynamicHeatmapOption,
   buildHeatmapData,
   formatHeatmapCellLabel,
@@ -10,6 +11,7 @@ import {
   pointToCell,
   showHeatmapTooltipForCell
 } from "./Heatmap";
+import { resolveColourRange } from "../../state/heatmap";
 
 describe("Heatmap data helpers", () => {
   it("keeps invalid cells addressable while fixed series ids preserve chart instance state", () => {
@@ -20,14 +22,14 @@ describe("Heatmap data helpers", () => {
 
     const data = buildHeatmapData(snapshot);
     expect(data).toHaveLength(64);
-    expect(data.find((item) => item[3] === "S1D2")).toEqual([1, 0, null, "S1D2", false]);
+    expect(data.find((item) => item[3] === "S1D2")).toEqual([1, 0, null, "S1D2", false, "CAP"]);
 
     const selected = data[Math.floor(data.length / 8)];
     const option = buildDynamicHeatmapOption(snapshot, new Set([String(selected[3])])) as {
       series: Array<{ id: string; type: string; data: unknown[]; silent?: boolean }>;
     };
 
-    expect(option.series[0].id).toBe("heatmap-values");
+    expect(option.series[0].id).toBe("heatmap-cap");
     expect(option.series[1].id).toBe("invalid-cells");
     expect(option.series[1].data).toHaveLength(1);
     expect(option.series[2].id).toBe("selected-cells");
@@ -40,7 +42,7 @@ describe("Heatmap data helpers", () => {
       const option = buildDynamicHeatmapOption(createBackendSnapshot({ mode }), new Set()) as {
         visualMap: Array<{ id: string; text?: string[] }>;
       };
-      expect(option.visualMap[0].id).toBe("measurement-scale");
+      expect(option.visualMap[0].id).toMatch(/-scale$/);
       return option.visualMap[0].text?.[0] ?? "";
     };
 
@@ -136,6 +138,20 @@ describe("Heatmap data helpers", () => {
     expect(errorTooltip).toContain("ADC timeout");
   });
 
+  it("excludes a finite valid/fresh cell when the typed error mask is set", () => {
+    const snapshot = createBackendSnapshot({ mode: "RES" });
+    snapshot.matrix.displayValues[0][0] = 10_025;
+    snapshot.matrix.error = snapshot.matrix.valid.map((row) => row.map(() => false));
+    snapshot.matrix.error[0][0] = true;
+    const data = buildHeatmapData(snapshot);
+    expect(data.find((item) => item[3] === "S1D1")).toEqual([0, 0, null, "S1D1", false, "RES"]);
+    const option = buildDynamicHeatmapOption(snapshot, new Set()) as { series: Array<{ id: string; data: unknown[] }> };
+    expect(option.series.find((series) => series.id === "heatmap-res")?.data).not.toContainEqual(
+      expect.objectContaining({ value: expect.arrayContaining([0, 0, 10_025]) })
+    );
+    expect(option.series.find((series) => series.id === "invalid-cells")?.data).toHaveLength(1);
+  });
+
   it("leaves inactive cells blank and gives Xhh precedence over stale", () => {
     const snapshot = createBackendSnapshot({ mode: "RES" });
     snapshot.frame.rows = 1;
@@ -168,5 +184,104 @@ describe("Heatmap data helpers", () => {
     expect(option.series[0].data).toHaveLength(0);
     expect(option.series[1].data).toHaveLength(0);
     expect(formatHeatmapCellLabel(snapshot, 0, 0, null)).toBe("");
+  });
+
+  it("uses active ROWS geometry for data, axes, and selection overlays", () => {
+    const snapshot = createBackendSnapshot({ mode: "RES" });
+    snapshot.frame.rows = 5;
+    snapshot.matrix.rows = Array.from({ length: 8 }, (_, index) => `S${index + 1}`);
+    const data = buildHeatmapData(snapshot);
+    const option = buildDynamicHeatmapOption(snapshot, new Set(["S8D8", "S5D1"])) as {
+      yAxis: { data: string[] };
+      series: Array<{ id: string; data: unknown[] }>;
+    };
+    expect(activeRows(snapshot)).toBe(5);
+    expect(data).toHaveLength(40);
+    expect(option.yAxis.data).toEqual(["S1", "S2", "S3", "S4", "S5"]);
+    expect(option.series.find((series) => series.id === "selected-cells")?.data).toEqual([[0, 4]]);
+  });
+
+  it("builds one physical mixed grid with isolated CAP, VOLT, and RES scales", () => {
+    const snapshot = createBackendSnapshot();
+    const modes = ["RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES"] as const;
+    snapshot.frame.layout = "MIXED";
+    snapshot.frame.rowModes = [...modes];
+    snapshot.matrix.modeByRow = [...modes];
+    snapshot.matrix.unitByRow = ["ohm", "V", "V", "pF", "pF", "V", "V", "ohm"];
+    snapshot.display.colourRanges = {
+      cap_absolute: { min: 0, max: 10, frozen: false },
+      voltage: { min: -2.5, max: 2.5, frozen: false },
+      resistance: { min: 0, max: 20_000, frozen: false }
+    };
+    snapshot.matrix.displayValues[0][0] = 10_025;
+    snapshot.matrix.displayValues[1][0] = 1.2;
+    snapshot.matrix.displayValues[3][0] = 6.315;
+
+    const option = buildDynamicHeatmapOption(snapshot, new Set()) as {
+      yAxis: { data: string[] };
+      series: Array<{ id: string; data: Array<{ value: number[] }> }>;
+      visualMap: Array<{ id: string; min: number; max: number; seriesIndex: number[]; text: string[] }>;
+    };
+    expect(option.yAxis.data).toEqual([
+      "S1 · RES", "S2 · VOLT", "S3 · VOLT", "S4 · CAP", "S5 · CAP", "S6 · VOLT", "S7 · VOLT", "S8 · RES"
+    ]);
+    expect(option.series.slice(0, 3).map((series) => series.id)).toEqual(["heatmap-cap", "heatmap-volt", "heatmap-res"]);
+    expect(option.visualMap.slice(0, 3).map(({ id, min, max, seriesIndex, text }) => ({ id, min, max, seriesIndex, unit: text[0] }))).toEqual([
+      { id: "cap_absolute-scale", min: 0, max: 10, seriesIndex: [0], unit: "pF" },
+      { id: "voltage-scale", min: -2.5, max: 2.5, seriesIndex: [1], unit: "V" },
+      { id: "resistance-scale", min: 0, max: 20_000, seriesIndex: [2], unit: "Ω" }
+    ]);
+    expect(option.series[0].data.every((item) => modes[item.value[1]] === "CAP")).toBe(true);
+    expect(option.series[1].data.every((item) => modes[item.value[1]] === "VOLT")).toBe(true);
+    expect(option.series[2].data.every((item) => modes[item.value[1]] === "RES")).toBe(true);
+
+    const resTooltip = formatHeatmapTooltip({ value: [0, 0, 10_025, "S1D1", 1] } as never, snapshot);
+    const capTooltip = formatHeatmapTooltip({ value: [0, 3, 6.315, "S4D1", 1] } as never, snapshot);
+    expect(resTooltip).toContain("Mode: RES");
+    expect(resTooltip).toContain("10.025 kΩ");
+    expect(capTooltip).toContain("Mode: CAP");
+    expect(capTooltip).toContain("6.315 pF");
+  });
+
+  it("applies Delta C/C0 only to mixed CAP rows while VOLT and RES remain absolute", () => {
+    const snapshot = createBackendSnapshot({ displayMode: "delta_percent" });
+    const modes = ["RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES"] as const;
+    snapshot.frame.layout = "MIXED";
+    snapshot.frame.rowModes = [...modes];
+    snapshot.matrix.mode = "MIXED";
+    snapshot.matrix.quantity = "mixed";
+    snapshot.matrix.unit = "";
+    snapshot.matrix.modeByRow = [...modes];
+    snapshot.matrix.unitByRow = ["ohm", "V", "V", "pF", "pF", "V", "V", "ohm"];
+    snapshot.display.colourRanges = {
+      cap_delta: { min: -5, max: 5, frozen: false },
+      voltage: { min: -2.5, max: 2.5, frozen: false },
+      resistance: { min: 0, max: 20_000, frozen: false }
+    };
+    const option = buildDynamicHeatmapOption(snapshot, new Set()) as {
+      series: Array<{ id: string }>;
+      visualMap: Array<{ id: string; text: string[]; seriesIndex: number[] }>;
+    };
+    expect(option.series.slice(0, 3).map((series) => series.id)).toEqual(["heatmap-cap", "heatmap-volt", "heatmap-res"]);
+    expect(option.visualMap.slice(0, 3).map((scale) => ({ id: scale.id, unit: scale.text[0], seriesIndex: scale.seriesIndex }))).toEqual([
+      { id: "cap_delta-scale", unit: "%", seriesIndex: [0] },
+      { id: "voltage-scale", unit: "V", seriesIndex: [1] },
+      { id: "resistance-scale", unit: "Ω", seriesIndex: [2] }
+    ]);
+  });
+
+  it.each([10_025, 670])("keeps a single RES value %s above the neutral midpoint", (value) => {
+    const snapshot = createBackendSnapshot({ mode: "RES" });
+    snapshot.frame.rows = 1;
+    snapshot.matrix.displayValues = snapshot.matrix.displayValues.map((row) => row.map(() => null));
+    snapshot.matrix.valid = snapshot.matrix.valid.map((row) => row.map(() => false));
+    snapshot.matrix.fresh = snapshot.matrix.fresh.map((row) => row.map(() => false));
+    snapshot.matrix.displayValues[0][0] = value;
+    snapshot.matrix.valid[0][0] = true;
+    snapshot.matrix.fresh[0][0] = true;
+    const data = buildHeatmapData(snapshot).filter((item) => item[4]);
+    const range = resolveColourRange(data, snapshot, "resistance");
+    expect(range[1]).toBeGreaterThan(range[0]);
+    expect((value - range[0]) / (range[1] - range[0])).toBeGreaterThan(0.5);
   });
 });

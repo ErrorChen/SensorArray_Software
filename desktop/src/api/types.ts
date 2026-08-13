@@ -2,8 +2,13 @@ export type TransportMode = "serial" | "ble" | "wifi" | "replay";
 export type DisplayMode = "absolute_pf" | "delta_percent";
 export type CommandLineEnding = "lf" | "crlf" | "none";
 export type MeasurementMode = "CAP" | "VOLT" | "RES";
+export type RowMeasurementMode = MeasurementMode;
+export type FrameLayout = "HOMOGENEOUS" | "MIXED";
 export type MeasurementQuantity = "capacitance" | "voltage" | "resistance";
 export type MeasurementUnit = "pF" | "V" | "ohm";
+export type MatrixSnapshotMode = MeasurementMode | "MIXED";
+export type MatrixSnapshotQuantity = MeasurementQuantity | "mixed" | "row_specific";
+export type MatrixSnapshotUnit = MeasurementUnit | "%" | "";
 export type MeasurementTransitionState =
   | "applied"
   | "requested"
@@ -21,6 +26,27 @@ export type VoltageRailSnapshot = {
   measuredAvssV: number | null;
 };
 
+export type RailTelemetry = {
+  railSpanUv: number | null;
+  valid: boolean | null;
+  fresh: boolean | null;
+  age: number | null;
+  ageSeconds?: number | null;
+  source: string;
+  reason: string;
+  timestamp: number | null;
+};
+
+export type RowModeProfileSnapshot = {
+  appliedModes: RowMeasurementMode[];
+  pendingModes: RowMeasurementMode[] | null;
+  transitionState: MeasurementTransitionState;
+  requestId: number | null;
+  generation: number | null;
+  frameSeq: number | null;
+  error: string;
+};
+
 export type MeasurementSnapshot = {
   appliedMode: MeasurementMode;
   pendingMode: MeasurementMode | null;
@@ -31,6 +57,8 @@ export type MeasurementSnapshot = {
   error: string;
   deviceState?: string;
   rail: VoltageRailSnapshot;
+  railTelemetry?: RailTelemetry;
+  rowProfile?: RowModeProfileSnapshot;
 };
 
 export type ConnectionSnapshot = {
@@ -52,6 +80,10 @@ export type FrameSnapshot = {
   hostParserFps?: number;
   generation?: number | null;
   requestId?: number | null;
+  layout?: FrameLayout;
+  rowModes?: RowMeasurementMode[];
+  profileGeneration?: number | null;
+  profileRequestId?: number | null;
 };
 
 export type MatrixDiagnostics = {
@@ -78,9 +110,9 @@ export type MatrixDiagnostics = {
 export type MatrixSnapshot = {
   rows: string[];
   cols: string[];
-  quantity: MeasurementQuantity;
-  mode?: MeasurementMode;
-  unit: MeasurementUnit | "%";
+  quantity: MatrixSnapshotQuantity;
+  mode?: MatrixSnapshotMode;
+  unit: MatrixSnapshotUnit;
   wireUnit?: MeasurementUnit;
   scale: number;
   format?: string;
@@ -105,6 +137,9 @@ export type MatrixSnapshot = {
   userOffsetPf: (number | null)[][];
   validMask: boolean[][];
   domain: string;
+  modeByRow?: RowMeasurementMode[];
+  unitByRow?: (MeasurementUnit | "%")[];
+  scaleByRow?: number[];
 };
 
 export type SelectionSnapshot = {
@@ -134,6 +169,15 @@ export type DisplaySnapshot = {
     frozen: boolean;
     quantity?: MeasurementQuantity;
   };
+  colourRanges?: Partial<Record<ColourDomain, ColourRangeSnapshot>>;
+};
+
+export type ColourDomain = "cap_absolute" | "cap_delta" | "voltage" | "resistance";
+
+export type ColourRangeSnapshot = {
+  min: number | null;
+  max: number | null;
+  frozen: boolean;
 };
 
 export type BaselineSnapshot = {
@@ -287,6 +331,22 @@ export type BatterySnapshot = {
   validRunCount?: number | null;
   invalidRunCount?: number | null;
   rawFields?: Record<string, string>;
+  latestAttempt?: BatteryTelemetryAttempt | null;
+  lastGood?: BatteryTelemetryAttempt | null;
+  [key: string]: unknown;
+};
+
+export type BatteryTelemetryAttempt = {
+  batteryMv?: number | null;
+  batteryText?: string;
+  valid?: boolean | null;
+  fresh?: boolean | null;
+  ageMs?: number | null;
+  ageSeconds?: number | null;
+  reason?: string;
+  source?: string;
+  firmwareAuthoritative?: boolean;
+  timestamp?: number | null;
   [key: string]: unknown;
 };
 
@@ -390,6 +450,17 @@ export type MeasurementModeResponse = {
   error?: string;
 };
 
+export type RowModesRequest = {
+  modes: RowMeasurementMode[];
+};
+
+export type RowModesResponse = {
+  ok: boolean;
+  modes?: RowMeasurementMode[];
+  measurement?: MeasurementSnapshot;
+  error?: string;
+};
+
 export type OffsetScope = "cell" | "row" | "all";
 
 export type OffsetResponse = {
@@ -401,7 +472,7 @@ export type OffsetResponse = {
 export type SessionDataFormat = "csv" | "xlsx" | "mat" | "h5";
 
 export type SetupProfile = {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   appVersion?: string;
   transport: {
     mode: TransportMode;
@@ -410,7 +481,7 @@ export type SetupProfile = {
     ble: { address?: string; deviceId?: string };
     replay: { path?: string; speed: number };
   };
-  acquisition: { rows: number; measurementMode: MeasurementMode };
+  acquisition: { rows: number; measurementMode: MeasurementMode; rowModes: RowMeasurementMode[] };
   voltageRail: {
     measuredAvddV: number | null;
     measuredAvssV: number | null;

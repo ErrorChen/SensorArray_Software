@@ -53,7 +53,7 @@ def test_transport_write_disconnected_returns_clear_error():
     assert "not connected" in payload["error"]
 
 
-def test_measurement_mode_api_is_distinct_from_transport_mode_and_requires_voltage_rails():
+def test_measurement_mode_api_is_distinct_from_transport_mode_and_has_no_rail_validation_dependency():
     app = create_app(AppConfiguration())
     with TestClient(app) as client:
         current = client.get("/api/measurement/mode")
@@ -61,17 +61,17 @@ def test_measurement_mode_api_is_distinct_from_transport_mode_and_requires_volta
         transport = client.post("/api/transport/mode", json={"mode": "replay"})
     assert current.status_code == 200
     assert current.json()["measurement"]["appliedMode"] == "CAP"
-    assert missing_rails.status_code == 409
-    assert "measured AVDD/AVSS" in missing_rails.json()["detail"]
+    assert missing_rails.status_code == 400
+    assert "no transport connected" in missing_rails.json()["detail"]
     assert transport.json() == {"mode": "replay"}
 
 
-def test_measurement_mode_api_rejects_unpaired_external_rail_snapshot():
+def test_measurement_mode_api_legacy_single_rail_field_does_not_trigger_railcfg():
     app = create_app(AppConfiguration())
     with TestClient(app) as client:
         response = client.post("/api/measurement/mode", json={"mode": "VOLT", "measuredAvddV": 3.3})
     assert response.status_code == 400
-    assert "supplied together" in response.json()["detail"]
+    assert "no transport connected" in response.json()["detail"]
 
 
 def test_transport_write_serial_respects_line_ending():

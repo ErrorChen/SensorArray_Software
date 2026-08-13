@@ -18,6 +18,13 @@ def parse_battery_fields(fields: dict[str, str], received_time: float | None = N
     battery_mv = _int_or_none(fields.get("bt"))
     if battery_mv == -1:
         battery_mv = None
+    # Firmware 331c445 emits the long ``lastGood*`` names in both ABAT and
+    # AB50.  The former ``bl*`` spellings were emitted by older saved replay
+    # fixtures, so they remain read-only aliases rather than replacing the
+    # production schema.
+    last_good_battery_mv = _int_or_none(fields.get("lastGoodMv") or fields.get("bl"))
+    if last_good_battery_mv == -1:
+        last_good_battery_mv = None
     valid = _bool_or_none(fields.get("valid"))
     state = fields.get("bs") or ("present" if valid is True else "invalid" if valid is False else "unknown")
     if valid is None and "bs" in fields:
@@ -83,6 +90,13 @@ def parse_battery_fields(fields: dict[str, str], received_time: float | None = N
         sampleAverageUs=sample_average_us,
         sampleMaximumUs=sample_maximum_us,
         restoreResult=fields.get("restore"),
+        lastGoodBatteryMv=last_good_battery_mv,
+        lastGoodValid=_bool_or_none(fields.get("lastGoodValid") or fields.get("blValid")),
+        lastGoodFresh=_bool_or_none(fields.get("lastGoodFresh") or fields.get("blFresh")),
+        lastGoodAgeMs=_int_or_none(fields.get("lastGoodAgeMs") or fields.get("blAgeMs")),
+        lastGoodFrame=_int_or_none(fields.get("lastGoodFrame") or fields.get("blFrame")),
+        lastGoodSource=fields.get("blSource"),
+        lastGoodReason=fields.get("blReason"),
     )
 
 

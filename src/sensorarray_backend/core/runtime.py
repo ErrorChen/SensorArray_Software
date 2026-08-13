@@ -40,8 +40,16 @@ class BackendRuntime(SensorArrayRuntime):
         self.replaySpeed = 1.0
         self.commandLineEnding = "lf"
         self.defaultSaveDirectory = str(Path.cwd())
-        self._lastColorRange: tuple[float | None, float | None] = (None, None)
+        self._lastColourRanges: dict[str, tuple[float | None, float | None]] = {
+            "cap_absolute": (None, None),
+            "cap_delta": (None, None),
+            "voltage": (None, None),
+            "resistance": (None, None),
+        }
+        self._resolvedColourRanges = dict(self._lastColourRanges)
+        self._frozenColourRanges = dict(self._lastColourRanges)
         self.preferredMeasurementMode = "CAP"
+        self.preferredRowModes: tuple[str, ...] = ("CAP",) * 8
         self.measuredAvddV: float | None = None
         self.measuredAvssV: float | None = None
 
@@ -139,19 +147,29 @@ class BackendRuntime(SensorArrayRuntime):
     ) -> dict[str, Any]:
         normalized = str(mode).strip().upper()
         normalized = {"CAPACITANCE": "CAP", "VOLTAGE": "VOLT", "RESISTANCE": "RES"}.get(normalized, normalized)
-        if (measured_avdd_v is None) != (measured_avss_v is None):
-            raise ValueError("Measured AVDD and AVSS must be supplied together as one external rail snapshot")
-        next_avdd_v = self.measuredAvddV
-        next_avss_v = self.measuredAvssV
-        if measured_avdd_v is not None:
-            next_avdd_v = _finite_float(measured_avdd_v, "measuredAvddV")
-        if measured_avss_v is not None:
-            next_avss_v = _finite_float(measured_avss_v, "measuredAvssV")
-        super().request_measurement_mode(normalized, next_avdd_v, next_avss_v)
-        self.measuredAvddV = next_avdd_v
-        self.measuredAvssV = next_avss_v
+        # measuredAvddV/measuredAvssV remain accepted for wire/API backwards
+        # compatibility, but normal MODE operation no longer configures rails.
+        # The legacy /rail endpoint is the only path which emits RAILCFG.
+        super().request_measurement_mode(normalized)
         self.preferredMeasurementMode = normalized
         return {"ok": True, "measurement": self.commands.measurement_snapshot()}
+
+    def request_row_modes_api(self, modes: Any) -> dict[str, Any]:
+        normalized = _normalize_row_modes(modes)
+        super().request_row_modes(normalized)
+        self.preferredRowModes = normalized
+        return {
+            "ok": True,
+            "modes": list(normalized),
+            "measurement": self.commands.measurement_snapshot(),
+        }
+
+    def row_modes_payload(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "modes": list(self.commands.appliedRowModes),
+            "rowProfile": self.commands.measurement_snapshot()["rowProfile"],
+        }
 
     def configure_voltage_rail(self, measured_avdd_v: float, measured_avss_v: float) -> dict[str, Any]:
         if self.commands.appliedMode == "VOLT":
@@ -182,7 +200,12 @@ class BackendRuntime(SensorArrayRuntime):
         if "pauseDisplay" in payload and payload["pauseDisplay"] is not None:
             self.ui.paused = bool(payload["pauseDisplay"])
         if "freezeColor" in payload and payload["freezeColor"] is not None:
-            self.ui.freezeColor = bool(payload["freezeColor"])
+            freeze = bool(payload["freezeColor"])
+            if freeze and not self.ui.freezeColor:
+                self._frozenColourRanges = dict(self._resolvedColourRanges)
+            elif not freeze:
+                self._frozenColourRanges = {domain: (None, None) for domain in self._frozenColourRanges}
+            self.ui.freezeColor = freeze
         if "unitMode" in payload and payload["unitMode"] is not None:
             self.ui.unitMode = str(payload["unitMode"])
         if "circuitOffsetPf" in payload and payload["circuitOffsetPf"] is not None:
@@ -195,8 +218,10 @@ class BackendRuntime(SensorArrayRuntime):
 
     def set_display_mode(self, mode: str) -> None:
         selected = DisplayMode(mode)
-        if selected == DisplayMode.DELTA_PERCENT and self.matrixStore.snapshot().mode != "CAP":
-            raise ValueError("Delta C/C0 is available in capacitance mode only.")
+        snapshot = self.matrixStore.snapshot()
+        has_cap_rows = any(row_mode == "CAP" for row_mode in snapshot.rowModes[: snapshot.activeRows])
+        if selected == DisplayMode.DELTA_PERCENT and not has_cap_rows:
+            raise ValueError("Delta C/C0 is available when an active row uses CAP.")
         if selected == DisplayMode.DELTA_PERCENT and self.ui.baseline is None:
             self.ui.pendingDisplayMode = DisplayMode.DELTA_PERCENT
             self.capture_baseline()
@@ -364,10 +389,19 @@ class BackendRuntime(SensorArrayRuntime):
 
     def zero_current_offsets(self, scope: str, row: int | None = None, col: int | None = None) -> dict[str, Any]:
         snapshot = self.matrixStore.snapshot()
-        if snapshot.mode != "CAP":
-            raise ValueError("Capacitance offsets are available in capacitance mode only.")
+        cap_rows = np.asarray([mode == "CAP" for mode in snapshot.rowModes], dtype=bool)
+        active_rows = np.arange(8) < int(snapshot.activeRows)
+        if not bool(np.any(cap_rows & active_rows)):
+            raise ValueError("Capacitance offsets are available when an active row uses CAP.")
         corrected = np.asarray(snapshot.matrix, dtype=np.float64)
-        valid = np.asarray(snapshot.valid, dtype=bool) & np.isfinite(corrected)
+        valid = (
+            np.asarray(snapshot.valid, dtype=bool)
+            & np.asarray(snapshot.fresh, dtype=bool)
+            & ~np.asarray(snapshot.error, dtype=bool)
+            & np.isfinite(corrected)
+            & cap_rows.reshape(8, 1)
+            & active_rows.reshape(8, 1)
+        )
         if snapshot.seq is None:
             raise ValueError("no capacitance frame yet")
         offsets = self.user_offsets_array()
@@ -381,6 +415,8 @@ class BackendRuntime(SensorArrayRuntime):
             if row is None:
                 raise ValueError("row is required for row scope")
             row_index = _row_index(row)
+            if not cap_rows[row_index] or not active_rows[row_index]:
+                raise ValueError("selected row is not an active capacitance row")
             mask = valid[row_index, :]
             offsets[row_index, mask] = corrected[row_index, mask]
             changed = int(mask.sum())
@@ -388,6 +424,8 @@ class BackendRuntime(SensorArrayRuntime):
             if row is None or col is None:
                 raise ValueError("row and col are required for cell scope")
             row_index, col_index = _cell_indices(row, col)
+            if not cap_rows[row_index] or not active_rows[row_index]:
+                raise ValueError("selected cell is not in an active capacitance row")
             if not bool(valid[row_index, col_index]):
                 raise ValueError("selected cell has no valid current value")
             offsets[row_index, col_index] = corrected[row_index, col_index]
@@ -443,7 +481,7 @@ class BackendRuntime(SensorArrayRuntime):
         self.registry.reset_session()
         self.commands.reset_session(import_session_generation)
         self.telemetry.reset()
-        self.matrixStore.clear()
+        self.matrixStore.reset_session()
         imported_frames = 0
         for frame in frames:
             # Re-enter imported data through the exact current ASCII parser so
@@ -490,7 +528,7 @@ class BackendRuntime(SensorArrayRuntime):
     def setup_profile_payload(self) -> dict[str, Any]:
         snap = snapshot_payload(self)
         return {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "appVersion": APP_VERSION,
             "transport": {
                 "mode": self.selectedMode,
@@ -502,6 +540,7 @@ class BackendRuntime(SensorArrayRuntime):
             "acquisition": {
                 "rows": snap["frame"]["rows"],
                 "measurementMode": self.preferredMeasurementMode,
+                "rowModes": list(self.preferredRowModes),
             },
             "voltageRail": {
                 "measuredAvddV": self.measuredAvddV,
@@ -524,7 +563,7 @@ class BackendRuntime(SensorArrayRuntime):
 
     def apply_setup_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
         warnings: list[str] = []
-        if int(payload.get("schemaVersion", 1)) not in {1, 2}:
+        if int(payload.get("schemaVersion", 1)) not in {1, 2, 3}:
             raise ValueError("unsupported setup profile schemaVersion")
         transport = payload.get("transport") if isinstance(payload.get("transport"), dict) else {}
         serial = transport.get("serial") if isinstance(transport.get("serial"), dict) else {}
@@ -578,6 +617,17 @@ class BackendRuntime(SensorArrayRuntime):
             if requested_mode not in {"CAP", "VOLT", "RES"}:
                 raise ValueError("acquisition.measurementMode must be CAP, VOLT, or RES")
             self.preferredMeasurementMode = requested_mode
+        row_modes = acquisition.get("rowModes")
+        if row_modes is None:
+            # Schema 1/2 migration: the old global preference described every
+            # row. Do not make legacy profiles fail to open.
+            row_modes = [self.preferredMeasurementMode] * 8
+        normalized_row_modes = _normalize_row_modes(row_modes)
+        self.preferredRowModes = normalized_row_modes
+        try:
+            self.request_row_modes_api(normalized_row_modes)
+        except Exception as exc:
+            warnings.append(f"row mode preference stored but not applied to hardware: {exc}")
         voltage_rail = payload.get("voltageRail") if isinstance(payload.get("voltageRail"), dict) else {}
         if voltage_rail.get("measuredAvddV") is not None:
             self.measuredAvddV = _finite_float(voltage_rail["measuredAvddV"], "voltageRail.measuredAvddV")
@@ -689,32 +739,121 @@ class BackendRuntime(SensorArrayRuntime):
             self.ui.pendingDisplayMode = None
         return True
 
-    def color_range(self, matrix: np.ndarray, valid_mask: np.ndarray | None = None) -> tuple[float | None, float | None]:
-        if self.ui.freezeColor and self._lastColorRange != (None, None):
-            return self._lastColorRange
-        valid = np.isfinite(matrix)
-        if valid_mask is not None:
-            valid &= np.asarray(valid_mask, dtype=bool)
-        finite = matrix[valid]
-        if finite.size == 0:
-            self._lastColorRange = (None, None)
-        else:
-            minimum = float(np.nanmin(finite))
-            maximum = float(np.nanmax(finite))
-            if self.ui.displayMode == DisplayMode.DELTA_PERCENT:
-                extent = max(abs(minimum), abs(maximum), 0.5)
-                self._lastColorRange = (-extent, extent)
+    def color_range(
+        self,
+        matrix: np.ndarray,
+        valid_mask: np.ndarray | None = None,
+        domain: str | None = None,
+    ) -> tuple[float | None, float | None]:
+        """Compatibility wrapper around the authoritative domain algorithm."""
+
+        if domain is None:
+            current = self.matrixStore.snapshot()
+            if current.mode == "CAP":
+                domain = "cap_delta" if self.ui.displayMode == DisplayMode.DELTA_PERCENT else "cap_absolute"
+            elif current.mode == "VOLT":
+                domain = "voltage"
+            elif current.mode == "RES":
+                domain = "resistance"
             else:
-                span = maximum - minimum
-                if span == 0:
-                    padding = max(abs(minimum) * 0.02, 0.5)
+                domain = "cap_absolute"
+        return self._colour_range_for_domain(domain, matrix, valid_mask)
+
+    def colour_ranges(
+        self,
+        matrix_snapshot: Any,
+        display_matrix: np.ndarray,
+        usable_mask: np.ndarray,
+    ) -> dict[str, dict[str, float | bool | None]]:
+        active_rows = max(1, min(8, int(matrix_snapshot.activeRows)))
+        active_mask = np.zeros((8, 8), dtype=bool)
+        active_mask[:active_rows, :] = True
+        usable = np.asarray(usable_mask, dtype=bool).reshape(8, 8) & active_mask
+        row_modes = tuple(matrix_snapshot.rowModes)
+        output: dict[str, dict[str, float | bool | None]] = {}
+        cap_domain = "cap_delta" if self.ui.displayMode == DisplayMode.DELTA_PERCENT else "cap_absolute"
+        for mode, domain in (("CAP", cap_domain), ("VOLT", "voltage"), ("RES", "resistance")):
+            mode_mask = np.zeros((8, 8), dtype=bool)
+            for row_index in range(active_rows):
+                if row_modes[row_index] == mode:
+                    mode_mask[row_index, :] = True
+            minimum, maximum = self._colour_range_for_domain(domain, display_matrix, usable & mode_mask)
+            output[domain] = {
+                "min": minimum,
+                "max": maximum,
+                "frozen": bool(self.ui.freezeColor),
+            }
+        # Always expose all typed domains; absent domains receive a
+        # deterministic cold-start or their own previous nondegenerate range.
+        for domain in ("cap_absolute", "cap_delta", "voltage", "resistance"):
+            if domain in output:
+                continue
+            minimum, maximum = self._colour_range_for_domain(domain, np.empty(0), np.empty(0, dtype=bool))
+            output[domain] = {"min": minimum, "max": maximum, "frozen": bool(self.ui.freezeColor)}
+        return output
+
+    def _colour_range_for_domain(
+        self,
+        domain: str,
+        matrix: np.ndarray,
+        valid_mask: np.ndarray | None,
+    ) -> tuple[float, float]:
+        if domain not in self._lastColourRanges:
+            raise ValueError(f"unknown colour domain: {domain}")
+        cached = self._lastColourRanges[domain]
+        frozen = self._frozenColourRanges[domain]
+        if self.ui.freezeColor and frozen != (None, None):
+            return float(frozen[0]), float(frozen[1])
+        values = np.asarray(matrix, dtype=np.float64)
+        valid = np.isfinite(values)
+        if valid_mask is not None:
+            valid &= np.asarray(valid_mask, dtype=bool).reshape(values.shape)
+        finite = values[valid]
+        if finite.size:
+            minimum = float(np.min(finite))
+            maximum = float(np.max(finite))
+            if maximum > minimum:
+                if domain in {"cap_delta", "voltage"}:
+                    extent_minimum = 0.5 if domain == "cap_delta" else 0.001
+                    extent = max(abs(minimum), abs(maximum), extent_minimum)
+                    result = (-extent, extent)
                 else:
-                    padding = span * 0.02
-                self._lastColorRange = (minimum - padding, maximum + padding)
-        return self._lastColorRange
+                    padding = (maximum - minimum) * 0.02
+                    result = (minimum - padding, maximum + padding)
+                self._lastColourRanges[domain] = result
+                return self._remember_colour_range(domain, result)
+        if cached != (None, None):
+            result = (float(cached[0]), float(cached[1]))
+            return self._remember_colour_range(domain, result)
+        value = float(finite[0]) if finite.size else 0.0
+        if domain == "cap_delta":
+            extent = max(abs(value) * 1.05, 0.5)
+            result = (-extent, extent)
+            return self._remember_colour_range(domain, result)
+        if domain == "voltage":
+            extent = max(abs(value) * 1.05, 0.001)
+            result = (-extent, extent)
+            return self._remember_colour_range(domain, result)
+        minimum_extent = 1.0
+        if value > 0:
+            result = (0.0, max(value * 1.05, minimum_extent))
+            return self._remember_colour_range(domain, result)
+        if value < 0:
+            result = (min(value * 1.05, -minimum_extent), 0.0)
+            return self._remember_colour_range(domain, result)
+        result = (0.0, minimum_extent)
+        return self._remember_colour_range(domain, result)
+
+    def _remember_colour_range(self, domain: str, result: tuple[float, float]) -> tuple[float, float]:
+        self._resolvedColourRanges[domain] = result
+        if self.ui.freezeColor and self._frozenColourRanges[domain] == (None, None):
+            self._frozenColourRanges[domain] = result
+        return result
 
     def _measurement_mode_visual_reset(self) -> None:
-        self._lastColorRange = (None, None)
+        # Ranges are isolated by physical domain, so a mode switch cannot
+        # contaminate the next quantity and no global reset is needed.
+        return None
 
     def _correct_selection_locked(self, active_rows: int):
         from sensorarray_app.domain.selection import correct_selection
@@ -808,6 +947,22 @@ def _normalize_scope(scope: str) -> str:
     normalized = str(scope or "cell").lower()
     if normalized not in {"cell", "row", "all"}:
         raise ValueError("scope must be cell, row, or all")
+    return normalized
+
+
+def _normalize_row_modes(modes: Any) -> tuple[str, ...]:
+    aliases = {"CAPACITANCE": "CAP", "VOLTAGE": "VOLT", "RESISTANCE": "RES"}
+    if isinstance(modes, str):
+        compact = modes.strip().upper()
+        if len(compact) != 8 or not set(compact) <= {"C", "V", "R"}:
+            raise ValueError("modes must contain exactly 8 CAP, VOLT, or RES entries")
+        modes = [{"C": "CAP", "V": "VOLT", "R": "RES"}[value] for value in compact]
+    try:
+        normalized = tuple(aliases.get(str(mode).strip().upper(), str(mode).strip().upper()) for mode in modes)
+    except TypeError as exc:
+        raise ValueError("modes must contain exactly 8 CAP, VOLT, or RES entries") from exc
+    if len(normalized) != 8 or any(mode not in {"CAP", "VOLT", "RES"} for mode in normalized):
+        raise ValueError("modes must contain exactly 8 CAP, VOLT, or RES entries")
     return normalized
 
 

@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { BackendHttpClient } from "../../api/httpClient";
 import type { BackendSnapshotPayload, HistoryPayload, HistorySeries, MeasurementMode, MeasurementQuantity } from "../../api/types";
-import { appliedMeasurementMode, formatMeasurementValue, quantityForMode, quantityLabel } from "../../state/measurement";
+import { formatMeasurementValue, modeForRow, quantityForMode, quantityLabel } from "../../state/measurement";
 
 type Props = {
   client: BackendHttpClient | null;
@@ -24,7 +24,7 @@ const trendWindowOptions = [
 export function TrendGrid({ client, snapshot, history, onHistory, onError }: Props): JSX.Element {
   const [latestN, setLatestN] = useState(history?.latestN ?? 600);
   const [pending, setPending] = useState(false);
-  const appliedMode = appliedMeasurementMode(snapshot);
+  const appliedMode = modeForRow(snapshot, snapshot?.selection.rowIndex ?? 0);
   const visibleHistory = historyForMode(history, appliedMode);
   const series = visibleHistory?.series ?? [];
   const padded = [0, 1, 2, 3].map((index) => series[index] ?? { cell: "-", points: [] });
@@ -55,7 +55,7 @@ export function TrendGrid({ client, snapshot, history, onHistory, onError }: Pro
     <section className="trendPanel">
       <div className="panelHeader panelHeaderWithActions">
         <span>
-          {visibleHistory?.title ?? "S1 Primary FDC D1-D4"} · {quantityLabel(visibleHistory?.quantity ?? quantityForMode(appliedMode))}
+          {visibleHistory?.title ?? "S1 Primary FDC D1-D4"} {"\u00B7"} {quantityLabel(visibleHistory?.quantity ?? quantityForMode(appliedMode))}
         </span>
         <label className="compactField">
           <span>Trend Window</span>
@@ -131,8 +131,16 @@ function TrendChart({ series, unit, quantity }: { series: HistorySeries; unit: s
           nameTextStyle: { fontSize: 10 },
           splitLine: { show: false }
         },
-        yAxis: { type: "value", name: unit === "ohm" ? "Ω" : unit, nameTextStyle: { fontSize: 10 }, scale: true },
-        series: [{ type: "line", showSymbol: false, data: points, lineStyle: { width: 1.6, color: "#0f766e" } }]
+        yAxis: { type: "value", name: unit === "ohm" ? "\u03A9" : unit, nameTextStyle: { fontSize: 10 }, scale: true },
+        series: [
+          {
+            type: "line",
+            showSymbol: false,
+            connectNulls: false,
+            data: points,
+            lineStyle: { width: 1.6, color: "#0f766e" }
+          }
+        ]
       },
       { notMerge: true, lazyUpdate: false }
     );
@@ -143,19 +151,23 @@ function TrendChart({ series, unit, quantity }: { series: HistorySeries; unit: s
 }
 
 type TrendDatum = {
-  value: [number, number];
+  value: [number, number | null];
   seq: number;
   timeSeconds: number | null;
   cell: string;
 };
 
 export function buildTrendPoints(series: HistorySeries): TrendDatum[] {
-  const visible = series.points.filter((point) => point.value !== null && point.valid !== false && point.fresh !== false);
-  const firstTime = visible.find((point) => typeof point.timeSeconds === "number")?.timeSeconds ?? null;
-  return visible.map((point, index) => {
+  const firstTime = series.points.find((point) => typeof point.timeSeconds === "number")?.timeSeconds ?? null;
+  return series.points.map((point, index) => {
     const x = typeof point.timeSeconds === "number" && firstTime !== null ? point.timeSeconds - firstTime : index;
+    const value = point.valid !== false && point.fresh !== false && typeof point.value === "number" && Number.isFinite(point.value)
+      ? point.value
+      : null;
     return {
-      value: [x, point.value ?? Number.NaN],
+      // Null is intentional: ECharts connectNulls=false turns mode/unit
+      // changes and invalid/stale samples into a visible discontinuity.
+      value: [x, value],
       seq: point.seq,
       timeSeconds: point.timeSeconds,
       cell: series.cell

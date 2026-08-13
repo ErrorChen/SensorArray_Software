@@ -10,7 +10,7 @@ describe("TrendGrid measurement isolation", () => {
     expect(historyForMode(history, "CAP")).toBe(history);
   });
 
-  it("drops invalid and stale history points instead of plotting them as values", () => {
+  it("retains invalid, stale, and mode-mismatch points as null discontinuities", () => {
     const series: HistorySeries = {
       cell: "S1D1",
       points: [
@@ -20,7 +20,25 @@ describe("TrendGrid measurement isolation", () => {
         { seq: 4, timeSeconds: 4, value: null, valid: true, fresh: true }
       ]
     };
-    expect(buildTrendPoints(series).map((point) => point.seq)).toEqual([1]);
+    expect(buildTrendPoints(series).map((point) => point.seq)).toEqual([1, 2, 3, 4]);
+    expect(buildTrendPoints(series).map((point) => point.value[1])).toEqual([1, null, null, null]);
+  });
+
+  it("does not reconnect values across a RES to CAP history gap", () => {
+    const series: HistorySeries = {
+      cell: "S1D1",
+      points: [
+        { seq: 10, timeSeconds: 10, value: 6.2, valid: true, fresh: true },
+        // Backend emits null while this cell belongs to another row mode.
+        { seq: 11, timeSeconds: 11, value: null, valid: false, fresh: false },
+        { seq: 12, timeSeconds: 12, value: 6.4, valid: true, fresh: true }
+      ]
+    };
+    expect(buildTrendPoints(series).map((point) => point.value)).toEqual([
+      [0, 6.2],
+      [1, null],
+      [2, 6.4]
+    ]);
   });
 });
 

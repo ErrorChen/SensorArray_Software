@@ -7,7 +7,18 @@ import { _electron as electron } from "@playwright/test";
 
 let backendUrl = "";
 const serialPort = process.env.SENSORARRAY_HIL_SERIAL_PORT || "COM12";
-const minimumRunMs = Number(process.env.SENSORARRAY_HIL_RUN_MS || 30_500);
+const minimumRunMs = Number(process.env.SENSORARRAY_HIL_RUN_MS || 120_000);
+const switchingCycles = Number(process.env.SENSORARRAY_HIL_SWITCH_CYCLES || 10);
+if (!Number.isFinite(minimumRunMs) || minimumRunMs < 120_000) {
+  throw new Error(`Hardware stability evidence requires at least 120000 ms, got ${minimumRunMs}`);
+}
+if (!Number.isInteger(switchingCycles) || switchingCycles < 10) {
+  throw new Error(`Hardware switching evidence requires at least 10 cycles, got ${switchingCycles}`);
+}
+const requestedPhase = process.argv.find((argument) => argument.startsWith("--phase="))?.slice("--phase=".length) || "all";
+if (!new Set(["all", "mixed"]).has(requestedPhase)) {
+  throw new Error(`Unsupported hardware HIL phase: ${requestedPhase}`);
+}
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const desktopRoot = path.join(repoRoot, "desktop");
 const artifactRoot = path.join(repoRoot, "validation_artifacts", "hardware");
@@ -21,11 +32,18 @@ const report = {
   renderer: "local built renderer (no browser/Vite URL)",
   serialPort,
   minimumRunMs,
+  switchingCycles,
+  requestedPhase,
   headedElectron: true,
   voltage: {
-    status: "BLOCKED",
-    reason: "No AVDD/AVSS values measured by the user with a DMM in this validation run; no historical ADS rail values were used."
+    status: "NOT_RUN",
+    reason: "Firmware internal rail telemetry is authoritative; the production GUI has no AVDD/AVSS input dependency."
   },
+  rail: { status: "NOT_RUN", observations: [], errors: [] },
+  battery: { status: "NOT_RUN", observations: [], errors: [] },
+  stability: { status: "NOT_RUN", observations: [], errors: [] },
+  switching: { status: "NOT_RUN", observations: [], errors: [] },
+  mixed: { status: "NOT_RUN", observations: [], errors: [] },
   serial: { status: "NOT_RUN", observations: [], errors: [] },
   ble: { status: "NOT_RUN", observations: [], errors: [] },
   wifi: { status: "NOT_RUN", observations: [], errors: [] },
@@ -57,9 +75,13 @@ page.on("pageerror", (error) => report.electron.pageErrors.push(error.message));
 
 try {
   await openGui(page);
-  await runSerialAcceptance(page);
+  if (requestedPhase === "all") {
+    await runSerialAcceptance(page);
+  }
   await runBleAcceptance(page);
-  await runWifiSmoke(page);
+  if (requestedPhase === "all") {
+    await runWifiSmoke(page);
+  }
 } catch (error) {
   report.fatalError = errorText(error);
 } finally {
@@ -68,7 +90,8 @@ try {
   if (finalStatus) {
     report.finalSnapshot = compactSnapshot(finalStatus);
   }
-  writeFileSync(path.join(artifactRoot, "hardware_gui_hil.json"), JSON.stringify(report, null, 2), "utf8");
+  const reportName = requestedPhase === "all" ? "hardware_gui_hil.json" : `hardware_gui_hil_${requestedPhase}.json`;
+  writeFileSync(path.join(artifactRoot, reportName), JSON.stringify(report, null, 2), "utf8");
   await electronApp.close();
 }
 
@@ -143,7 +166,11 @@ async function runSerialAcceptance(currentPage) {
       "serial connection"
     );
     const firstGeneration = snapshot.connection.generation;
-    snapshot = await waitForSnapshot(currentPage, isCompleteFreshCap, 40_000, "complete fresh CAP frame after serial attach");
+    snapshot = await waitForSnapshot(currentPage, isCompleteFreshCapAnyRows, 40_000, "complete fresh CAP frame after serial attach");
+    if (snapshot.frame.rows !== 8) {
+      await selectRows(currentPage, 8);
+      snapshot = await waitForSnapshot(currentPage, isCompleteFreshCap, 30_000, "ROWS=8 CAP setup for serial HIL");
+    }
     result.observations.push({ action: "connected", snapshot: compactSnapshot(snapshot), cellHealth: cellHealth(snapshot) });
     result.observations.push(await exerciseCellInspection(currentPage, "CAP", 0, 4));
     await screenshot(currentPage, "HIL_S01_serial_cap_initial.png");
@@ -151,7 +178,7 @@ async function runSerialAcceptance(currentPage) {
     result.observations.push(await observeSustainedRun(currentPage, "serial CAP initial", minimumRunMs, isCompleteFreshCap));
     result.observations.push(await exerciseRawLogAndStatus(currentPage, "serial"));
 
-    for (const rows of [1, 2, 4, 8]) {
+    for (const rows of [1, 2, 3, 4, 5, 6, 7, 8]) {
       await selectRows(currentPage, rows);
       let rowSnapshot = await waitForSnapshot(
         currentPage,
@@ -173,7 +200,7 @@ async function runSerialAcceptance(currentPage) {
       const commandState = rowSnapshot.commands || {};
       result.observations.push({ action: "rows", rows, snapshot: compactSnapshot(rowSnapshot), cellHealth: cellHealth(rowSnapshot), commands: commandState });
     }
-    await screenshot(currentPage, "HIL_S02_serial_rows_1_2_4_8.png");
+    await screenshot(currentPage, "HIL_S02_serial_rows_1_through_8.png");
 
     const modeQuery = await sendGuiCommand(currentPage, "MODE?", "MODE");
     const stateQuery = await sendGuiCommand(currentPage, "STATE?", "MODE");
@@ -237,9 +264,7 @@ async function runSerialAcceptance(currentPage) {
     const crcDelta = numeric(diagnosticsAfter.crcFailures) - numeric(diagnosticsBefore.crcFailures);
     const parserRejectDelta = numeric(diagnosticsAfter.parserRejects) - numeric(diagnosticsBefore.parserRejects);
     result.observations.push({ action: "diagnostics", crcDelta, parserRejectDelta, before: diagnosticsBefore, after: diagnosticsAfter });
-    if (crcDelta !== 0) {
-      throw new Error(`Serial produced ${crcDelta} CRC failure(s)`);
-    }
+    result.observations.push(assertNoParserCorruption(diagnosticsBefore, diagnosticsAfter, "Serial acceptance"));
     if (report.electron.consoleErrors.length || report.electron.pageErrors.length) {
       throw new Error(`GUI errors observed: ${JSON.stringify(report.electron)}`);
     }
@@ -258,6 +283,8 @@ async function runSerialAcceptance(currentPage) {
 
 async function runBleAcceptance(currentPage) {
   const result = report.ble;
+  let stabilityAttempted = false;
+  let voltageAttempted = false;
   try {
     await clickTransport(currentPage, "Bluetooth LE");
     const scanStartedAt = Date.now();
@@ -294,11 +321,28 @@ async function runBleAcceptance(currentPage) {
       "BLE streaming"
     );
     const firstGeneration = connected.connection.generation;
-    const initialCap = await waitForSnapshot(currentPage, isCompleteFreshCap, 45_000, "BLE complete fresh CAP frame");
+    let initialCap = await waitForSnapshot(currentPage, isCompleteFreshCapAnyRows, 45_000, "BLE complete fresh CAP frame");
+    if (initialCap.frame.rows !== 8) {
+      await selectRows(currentPage, 8);
+      initialCap = await waitForSnapshot(currentPage, isCompleteFreshCap, 30_000, "ROWS=8 CAP setup for BLE HIL");
+    }
     result.observations.push({ action: "connected", snapshot: compactSnapshot(initialCap), cellHealth: cellHealth(initialCap), gatt: recentLogs(initialCap, ["Transport"], 8) });
     result.observations.push(await exerciseCellInspection(currentPage, "CAP", 0, 4));
     await screenshot(currentPage, "HIL_B02_ble_cap.png");
-    result.observations.push(await observeSustainedRun(currentPage, "BLE CAP", minimumRunMs, isCompleteFreshCap));
+    if (requestedPhase === "mixed") {
+      result.observations.push({ action: "phase", phase: "mixed", note: "CAP attach is only the prerequisite for an independent mixed/profile HIL run." });
+      await runMixedAcceptance(currentPage, result);
+      const finalMixedPhase = await backendStatus(currentPage);
+      result.observations.push(
+        assertNoParserCorruption(initialCap.diagnostics, finalMixedPhase.diagnostics, "BLE mixed phase")
+      );
+      result.status = "PASS";
+      return;
+    }
+    stabilityAttempted = true;
+    const capStability = await observeSustainedRun(currentPage, "BLE CAP", minimumRunMs, isCompleteFreshCap);
+    result.observations.push(capStability);
+    report.stability.observations.push(capStability);
     result.observations.push(await exerciseRawLogAndStatus(currentPage, "ble"));
 
     const stateResponse = await sendGuiCommand(currentPage, "STATE?", "MODE");
@@ -316,45 +360,42 @@ async function runBleAcceptance(currentPage) {
     }
     await screenshot(currentPage, "HIL_B03_ble_rows.png");
 
-    const resRequestStart = Date.now();
-    const dropsBefore = numeric((await backendStatus(currentPage)).diagnostics.wrongModeDrops);
-    await currentPage.getByTestId("measurement-mode-control").getByRole("button", { name: "RES", exact: true }).click();
-    const pendingOrTimeout = await waitForSnapshot(
-      currentPage,
-      (candidate) => ["accepted", "timeout", "error"].includes(candidate.measurement.transitionState),
-      15_000,
-      "BLE mode transaction response"
-    );
-    await screenshot(currentPage, "HIL_B04_ble_res_pending.png");
-    await wait(minimumRunMs);
-    const afterResRun = await backendStatus(currentPage);
-    const modeReplies = logsSince(afterResRun, resRequestStart, ["MACK", "MAPP", "MODE", "FRAME_DROP", "BLE_RX50", "BLE_FRAG50", "PROTO50"]);
-    result.observations.push({
-      action: "bleResAttempt",
-      initialTransition: compactSnapshot(pendingOrTimeout),
-      afterMinimumRun: compactSnapshot(afterResRun),
-      wrongModeDropDelta: numeric(afterResRun.diagnostics.wrongModeDrops) - dropsBefore,
-      relevantLogs: modeReplies
-    });
+    // The current firmware contract publishes MACK over FF11 (ctrl) and the
+    // terminal MAPP over FF30 (log). Data frames never complete a transaction.
+    const resTransition = await setGlobalMode(currentPage, "RES");
+    result.observations.push(resTransition);
+    await screenshot(currentPage, "HIL_B04_ble_res_applied.png");
+    const resStability = await observeSustainedRun(currentPage, "BLE RES", minimumRunMs, (candidate) => isCompleteFreshMode(candidate, "RES"));
+    result.observations.push(resStability);
+    report.stability.observations.push(resStability);
 
-    // Pure BLE currently receives MACK over FF11 but firmware emits the
-    // asynchronous MAPP terminal event only on Serial stdout. Strict host
-    // semantics therefore keep RES pending/timeout and reject R frames. This
-    // is recorded as a real cross-repository blocker, never as a GUI PASS.
-    const mappSeen = modeReplies.some((row) => row.tag === "MAPP");
-    if (!mappSeen || afterResRun.measurement.appliedMode !== "RES") {
-      result.status = "BLOCKED";
-      result.errors.push("BLE CAP/data/control worked, but strict RES GUI acceptance is blocked because no matching MAPP terminal event arrived on FF11/FF30.");
-    }
-
-    // Restore physical firmware to CAP through FF10. The UI may retain a
-    // timeout because the matching MAPP is likewise unavailable on pure BLE.
-    await currentPage.getByTestId("measurement-mode-control").getByRole("button", { name: "CAP", exact: true }).click();
-    await waitForSnapshot(currentPage, (candidate) => candidate.matrix.quantity === "capacitance" && candidate.frame.rows === 8, 40_000, "BLE physical CAP return");
-    const capState = await sendGuiCommand(currentPage, "STATE?", "MODE");
-    result.observations.push({ action: "bleCapReturn", stateResponse: capState, snapshot: compactSnapshot(await backendStatus(currentPage)) });
+    const capReturn = await setGlobalMode(currentPage, "CAP");
+    result.observations.push(capReturn);
     await screenshot(currentPage, "HIL_B05_ble_cap_return.png");
-    result.observations.push(await observeSustainedRun(currentPage, "BLE CAP return", minimumRunMs, isCompleteFreshCap));
+
+    voltageAttempted = true;
+    const voltTransition = await setGlobalMode(currentPage, "VOLT");
+    result.observations.push(voltTransition);
+    const voltSnapshot = await backendStatus(currentPage);
+    if (await currentPage.getByLabel("Measured AVDD to GND").count() || await currentPage.getByLabel("Measured AVSS to GND").count()) {
+      throw new Error("Production GUI still exposed AVDD/AVSS inputs during BLE VOLT acceptance");
+    }
+    const rail = voltSnapshot.measurement?.railTelemetry;
+    if (!rail?.valid || rail.fresh !== true || typeof rail.railSpanUv !== "number" || rail.source !== "internal_monitor") {
+      report.rail.status = "FAIL";
+      report.rail.errors.push(`Internal read-only rail telemetry unavailable in VOLT: ${JSON.stringify(rail)}`);
+      throw new Error(report.rail.errors.at(-1));
+    }
+    report.rail.status = "PASS";
+    report.rail.observations.push({ snapshot: rail, avddInputs: 0, avssInputs: 0 });
+    await screenshot(currentPage, "HIL_B06_ble_volt_rail_readonly.png");
+    const voltStability = await observeSustainedRun(currentPage, "BLE VOLT", minimumRunMs, (candidate) => isCompleteFreshMode(candidate, "VOLT"));
+    result.observations.push(voltStability);
+    report.stability.observations.push(voltStability);
+    report.voltage.status = "PASS";
+
+    await runMixedAcceptance(currentPage, result);
+    report.stability.status = "PASS";
 
     await currentPage.getByRole("button", { name: "Disconnect", exact: true }).click();
     await waitForSnapshot(currentPage, (candidate) => candidate.connection.state === "disconnected", 20_000, "BLE disconnect");
@@ -368,6 +409,9 @@ async function runBleAcceptance(currentPage) {
     const reconnectedCap = await waitForSnapshot(currentPage, isCompleteFreshCap, 45_000, "BLE CAP after reconnect");
     await wait(5_000);
     const finalBle = await backendStatus(currentPage);
+    result.observations.push(
+      assertNoParserCorruption(initialCap.diagnostics, finalBle.diagnostics, "BLE full acceptance")
+    );
     result.observations.push({
       action: "reconnect",
       firstGeneration,
@@ -382,12 +426,96 @@ async function runBleAcceptance(currentPage) {
       result.status = "PASS";
     }
   } catch (error) {
+    if (voltageAttempted && report.voltage.status !== "PASS") {
+      report.voltage.status = "FAIL";
+      report.voltage.reason = `VOLT/internal-monitor acceptance did not complete: ${errorText(error)}`;
+    }
+    if (voltageAttempted && report.rail.status === "NOT_RUN") {
+      report.rail.status = "FAIL";
+      report.rail.errors.push(`Internal rail acceptance did not complete after MODE=VOLT was attempted: ${errorText(error)}`);
+    }
+    if (report.stability.status === "NOT_RUN" && stabilityAttempted) {
+      report.stability.status = "FAIL";
+      report.stability.errors.push(
+        `${report.stability.observations.length ? "Only part of" : "The first state in"} the required BLE stability matrix completed: ${errorText(error)}`
+      );
+    }
     result.status = result.observations.length ? "FAIL" : "BLOCKED";
     result.errors.push(errorText(error));
     result.failureEvidence = await collectFailureEvidence(currentPage, "ble", error);
     await screenshot(currentPage, "HIL_B99_ble_failure.png");
   } finally {
     await disconnectIfConnected(currentPage);
+  }
+}
+
+async function runMixedAcceptance(currentPage, result) {
+  let mixedCoreComplete = false;
+  let mixedStabilityStarted = false;
+  let switchingStarted = false;
+  let batteryEvaluated = false;
+  const switchResults = [];
+  try {
+    const mixedTransition = await applyRowProfile(currentPage, "RVVCCVVR");
+    result.observations.push(mixedTransition);
+    report.mixed.observations.push(mixedTransition);
+    await screenshot(currentPage, "HIL_B07_ble_mixed_rvvccvvr.png");
+    mixedStabilityStarted = true;
+    const mixedStability = await observeSustainedRun(
+      currentPage,
+      "BLE mixed RVVCCVVR",
+      minimumRunMs,
+      (candidate) => isCompleteFreshMixed(candidate, "RVVCCVVR")
+    );
+    result.observations.push(mixedStability);
+    report.mixed.observations.push(mixedStability);
+    report.stability.observations.push(mixedStability);
+    // The long-run gate is independent from the subsequent transaction stress.
+    // Preserve completed 120-second evidence if a later profile switch fails.
+    report.stability.status = "PASS";
+
+    const secondMixed = await applyRowProfile(currentPage, "CRVCRVCR");
+    result.observations.push(secondMixed);
+    report.mixed.observations.push(secondMixed);
+    await screenshot(currentPage, "HIL_B08_ble_mixed_crvcrvcr.png");
+    mixedCoreComplete = true;
+    report.mixed.status = "PASS";
+
+    switchingStarted = true;
+    for (let cycle = 1; cycle <= switchingCycles; cycle += 1) {
+      for (const mode of ["CAP", "RES", "CAP", "VOLT", "CAP"]) {
+        switchResults.push({ cycle, ...(await setGlobalMode(currentPage, mode)) });
+      }
+      // The required global sequence ends at CAP. Move to RES so the first
+      // CCCCCCCC profile is a real GUI Apply, not an unchanged disabled draft.
+      switchResults.push({ cycle, precondition: "rowProfileStress", ...(await setGlobalMode(currentPage, "RES")) });
+      for (const profile of ["CCCCCCCC", "RVVCCVVR", "VVVVVVVV", "CRVCRVCR", "RRRRRRRR"]) {
+        switchResults.push({ cycle, ...(await applyRowProfile(currentPage, profile)) });
+      }
+    }
+    report.switching.status = "PASS";
+    report.switching.observations = switchResults;
+    result.observations.push({ action: "switchingStress", cycles: switchingCycles, transactions: switchResults.length });
+    await evaluateBatteryLastGood(currentPage);
+    batteryEvaluated = true;
+  } catch (error) {
+    if (mixedStabilityStarted && report.stability.status !== "PASS") {
+      report.stability.status = "FAIL";
+      report.stability.errors.push(errorText(error));
+    }
+    if (!mixedCoreComplete) {
+      report.mixed.status = report.mixed.observations.length ? "FAIL" : "BLOCKED";
+      report.mixed.errors.push(errorText(error));
+    }
+    if (switchingStarted) {
+      report.switching.status = "FAIL";
+      report.switching.observations = switchResults;
+      report.switching.errors.push(errorText(error));
+    }
+    if (!batteryEvaluated && report.battery.status === "NOT_RUN") {
+      report.battery.errors.push("Battery last-good acceptance was not reached because an earlier mixed/switching gate failed.");
+    }
+    throw error;
   }
 }
 
@@ -426,6 +554,118 @@ async function clickTransport(currentPage, accessibleName) {
 async function selectRows(currentPage, rows) {
   const group = currentPage.locator(".controlGroup").filter({ has: currentPage.locator(".panelHeader", { hasText: "Rows" }) });
   await group.locator("select").selectOption(String(rows));
+}
+
+async function setGlobalMode(currentPage, mode) {
+  const startedAt = Date.now();
+  await currentPage.getByTestId("measurement-mode-control").getByRole("button", { name: mode, exact: true }).click();
+  const snapshot = await waitForSnapshot(
+    currentPage,
+    (candidate) => isCompleteFreshMode(candidate, mode),
+    45_000,
+    `BLE ${mode} MAPP and complete fresh frame`
+  );
+  const logs = logsSince(snapshot, startedAt, ["MACK", "MAPP"]);
+  const accepted = logs.find((row) => row.tag === "MACK");
+  const applied = logs.find((row) => row.tag === "MAPP");
+  if (!accepted || !applied || accepted.channel !== "ctrl" || applied.channel !== "log") {
+    throw new Error(`BLE ${mode} requires FF11/ctrl MACK and FF30/log MAPP: ${JSON.stringify(logs)}`);
+  }
+  if (accepted.parsedFields?.new !== mode || applied.parsedFields?.new !== mode) {
+    throw new Error(`BLE ${mode} MACK/MAPP payload mismatch: ${JSON.stringify(logs)}`);
+  }
+  const identity = {
+    generation: snapshot.measurement?.generation,
+    requestId: snapshot.measurement?.requestId,
+    frameSeq: snapshot.measurement?.frameSeq
+  };
+  if (mode !== "CAP") {
+    // V/R headers carry MODE gen/rid. Legacy C/D/K carries the independent
+    // ROWS identity, so CAP proves MAPP only through its sequence boundary.
+    identity.dataGeneration = snapshot.frame?.generation;
+    identity.dataRequestId = snapshot.frame?.requestId;
+  }
+  assertAppliedIdentity(snapshot, accepted, applied, identity, `MODE=${mode}`);
+  return { action: "globalMode", mode, accepted, applied, snapshot: compactSnapshot(snapshot) };
+}
+
+async function applyRowProfile(currentPage, profile) {
+  const modes = [...profile].map((mode) => mode === "C" ? "CAP" : mode === "V" ? "VOLT" : "RES");
+  const control = currentPage.getByTestId("row-mode-profile-control");
+  const startedAt = Date.now();
+  for (let row = 0; row < 8; row += 1) {
+    await control.getByLabel(`S${row + 1} measurement mode`).selectOption(modes[row]);
+  }
+  await control.getByRole("button", { name: "Apply row modes", exact: true }).click();
+  const snapshot = await waitForSnapshot(
+    currentPage,
+    (candidate) =>
+      candidate.frame.layout === (new Set(modes).size > 1 ? "MIXED" : "HOMOGENEOUS") &&
+      candidate.measurement?.rowProfile?.pendingModes === null &&
+      candidate.measurement?.rowProfile?.appliedModes?.join("") === modes.join("") &&
+      activeCellsFresh(candidate) === candidate.frame.rows * 8,
+    45_000,
+    `BLE ROWMODES=${profile} RMAPP and fresh frame`
+  );
+  const logs = logsSince(snapshot, startedAt, ["RMACK", "RMAPP"]);
+  const accepted = logs.find((row) => row.tag === "RMACK");
+  const applied = logs.find((row) => row.tag === "RMAPP");
+  if (!accepted || !applied || accepted.channel !== "ctrl" || applied.channel !== "log") {
+    throw new Error(`BLE ${profile} requires FF11/ctrl RMACK and FF30/log RMAPP: ${JSON.stringify(logs)}`);
+  }
+  if (accepted.parsedFields?.new !== profile || applied.parsedFields?.profile !== profile) {
+    throw new Error(`BLE ${profile} RMACK/RMAPP payload mismatch: ${JSON.stringify(logs)}`);
+  }
+  assertAppliedIdentity(snapshot, accepted, applied, {
+    generation: snapshot.measurement?.rowProfile?.generation,
+    requestId: snapshot.measurement?.rowProfile?.requestId,
+    frameSeq: snapshot.measurement?.rowProfile?.frameSeq,
+    dataGeneration: snapshot.frame?.profileGeneration,
+    dataRequestId: snapshot.frame?.profileRequestId
+  }, `ROWMODES=${profile}`);
+  return { action: "rowProfile", profile, accepted, applied, snapshot: compactSnapshot(snapshot) };
+}
+
+async function evaluateBatteryLastGood(currentPage) {
+  let snapshot;
+  try {
+    snapshot = await waitForSnapshot(
+      currentPage,
+      (candidate) =>
+        candidate.battery?.latestAttempt?.valid === true &&
+        candidate.battery?.latestAttempt?.fresh === true &&
+        typeof candidate.battery?.lastGood?.batteryMv === "number",
+      30_000,
+      "BLE first valid battery last-good"
+    );
+  } catch (error) {
+    report.battery.status = "BLOCKED";
+    report.battery.errors.push(`No valid battery telemetry observed: ${errorText(error)}`);
+    return;
+  }
+  const firstMv = snapshot.battery.lastGood.batteryMv;
+  report.battery.observations.push({ action: "firstValid", battery: snapshot.battery });
+  try {
+    const invalid = await waitForSnapshot(
+      currentPage,
+      (candidate) => candidate.battery?.latestAttempt?.valid === false,
+      30_000,
+      "BLE invalid/stale battery attempt"
+    );
+    if (invalid.battery?.lastGood?.batteryMv !== firstMv) {
+      throw new Error(`Battery last-good changed after invalid attempt: ${firstMv} -> ${invalid.battery?.lastGood?.batteryMv}`);
+    }
+    const statusText = (await currentPage.locator(".statusItems").textContent()) || "";
+    if (!statusText.includes((firstMv / 1000).toFixed(3)) || !statusText.includes("last known")) {
+      throw new Error(`StatusBar did not retain last-good battery: ${statusText}`);
+    }
+    report.battery.status = "PASS";
+    report.battery.observations.push({ action: "invalidSticky", battery: invalid.battery, statusText });
+    await screenshot(currentPage, "HIL_B09_battery_stale.png");
+  } catch (error) {
+    report.battery.status = "BLOCKED";
+    report.battery.errors.push(`Valid battery observed, but no later invalid attempt arrived in the bounded run: ${errorText(error)}`);
+  }
 }
 
 async function sendGuiCommand(currentPage, command, expectedTag) {
@@ -514,14 +754,15 @@ async function exerciseCellInspection(currentPage, mode, row, col) {
     throw new Error(`Cannot inspect ${mode} cell because the heatmap has no visible bounding box`);
   }
   const gridWidth = box.width - 64 - 28;
-  const gridHeight = box.height - 28 - 52;
+  const snapshot = await backendStatus(currentPage);
+  const gridHeight = box.height - 28 - 72;
   const x = box.x + 64 + ((col + 0.5) * gridWidth) / 8;
-  const y = box.y + 28 + ((row + 0.5) * gridHeight) / 8;
+  const y = box.y + 28 + ((row + 0.5) * gridHeight) / Math.max(1, Math.min(8, snapshot.frame.rows));
   const cell = `S${row + 1}D${col + 1}`;
   await currentPage.mouse.move(x, y);
   await poll(async () => {
     const bodyText = (await currentPage.locator("body").textContent()) || "";
-    const modeSpecificText = mode === "RES" ? "Raw integer mΩ" : "Raw pF";
+    const modeSpecificText = mode === "RES" ? "Raw integer m\u03A9" : mode === "VOLT" ? "Raw integer \u00B5V" : "Raw pF";
     return bodyText.includes(cell) && bodyText.includes(`Mode: ${mode}`) && bodyText.includes(modeSpecificText);
   }, 5_000, `${mode} ${cell} tooltip`);
   await currentPage.mouse.click(x, y);
@@ -627,6 +868,7 @@ async function observeSustainedRun(currentPage, label, durationMs, predicate) {
   let minimumValid = activeCellsValid(first);
   let minimumFresh = activeCellsFresh(first);
   let last = first;
+  const memorySamples = [await rendererMemorySample()];
   while (Date.now() - started < durationMs) {
     await wait(Math.min(1_000, durationMs - (Date.now() - started)));
     last = await backendStatus(currentPage);
@@ -637,9 +879,31 @@ async function observeSustainedRun(currentPage, label, durationMs, predicate) {
     sequences.add(last.frame.seq);
     minimumValid = Math.min(minimumValid, activeCellsValid(last));
     minimumFresh = Math.min(minimumFresh, activeCellsFresh(last));
+    memorySamples.push(await rendererMemorySample());
   }
   if (last.frame.revision <= first.frame.revision || sequences.size < 2) {
     throw new Error(`${label} did not continuously update frames`);
+  }
+  const parserEvidence = assertNoParserCorruption(first.diagnostics, last.diagnostics, label);
+  const validMemory = memorySamples.filter(
+    (sample) => sample !== null && Number.isFinite(Number(sample.workingSetSize))
+  );
+  if (validMemory.length < 2) {
+    throw new Error(`${label} could not obtain two renderer working-set samples`);
+  }
+  const memoryEvidence = validMemory.length
+    ? {
+        startWorkingSetKb: validMemory[0].workingSetSize,
+        endWorkingSetKb: validMemory.at(-1).workingSetSize,
+        maximumWorkingSetKb: Math.max(...validMemory.map((sample) => sample.workingSetSize)),
+        growthKb: validMemory.at(-1).workingSetSize - validMemory[0].workingSetSize,
+        samples: validMemory.length
+      }
+    : { unavailable: true };
+  // A 256 MiB increase over one two-minute window is conservative enough to
+  // tolerate ECharts/V8 warm-up while still detecting obvious runaway churn.
+  if (!("unavailable" in memoryEvidence) && memoryEvidence.growthKb > 256 * 1024) {
+    throw new Error(`${label} renderer working-set growth was unbounded: ${JSON.stringify(memoryEvidence)}`);
   }
   return {
     action: "sustainedRun",
@@ -655,15 +919,79 @@ async function observeSustainedRun(currentPage, label, durationMs, predicate) {
     observedSequenceCount: sequences.size,
     minimumValid,
     minimumFresh,
+    memoryEvidence,
+    parserEvidence,
     startDiagnostics: first.diagnostics,
     endDiagnostics: last.diagnostics
   };
+}
+
+async function rendererMemorySample() {
+  try {
+    return await electronApp.evaluate(async ({ app, BrowserWindow }) => {
+      const rendererPid = BrowserWindow.getAllWindows()[0]?.webContents.getOSProcessId();
+      if (!rendererPid) {
+        return null;
+      }
+      return app.getAppMetrics().find((metric) => metric.pid === rendererPid)?.memory ?? null;
+    });
+  } catch {
+    return null;
+  }
 }
 
 function isCompleteFreshCap(snapshot) {
   return (
     snapshot.connection.mode === "serial" || snapshot.connection.mode === "ble"
   ) && ["connected", "streaming"].includes(snapshot.connection.state) && snapshot.measurement.appliedMode === "CAP" && snapshot.matrix.quantity === "capacitance" && snapshot.frame.rows === 8 && snapshot.frame.valid && activeCellsValid(snapshot) === 64 && activeCellsFresh(snapshot) === 64;
+}
+
+function isCompleteFreshCapAnyRows(snapshot) {
+  const active = Math.max(1, Math.min(8, Number(snapshot.frame?.rows) || 0)) * 8;
+  return (
+    ["serial", "ble"].includes(snapshot.connection.mode) &&
+    ["connected", "streaming"].includes(snapshot.connection.state) &&
+    snapshot.measurement.appliedMode === "CAP" &&
+    snapshot.matrix.quantity === "capacitance" &&
+    snapshot.frame.valid &&
+    activeCellsValid(snapshot) === active &&
+    activeCellsFresh(snapshot) === active
+  );
+}
+
+function isCompleteFreshMode(snapshot, mode) {
+  const quantity = mode === "CAP" ? "capacitance" : mode === "VOLT" ? "voltage" : "resistance";
+  // A fresh frame can legitimately contain per-cell measurement errors (for
+  // example, an open RES channel).  Transaction/stability acceptance therefore
+  // requires every active cell to have been attempted freshly, while cellHealth
+  // records valid/error counts separately instead of misreporting a completed
+  // MAPP as a timeout.
+  return (
+    ["serial", "ble"].includes(snapshot.connection.mode) &&
+    ["connected", "streaming"].includes(snapshot.connection.state) &&
+    snapshot.measurement.appliedMode === mode &&
+    snapshot.measurement.pendingMode === null &&
+    snapshot.matrix.quantity === quantity &&
+    snapshot.frame.valid &&
+    activeCellsFresh(snapshot) === snapshot.frame.rows * 8
+  );
+}
+
+function isCompleteFreshMixed(snapshot, profile) {
+  const modes = [...profile].map((mode) => mode === "C" ? "CAP" : mode === "V" ? "VOLT" : "RES");
+  // Mixed frames use the same attempted-vs-valid distinction as homogeneous
+  // V/R frames.  CRC/profile/identity checks are covered by frame.valid and the
+  // authoritative profile metadata; invalid cells remain explicit diagnostics.
+  return (
+    snapshot.connection.mode === "ble" &&
+    ["connected", "streaming"].includes(snapshot.connection.state) &&
+    snapshot.frame.layout === "MIXED" &&
+    snapshot.frame.rowModes?.join("") === modes.join("") &&
+    snapshot.measurement?.rowProfile?.pendingModes === null &&
+    snapshot.measurement?.rowProfile?.appliedModes?.join("") === modes.join("") &&
+    snapshot.frame.valid &&
+    activeCellsFresh(snapshot) === snapshot.frame.rows * 8
+  );
 }
 
 function activeCellsValid(snapshot) {
@@ -711,6 +1039,71 @@ function logsSince(snapshot, timeMs, tags) {
   return (snapshot.logs.rows || [])
     .filter((row) => row.timestamp >= sinceSeconds && tags.includes(row.tag))
     .map(compactLog);
+}
+
+function assertAppliedIdentity(snapshot, accepted, applied, identity, label) {
+  const acceptedId = requiredLogInteger(accepted, "id", label);
+  const appliedId = requiredLogInteger(applied, "id", label);
+  const appliedGeneration = requiredLogInteger(applied, "gen", label);
+  const appliedFrameSeq = requiredLogInteger(applied, "seq", label);
+  if (acceptedId !== appliedId) {
+    throw new Error(`${label} accepted/applied request ID mismatch: ${acceptedId} != ${appliedId}`);
+  }
+  const expected = {
+    generation: appliedGeneration,
+    requestId: appliedId,
+    frameSeq: appliedFrameSeq
+  };
+  if (Object.hasOwn(identity, "dataGeneration")) {
+    expected.dataGeneration = appliedGeneration;
+  }
+  if (Object.hasOwn(identity, "dataRequestId")) {
+    expected.dataRequestId = appliedId;
+  }
+  for (const key of Object.keys(expected)) {
+    if (Number(identity[key]) !== expected[key]) {
+      throw new Error(`${label} ${key} mismatch: ${identity[key]} != ${expected[key]}`);
+    }
+  }
+  if (Number(snapshot.frame?.seq) < appliedFrameSeq) {
+    throw new Error(`${label} visible frame sequence ${snapshot.frame?.seq} precedes RM/MAPP seq ${appliedFrameSeq}`);
+  }
+}
+
+function assertNoParserCorruption(before, after, label) {
+  const crcDelta = numeric(after?.crcFailures) - numeric(before?.crcFailures);
+  const parserRejectDelta = numeric(after?.parserRejects) - numeric(before?.parserRejects);
+  const reasonNames = new Set([
+    ...Object.keys(before?.rejectsByReason || {}),
+    ...Object.keys(after?.rejectsByReason || {})
+  ]);
+  const rejectDeltas = {};
+  for (const reason of reasonNames) {
+    const delta = numeric(after?.rejectsByReason?.[reason]) - numeric(before?.rejectsByReason?.[reason]);
+    if (delta > 0) {
+      rejectDeltas[reason] = delta;
+    }
+  }
+  // A final queued notification from the old worker may be deliberately
+  // rejected while a tested disconnect/reconnect advances sessionGeneration.
+  // That safety drop is not parser corruption; every protocol-level reject is.
+  const disallowedRejects = Object.fromEntries(
+    Object.entries(rejectDeltas).filter(([reason]) => reason !== "stale_session_generation")
+  );
+  if (crcDelta !== 0 || Object.keys(disallowedRejects).length) {
+    throw new Error(
+      `${label} parser corruption counters changed: crc=${crcDelta}, rejects=${JSON.stringify(disallowedRejects)}`
+    );
+  }
+  return { action: "parserIntegrity", label, crcDelta, parserRejectDelta, rejectDeltas, disallowedRejects };
+}
+
+function requiredLogInteger(log, field, label) {
+  const value = Number(log?.parsedFields?.[field]);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${label} log lacks non-negative integer ${field}: ${JSON.stringify(log)}`);
+  }
+  return value;
 }
 
 function recentLogs(snapshot, tags, limit) {

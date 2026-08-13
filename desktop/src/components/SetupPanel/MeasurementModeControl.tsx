@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import type { BackendHttpClient } from "../../api/httpClient";
-import type { BackendSnapshotPayload, MeasurementMode, SetupProfile } from "../../api/types";
+import type { BackendSnapshotPayload, MeasurementMode, RailTelemetry, SetupProfile } from "../../api/types";
 import { appliedMeasurementMode, isTransitionPending, transitionDescription } from "../../state/measurement";
 
 type Props = {
@@ -22,22 +22,11 @@ export type MeasurementControlView = {
   error: string;
 };
 
-export type VoltageRailInputResult =
-  | { ok: true; measuredAvddV?: number; measuredAvssV?: number }
-  | { ok: false; error: string };
-
 const modes: MeasurementMode[] = ["CAP", "VOLT", "RES"];
 
 export function MeasurementModeControl({ client, snapshot, setupProfile, onSetupProfileChange, onError }: Props): JSX.Element {
-  const [avddText, setAvddText] = useState(formatRailInput(setupProfile.voltageRail.measuredAvddV));
-  const [avssText, setAvssText] = useState(formatRailInput(setupProfile.voltageRail.measuredAvssV));
   const [requestingMode, setRequestingMode] = useState<MeasurementMode | null>(null);
   const [localError, setLocalError] = useState("");
-
-  useEffect(() => {
-    setAvddText(formatRailInput(setupProfile.voltageRail.measuredAvddV));
-    setAvssText(formatRailInput(setupProfile.voltageRail.measuredAvssV));
-  }, [setupProfile.voltageRail.measuredAvddV, setupProfile.voltageRail.measuredAvssV]);
 
   useEffect(() => {
     const measurement = snapshot?.measurement;
@@ -54,37 +43,25 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
   }, [requestingMode, snapshot?.measurement]);
 
   const view = useMemo(() => measurementControlView(snapshot, requestingMode), [requestingMode, snapshot]);
-  const rail = snapshot?.measurement?.rail;
-  const showVoltageRail = view.appliedMode !== "RES" || view.pendingMode === "VOLT" || requestingMode === "VOLT";
 
   async function requestMode(mode: MeasurementMode): Promise<void> {
     if (!client || view.busy || requestingMode) {
       return;
     }
     setLocalError("");
-    const railInput = validateVoltageRailInputs(avddText, avssText, Boolean(rail?.configured));
-    if (mode === "VOLT" && !railInput.ok) {
-      setLocalError(railInput.error);
-      onError(railInput.error);
-      return;
-    }
-
-    const nextProfile: SetupProfile = {
+    onSetupProfileChange({
       ...setupProfile,
-      acquisition: { ...setupProfile.acquisition, measurementMode: mode },
-      voltageRail:
-        mode === "VOLT" && railInput.ok && railInput.measuredAvddV !== undefined && railInput.measuredAvssV !== undefined
-          ? { measuredAvddV: railInput.measuredAvddV, measuredAvssV: railInput.measuredAvssV }
-          : setupProfile.voltageRail
-    };
-    onSetupProfileChange(nextProfile);
+      acquisition: {
+        ...setupProfile.acquisition,
+        measurementMode: mode,
+        rowModes: Array.from({ length: 8 }, () => mode)
+      }
+    });
     setRequestingMode(mode);
     try {
-      const railFields =
-        mode === "VOLT" && railInput.ok && railInput.measuredAvddV !== undefined && railInput.measuredAvssV !== undefined
-          ? { measuredAvddV: railInput.measuredAvddV, measuredAvssV: railInput.measuredAvssV }
-          : {};
-      const response = await client.setMeasurementMode({ mode, ...railFields });
+      // MODE remains the backward-compatible, atomic firmware quick action.
+      // Rail acquisition is owned by firmware and is never a prerequisite.
+      const response = await client.setMeasurementMode({ mode });
       if (response.ok === false) {
         throw new Error(response.error || `Firmware rejected ${mode} mode`);
       }
@@ -96,17 +73,6 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
     }
   }
 
-  function persistRailInputs(): void {
-    const result = validateVoltageRailInputs(avddText, avssText, false);
-    if (!result.ok || result.measuredAvddV === undefined || result.measuredAvssV === undefined) {
-      return;
-    }
-    onSetupProfileChange({
-      ...setupProfile,
-      voltageRail: { measuredAvddV: result.measuredAvddV, measuredAvssV: result.measuredAvssV }
-    });
-  }
-
   return (
     <div className="controlGroup measurementModeControl" data-testid="measurement-mode-control">
       <div className="panelHeader small">Measurement Mode</div>
@@ -115,11 +81,12 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
         <strong data-testid="measurement-applied-mode">{view.appliedMode}</strong>
         {view.pendingMode ? (
           <span className="measurementPending" data-testid="measurement-pending-mode">
-            → {view.pendingMode}
+            {"\u2192"} {view.pendingMode}
           </span>
         ) : null}
       </div>
-      <div className="measurementModeButtons" role="group" aria-label="Measurement mode">
+      <div className="modeActionLabel">Set all rows:</div>
+      <div className="measurementModeButtons" role="group" aria-label="Set all row measurement modes">
         {modes.map((mode) => (
           <button
             key={mode}
@@ -133,42 +100,38 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
         ))}
       </div>
       <div className={`measurementTransition ${view.error || localError ? "error" : ""}`} data-testid="measurement-transition-state">
-        {requestingMode ? `Requesting ${requestingMode}…` : view.status}
+        {requestingMode ? `Requesting ${requestingMode}\u2026` : view.status}
       </div>
-
-      {showVoltageRail ? (
-        <fieldset className="voltageRailFields">
-          <legend>Voltage measurement rails</legend>
-          <p>Enter externally measured rail voltages. Nominal values are never assumed.</p>
-          <label>
-            AVDD to GND (V)
-            <input
-              aria-label="Measured AVDD to GND"
-              inputMode="decimal"
-              placeholder="e.g. 3.391"
-              value={avddText}
-              onChange={(event) => setAvddText(event.target.value)}
-              onBlur={persistRailInputs}
-            />
-          </label>
-          <label>
-            AVSS to GND (V)
-            <input
-              aria-label="Measured AVSS to GND"
-              inputMode="decimal"
-              placeholder="e.g. -2.500"
-              value={avssText}
-              onChange={(event) => setAvssText(event.target.value)}
-              onBlur={persistRailInputs}
-            />
-          </label>
-          <div className="railState">
-            Firmware rail: {rail?.configured ? "configured" : "not configured"}
-            {rail?.state ? ` (${rail.state})` : ""}
-          </div>
-        </fieldset>
-      ) : null}
+      <RailTelemetryReadout telemetry={snapshot?.measurement?.railTelemetry} />
       {localError || view.error ? <div className="inlineError compactMessage">{localError || view.error}</div> : null}
+    </div>
+  );
+}
+
+export function RailTelemetryReadout({ telemetry }: { telemetry: RailTelemetry | undefined }): JSX.Element {
+  const railSpanUv = typeof telemetry?.railSpanUv === "number" && Number.isFinite(telemetry.railSpanUv)
+    ? telemetry.railSpanUv
+    : null;
+  const span = railSpanUv !== null
+    ? `${(railSpanUv / 1_000_000).toFixed(3)} V`
+    : "Rail unavailable";
+  const age = telemetryAgeSeconds(telemetry);
+  const staleReason = String(telemetry?.reason || "").toLowerCase();
+  const retainedStale = railSpanUv !== null && telemetry?.fresh === false && (
+    telemetry.valid || ["stale", "hold", "connection_stale"].includes(staleReason)
+  );
+  const state = telemetry?.fresh
+    ? "fresh"
+    : retainedStale
+      ? `stale${age === null ? "" : ` ${formatAge(age)}`}`
+      : telemetry?.reason || "unavailable";
+  return (
+    <div className="railTelemetry" data-testid="rail-telemetry">
+      <div className="railTelemetryTitle">ADS analogue rail span</div>
+      <strong>AVDD {"\u2212"} AVSS: {span}</strong>
+      {telemetry?.valid ? <span>{state}</span> : <span>{state}</span>}
+      {telemetry?.valid && telemetry.fresh && age !== null ? <span>age: {formatAge(age)}</span> : null}
+      {telemetry?.source ? <span>source: {telemetry.source.replace(/_/g, " ")}</span> : null}
     </div>
   );
 }
@@ -187,35 +150,19 @@ export function measurementControlView(
     transitionState,
     status: requestingMode ? `Requesting ${requestingMode}` : transitionDescription(snapshot),
     requestId: measurement?.requestId ?? null,
-    busy: requestingMode !== null || isTransitionPending(measurement?.transitionState),
+    busy:
+      requestingMode !== null ||
+      isTransitionPending(measurement?.transitionState) ||
+      isTransitionPending(measurement?.rowProfile?.transitionState),
     error: measurement?.transitionState === "error" || measurement?.transitionState === "timeout" ? measurement.error || transitionDescription(snapshot) : ""
   };
 }
 
-export function validateVoltageRailInputs(avddText: string, avssText: string, railAlreadyConfigured: boolean): VoltageRailInputResult {
-  const avddTrimmed = avddText.trim();
-  const avssTrimmed = avssText.trim();
-  if (!avddTrimmed && !avssTrimmed && railAlreadyConfigured) {
-    return { ok: true };
-  }
-  const measuredAvddV = Number(avddTrimmed);
-  const measuredAvssV = Number(avssTrimmed);
-  if (!avddTrimmed || !avssTrimmed || !Number.isFinite(measuredAvddV) || !Number.isFinite(measuredAvssV)) {
-    return { ok: false, error: "Voltage mode requires measured AVDD/AVSS rail configuration." };
-  }
-  if (measuredAvddV <= 0) {
-    return { ok: false, error: "Measured AVDD must be greater than 0 V." };
-  }
-  if (measuredAvssV >= 0) {
-    return { ok: false, error: "Measured AVSS must be less than 0 V." };
-  }
-  const railSpanV = measuredAvddV - measuredAvssV;
-  if (railSpanV < 3.5 || railSpanV > 6.0) {
-    return { ok: false, error: "Measured AVDD-AVSS span must be between 3.5 V and 6.0 V." };
-  }
-  return { ok: true, measuredAvddV, measuredAvssV };
+function telemetryAgeSeconds(telemetry: RailTelemetry | undefined): number | null {
+  const value = telemetry?.ageSeconds ?? telemetry?.age;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function formatRailInput(value: number | null): string {
-  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+function formatAge(seconds: number): string {
+  return seconds < 10 ? `${seconds.toFixed(1)} s` : `${Math.round(seconds)} s`;
 }

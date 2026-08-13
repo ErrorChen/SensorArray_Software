@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { createBackendSnapshot } from "../../testUtils/snapshot";
 import { defaultSetupProfile } from "../../state/setupProfile";
-import { MeasurementModeControl, measurementControlView, validateVoltageRailInputs } from "./MeasurementModeControl";
+import { MeasurementModeControl, measurementControlView } from "./MeasurementModeControl";
 
 describe("MeasurementModeControl state", () => {
   it("shows requested VOLT separately while CAP remains applied", () => {
@@ -37,28 +37,6 @@ describe("MeasurementModeControl state", () => {
     expect(view.error).toBe("MAPP timeout");
   });
 
-  it("requires measured rails for a new VOLT transition and validates their signs", () => {
-    expect(validateVoltageRailInputs("", "", false)).toEqual({
-      ok: false,
-      error: "Voltage mode requires measured AVDD/AVSS rail configuration."
-    });
-    expect(validateVoltageRailInputs("3.391", "-2.500", false)).toEqual({
-      ok: true,
-      measuredAvddV: 3.391,
-      measuredAvssV: -2.5
-    });
-    expect(validateVoltageRailInputs("-3.3", "-2.5", false)).toEqual({ ok: false, error: "Measured AVDD must be greater than 0 V." });
-    expect(validateVoltageRailInputs("3.3", "2.5", false)).toEqual({ ok: false, error: "Measured AVSS must be less than 0 V." });
-    expect(validateVoltageRailInputs("1.8", "-1.0", false)).toEqual({
-      ok: false,
-      error: "Measured AVDD-AVSS span must be between 3.5 V and 6.0 V."
-    });
-  });
-
-  it("allows firmware-configured rails to be reused without inventing host values", () => {
-    expect(validateVoltageRailInputs("", "", true)).toEqual({ ok: true });
-  });
-
   it("renders applied and pending modes as separate user-visible state", () => {
     const snapshot = createBackendSnapshot();
     snapshot.measurement.pendingMode = "VOLT";
@@ -75,12 +53,21 @@ describe("MeasurementModeControl state", () => {
     );
     expect(html).toContain("Applied mode");
     expect(html).toContain("CAP");
-    expect(html).toContain("→ VOLT");
+    expect(html).toContain("\u2192 VOLT");
     expect(html).toContain("Waiting for firmware apply (MAPP #42)");
   });
 
-  it("does not present voltage rail inputs as resistance controls", () => {
-    const snapshot = createBackendSnapshot({ mode: "RES" });
+  it("removes AVDD/AVSS inputs and presents internal rail telemetry read-only", () => {
+    const snapshot = createBackendSnapshot({ mode: "VOLT" });
+    snapshot.measurement.railTelemetry = {
+      railSpanUv: 5_126_000,
+      valid: true,
+      fresh: true,
+      age: 1.8,
+      source: "internal_monitor",
+      reason: "",
+      timestamp: 123
+    };
     const html = renderToStaticMarkup(
       createElement(MeasurementModeControl, {
         client: null,
@@ -90,7 +77,52 @@ describe("MeasurementModeControl state", () => {
         onError: () => undefined
       })
     );
-    expect(html).not.toContain("Voltage measurement rails");
+    expect(html).toContain("ADS analogue rail span");
+    expect(html).toContain("AVDD \u2212 AVSS: 5.126 V");
+    expect(html).toContain("age: 1.8 s");
+    expect(html).toContain("source: internal monitor");
     expect(html).not.toContain("Measured AVDD to GND");
+    expect(html).not.toContain("Measured AVSS to GND");
+    expect(html).not.toContain("<input");
+  });
+
+  it("keeps a retained rail span visible with stale age", () => {
+    const snapshot = createBackendSnapshot({ mode: "VOLT" });
+    snapshot.measurement.railTelemetry = {
+      railSpanUv: 5_126_000,
+      valid: false,
+      fresh: false,
+      age: 12,
+      source: "internal_monitor",
+      reason: "connection_stale",
+      timestamp: 123
+    };
+    const html = renderToStaticMarkup(createElement(MeasurementModeControl, {
+      client: null,
+      snapshot,
+      setupProfile: defaultSetupProfile("."),
+      onSetupProfileChange: () => undefined,
+      onError: () => undefined
+    }));
+    expect(html).toContain("AVDD − AVSS: 5.126 V");
+    expect(html).toContain("stale 12 s");
+  });
+
+  it("blocks global MODE while a row-profile transaction is requested or accepted", () => {
+    const snapshot = createBackendSnapshot();
+    snapshot.measurement.rowProfile!.transitionState = "accepted";
+    snapshot.measurement.rowProfile!.pendingModes = ["RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES"];
+
+    expect(measurementControlView(snapshot).busy).toBe(true);
+    const html = renderToStaticMarkup(
+      createElement(MeasurementModeControl, {
+        client: {} as never,
+        snapshot,
+        setupProfile: defaultSetupProfile("."),
+        onSetupProfileChange: () => undefined,
+        onError: () => undefined
+      })
+    );
+    expect((html.match(/disabled=""/g) ?? [])).toHaveLength(3);
   });
 });

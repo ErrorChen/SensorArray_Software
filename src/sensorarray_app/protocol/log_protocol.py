@@ -11,14 +11,16 @@ from sensorarray_app.domain.models import (
     CommandApplied,
     CommandTransactionEvent,
     LogRecord,
+    RailTelemetry,
     TransportEnvelope,
+    normalize_row_modes,
 )
 
 
 # ARL and ADS describe rail/ADC state; treating either as battery telemetry
 # used to erase the last real ABAT/AB50 reading. Only actual battery records
 # are accepted here. BATD is retained for compatibility with older firmware.
-BATTERY_TAGS = {"AB50", "ABAT", "BATD"}
+BATTERY_TAGS = {"AB50", "ABAT", "BATD", "BATERR"}
 
 # This is intentionally a superset of the current production summaries. An
 # unknown tag is still emitted as a LogRecord with recognised=False so future
@@ -31,6 +33,7 @@ KNOWN_LOG_TAGS = {
     "SF50",
     "TR50",
     "AB50",
+    "BATERR",
     "OT50",
     "BL50",
     "I2C50",
@@ -66,6 +69,9 @@ KNOWN_LOG_TAGS = {
     "MAPP",
     "MERR",
     "MFAULT",
+    "RMACK",
+    "RMAPP",
+    "RMERR",
     "RACK",
     "RERR",
     "ACK",
@@ -76,6 +82,7 @@ KNOWN_LOG_TAGS = {
     "BLE_FRAG50",
     "PROTO50",
     "LOGTRUNC",
+    "RAIL",
 }
 
 
@@ -93,13 +100,14 @@ class TextLogProtocol:
         | CommandApplied
         | CommandTransactionEvent
         | AdsDiagnosticEvent
+        | RailTelemetry
     ]:
         tag = line.split(",", maxsplit=1)[0].strip() or "UNKNOWN"
         fields = parse_key_values(line)
         recognised = tag in KNOWN_LOG_TAGS
         severity = (
             "error"
-            if tag in {"ERR", "MERR", "RERR", "MFAULT", "CMDERR"} or tag.startswith("ERROR")
+            if tag in {"ERR", "MERR", "RMERR", "RERR", "MFAULT", "CMDERR"} or tag.startswith("ERROR")
             else "warning"
             if tag.startswith("WARN")
             else "info"
@@ -124,10 +132,13 @@ class TextLogProtocol:
             | CommandApplied
             | CommandTransactionEvent
             | AdsDiagnosticEvent
+            | RailTelemetry
         ] = [record]
 
         if tag in BATTERY_TAGS:
             events.append(parse_battery_fields(fields, envelope.receivedWallTime))
+        if tag in {"ARL", "RAIL"}:
+            events.append(_rail_telemetry(fields, envelope.receivedWallTime))
 
         if tag == "RCMD":
             events.append(
@@ -223,6 +234,52 @@ class TextLogProtocol:
                     line,
                     oldValue=fields.get("old"),
                     requestedValue=fields.get("new"),
+                    error=_transaction_error(fields),
+                )
+            )
+        elif tag == "RMACK":
+            requestedProfile = _row_profile(fields.get("new") or fields.get("profile") or fields.get("requested"))
+            oldProfile = _row_profile(fields.get("old"))
+            # A malformed eight-row profile stays visible in the LogRecord,
+            # but must never advance typed command state.
+            if requestedProfile is not None:
+                events.append(
+                    _transaction(
+                        "row_modes",
+                        "accepted",
+                        fields,
+                        envelope,
+                        line,
+                        oldValue=oldProfile,
+                        requestedValue=requestedProfile,
+                    )
+                )
+        elif tag == "RMAPP":
+            appliedProfile = _row_profile(fields.get("new") or fields.get("profile") or fields.get("applied"))
+            oldProfile = _row_profile(fields.get("old"))
+            if appliedProfile is not None:
+                events.append(
+                    _transaction(
+                        "row_modes",
+                        "applied",
+                        fields,
+                        envelope,
+                        line,
+                        oldValue=oldProfile,
+                        requestedValue=appliedProfile,
+                        appliedValue=appliedProfile,
+                    )
+                )
+        elif tag == "RMERR":
+            events.append(
+                _transaction(
+                    "row_modes",
+                    "failed",
+                    fields,
+                    envelope,
+                    line,
+                    oldValue=_row_profile(fields.get("old")),
+                    requestedValue=_row_profile(fields.get("new") or fields.get("profile") or fields.get("requested")),
                     error=_transaction_error(fields),
                 )
             )
@@ -411,10 +468,48 @@ def _rail_value(fields: dict[str, str]) -> dict[str, Any]:
     }
 
 
+def _rail_telemetry(fields: dict[str, str], receivedTime: float) -> RailTelemetry:
+    state = (fields.get("rs") or fields.get("state") or "unknown").strip().lower()
+    valid = _optional_bool(fields.get("rv") or fields.get("valid"))
+    explicitFresh = _optional_bool(fields.get("fresh"))
+    if explicitFresh is not None:
+        fresh = explicitFresh
+    elif state in {"stale", "hold", "bad", "invalid", "fault", "error", "missing"}:
+        fresh = False
+    elif state in {"ok", "fresh", "valid"}:
+        fresh = valid
+    else:
+        fresh = None
+    source = (fields.get("src") or fields.get("source") or "internal_monitor").strip().lower()
+    if source in {"monitor", "internal", "ads_monitor", "internal-monitor"}:
+        source = "internal_monitor"
+    return RailTelemetry(
+        railSpanUv=_optional_int(fields.get("railSpanUv") or fields.get("spanUv") or fields.get("rail")),
+        valid=valid,
+        fresh=fresh,
+        age=_optional_int(fields.get("age")),
+        ageMs=_optional_int(fields.get("ageMs")),
+        source=source,
+        reason=fields.get("reason") or state,
+        timestamp=float(receivedTime),
+        rawFields=dict(fields),
+    )
+
+
+def _row_profile(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    try:
+        return normalize_row_modes(value)
+    except ValueError:
+        return None
+
+
 def _command_type(command: str) -> str:
     normalized = command.strip().upper()
     return {
         "MODE": "mode",
+        "ROWMODES": "row_modes",
         "ROWS": "rows",
         "ROWLIMIT": "rows",
         "SCANROWS": "rows",

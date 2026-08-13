@@ -7,6 +7,8 @@ import type {
   MeasurementModeResponse,
   OffsetResponse,
   OffsetScope,
+  RowModesRequest,
+  RowModesResponse,
   RowsResponse,
   SerialPortsResponse,
   SessionDataFormat,
@@ -36,6 +38,14 @@ export class BackendHttpClient {
 
   async setMeasurementMode(request: MeasurementModeRequest): Promise<MeasurementModeResponse> {
     return this.post<MeasurementModeResponse>("/api/measurement/mode", request);
+  }
+
+  async getRowModes(): Promise<RowModesResponse> {
+    return this.get<RowModesResponse>("/api/measurement/row-modes");
+  }
+
+  async setRowModes(request: RowModesRequest): Promise<RowModesResponse> {
+    return this.post<RowModesResponse>("/api/measurement/row-modes", request);
   }
 
   async listSerialPorts(): Promise<SerialPortsResponse> {

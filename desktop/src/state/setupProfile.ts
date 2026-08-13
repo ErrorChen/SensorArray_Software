@@ -1,6 +1,6 @@
-import type { BackendSnapshotPayload, CommandLineEnding, MeasurementMode, SetupProfile, TransportMode } from "../api/types";
+import type { BackendSnapshotPayload, CommandLineEnding, MeasurementMode, RowMeasurementMode, SetupProfile, TransportMode } from "../api/types";
 
-export const setupProfileSchemaVersion = 2;
+export const setupProfileSchemaVersion = 3;
 
 export function defaultSetupProfile(runtimeDirectory: string): SetupProfile {
   return {
@@ -13,7 +13,7 @@ export function defaultSetupProfile(runtimeDirectory: string): SetupProfile {
       ble: { address: "", deviceId: "" },
       replay: { path: "", speed: 1 }
     },
-    acquisition: { rows: 8, measurementMode: "CAP" },
+    acquisition: { rows: 8, measurementMode: "CAP", rowModes: allRows("CAP") },
     voltageRail: {
       measuredAvddV: null,
       measuredAvssV: null
@@ -48,7 +48,14 @@ export function setupProfileFromSnapshot(snapshot: BackendSnapshotPayload | null
       ble: { ...current.transport.ble },
       replay: { ...current.transport.replay }
     },
-    acquisition: { rows: snapshot.frame.rows, measurementMode: snapshot.measurement?.appliedMode ?? current.acquisition.measurementMode },
+    acquisition: {
+      rows: snapshot.frame.rows,
+      measurementMode: snapshot.measurement?.appliedMode ?? current.acquisition.measurementMode,
+      rowModes: normaliseRowModes(
+        snapshot.measurement?.rowProfile?.appliedModes ?? snapshot.frame.rowModes ?? snapshot.matrix.modeByRow,
+        current.acquisition.rowModes
+      )
+    },
     voltageRail: {
       measuredAvddV: finiteOrExisting(snapshot.measurement?.rail.measuredAvddV, current.voltageRail.measuredAvddV),
       measuredAvssV: finiteOrExisting(snapshot.measurement?.rail.measuredAvssV, current.voltageRail.measuredAvssV)
@@ -73,7 +80,12 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
     return fallback;
   }
   const payload = value as Partial<SetupProfile>;
-  if (payload.schemaVersion !== undefined && payload.schemaVersion !== 1 && payload.schemaVersion !== setupProfileSchemaVersion) {
+  if (
+    payload.schemaVersion !== undefined &&
+    payload.schemaVersion !== 1 &&
+    payload.schemaVersion !== 2 &&
+    payload.schemaVersion !== setupProfileSchemaVersion
+  ) {
     throw new Error("Unsupported setup profile schemaVersion");
   }
   const transport = objectValue<SetupProfile["transport"]>(payload.transport);
@@ -93,6 +105,7 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
   if (!defaultSaveDirectory) {
     throw new Error("paths.defaultSaveDirectory must not be empty");
   }
+  const measurementMode = normaliseMeasurementMode(acquisition.measurementMode ?? fallback.acquisition.measurementMode);
   return {
     schemaVersion: setupProfileSchemaVersion,
     appVersion: typeof payload.appVersion === "string" ? payload.appVersion : fallback.appVersion,
@@ -108,7 +121,8 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
     },
     acquisition: {
       rows,
-      measurementMode: normaliseMeasurementMode(acquisition.measurementMode ?? fallback.acquisition.measurementMode)
+      measurementMode,
+      rowModes: normaliseRowModes(acquisition.rowModes, allRows(measurementMode))
     },
     voltageRail: {
       measuredAvddV: optionalFiniteNumber(voltageRail.measuredAvddV ?? fallback.voltageRail.measuredAvddV, "voltageRail.measuredAvddV"),
@@ -178,9 +192,9 @@ function integerRange(value: unknown, min: number, max: number, name: string): n
 }
 
 function supportedRows(value: unknown): number {
-  const rows = Math.trunc(finiteNumber(value, "acquisition.rows"));
-  if (![1, 2, 4, 8].includes(rows)) {
-    throw new Error("acquisition.rows must be one of 1, 2, 4, or 8");
+  const rows = finiteNumber(value, "acquisition.rows");
+  if (!Number.isInteger(rows) || rows < 1 || rows > 8) {
+    throw new Error("acquisition.rows must be an integer from 1 through 8");
   }
   return rows;
 }
@@ -192,6 +206,26 @@ function normaliseTransportMode(value: unknown): TransportMode {
 function normaliseMeasurementMode(value: unknown): MeasurementMode {
   const mode = String(value ?? "").trim().toUpperCase();
   return mode === "VOLT" || mode === "RES" ? mode : "CAP";
+}
+
+export function normaliseRowModes(value: unknown, fallback: RowMeasurementMode[] = allRows("CAP")): RowMeasurementMode[] {
+  if (value === undefined || value === null) {
+    return [...fallback];
+  }
+  if (!Array.isArray(value) || value.length !== 8) {
+    throw new Error("acquisition.rowModes must contain exactly 8 modes");
+  }
+  return value.map((mode, index) => {
+    const normalised = String(mode ?? "").trim().toUpperCase();
+    if (normalised !== "CAP" && normalised !== "VOLT" && normalised !== "RES") {
+      throw new Error(`acquisition.rowModes[${index}] must be CAP, VOLT, or RES`);
+    }
+    return normalised;
+  });
+}
+
+function allRows(mode: RowMeasurementMode): RowMeasurementMode[] {
+  return Array.from({ length: 8 }, () => mode);
 }
 
 function optionalFiniteNumber(value: unknown, name: string): number | null {

@@ -53,6 +53,57 @@ describe("appStore helpers", () => {
     next.frame.seq = 99;
     expect(measurementMatrixIsCurrent(next, current)).toBe(false);
   });
+
+  it("uses homogeneous ROWMODES authority when global appliedMode is still different", () => {
+    const current = createBackendSnapshot({ mode: "CAP" });
+    const next = createBackendSnapshot({ mode: "VOLT" });
+    next.measurement.appliedMode = "CAP";
+    next.measurement.generation = 3;
+    next.measurement.rowProfile = {
+      appliedModes: Array.from({ length: 8 }, () => "VOLT"),
+      pendingModes: null,
+      transitionState: "applied",
+      requestId: 81,
+      generation: 12,
+      frameSeq: 200,
+      error: ""
+    };
+    next.frame.rowModes = Array.from({ length: 8 }, () => "VOLT");
+    next.frame.profileGeneration = 12;
+    next.frame.profileRequestId = 81;
+    next.frame.seq = 201;
+    next.matrix.generation = 12;
+
+    expect(measurementMatrixIsCurrent(next, current)).toBe(true);
+    next.frame.profileRequestId = 82;
+    expect(measurementMatrixIsCurrent(next, current)).toBe(false);
+  });
+
+  it("does not treat a homogeneous active prefix as a homogeneous saved profile", () => {
+    const next = createBackendSnapshot({ mode: "CAP" });
+    const profile = ["CAP", "CAP", "CAP", "CAP", "RES", "VOLT", "VOLT", "RES"] as const;
+    next.frame.rows = 4;
+    next.measurement.appliedMode = "VOLT";
+    next.measurement.rowProfile = {
+      appliedModes: [...profile],
+      pendingModes: null,
+      transitionState: "applied",
+      requestId: 91,
+      generation: 13,
+      frameSeq: 300,
+      error: ""
+    };
+    next.frame.rowModes = [...profile];
+    next.matrix.modeByRow = [...profile];
+    next.frame.profileGeneration = 13;
+    next.frame.profileRequestId = 91;
+    next.frame.seq = 301;
+
+    expect(measurementMatrixIsCurrent(next, null)).toBe(false);
+
+    next.frame.layout = "MIXED";
+    expect(measurementMatrixIsCurrent(next, null)).toBe(true);
+  });
 });
 
 describe("heatmap colour range", () => {
@@ -70,13 +121,23 @@ describe("heatmap colour range", () => {
       [0, 0, -0.1, "S1D1", true],
       [1, 0, 0.2, "S1D2", true]
     ];
-    expect(resolveColourRange(data, snapshot("%"))).toEqual([-0.5, 0.5]);
+    expect(resolveColourRange(data, snapshot("%"))).toEqual([-0.525, 0.525]);
   });
 
   it("does not override a frozen backend colour range", () => {
     const frozen = snapshot("pF");
     frozen.display.colorRange = { min: 1, max: 2, frozen: true };
     expect(resolveColourRange([[0, 0, 10, "S1D1", true]], frozen)).toEqual([1, 2]);
+  });
+
+  it("does not reuse a legacy single range when inactive saved rows make the profile mixed", () => {
+    const legacy = snapshot("pF");
+    legacy.frame.rows = 1;
+    legacy.frame.rowModes = ["CAP", "RES", "CAP", "CAP", "CAP", "CAP", "CAP", "CAP"];
+    legacy.matrix.modeByRow = [...legacy.frame.rowModes];
+    legacy.display.colourRanges = undefined;
+    legacy.display.colorRange = { min: 1, max: 2, frozen: true };
+    expect(resolveColourRange([[0, 0, 10, "S1D1", true]], legacy)).toEqual([0, 10.5]);
   });
 
 });

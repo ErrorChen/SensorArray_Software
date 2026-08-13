@@ -43,6 +43,7 @@ export function App(): JSX.Element {
   const runtimeDirectoryRef = useRef(runtimeDirectory);
   const latestSelectionRef = useRef<SelectionSnapshot | undefined>(undefined);
   const selectionRequestSeqRef = useRef(0);
+  const inactiveSelectionCorrectionRef = useRef("");
 
   useEffect(() => {
     void resolveBackendUrl()
@@ -192,6 +193,23 @@ export function App(): JSX.Element {
       }
     }
   }, []);
+
+  useEffect(() => {
+    const activeRows = Math.max(1, Math.min(8, Math.trunc(snapshot?.frame.rows ?? 8)));
+    if (!snapshot || snapshot.selection.rowIndex < activeRows) {
+      inactiveSelectionCorrectionRef.current = "";
+      return;
+    }
+    const firstDetector = snapshot.selection.detectorStart >= 1 && snapshot.selection.detectorStart <= 8
+      ? snapshot.selection.detectorStart
+      : 1;
+    const cell = `S${activeRows}D${firstDetector}`;
+    if (inactiveSelectionCorrectionRef.current === cell) {
+      return;
+    }
+    inactiveSelectionCorrectionRef.current = cell;
+    void selectCell(cell);
+  }, [selectCell, snapshot]);
 
   async function handleExportSessionData(activeClient: BackendHttpClient): Promise<void> {
     try {

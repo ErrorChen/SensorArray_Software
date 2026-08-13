@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from sensorarray_app.domain.baseline import delta_percent
-
 
 def cell_index(cell: str) -> int:
     row_text, detector_text = cell.upper().split("D", maxsplit=1)
@@ -21,27 +19,23 @@ def history_payload(runtime, latest_n: int | None = None) -> dict:
     latest = int(latest_n if latest_n is not None else getattr(runtime.ui, "trendLatestN", 600))
     current = runtime.matrixStore.snapshot()
     mode = current.mode
+    selected_row = indices[0] // 8 if indices else 0
+    if mode == "MIXED":
+        mode = current.rowModes[selected_row]
     history = runtime.matrixStore.history.slice(indices, latest_n=latest, measurement_mode=mode)
     values = history.values.copy()
     valid = history.valid.copy() & history.fresh.copy() & np.isfinite(values)
-    unit = current.unit
+    unit = current.rowUnits[selected_row] if current.layout == "MIXED" else current.unit
     if mode == "CAP":
         offsets = runtime.user_offsets_array().reshape(64)
         values = values - offsets[indices].reshape(1, len(indices))
         valid &= np.isfinite(values)
     if mode == "CAP" and runtime.ui.displayMode.value == "delta_percent" and runtime.ui.baseline is not None:
         unit = "%"
-        all_indices = runtime.matrixStore.history.ordered_indices()
-        all_indices = all_indices[runtime.matrixStore.history.modes[all_indices] == "CAP"]
-        if latest > 0:
-            all_indices = all_indices[-latest:]
-        full_values = runtime.matrixStore.history.values[all_indices, :].copy() - offsets.reshape(1, 64)
-        delta_values = np.vstack([delta_percent(row, runtime.ui.baseline) for row in full_values]) if full_values.size else full_values
-        values = delta_values[:, indices]
+        baseline_values = runtime.ui.baseline.valuesPf[indices].reshape(1, len(indices))
+        values = ((values - baseline_values) / baseline_values) * 100.0
         baseline_valid = runtime.ui.baseline.validMask[indices]
-        source_valid = runtime.matrixStore.history.valid[np.ix_(all_indices, indices)].copy()
-        source_fresh = runtime.matrixStore.history.fresh[np.ix_(all_indices, indices)].copy()
-        valid = source_valid & source_fresh & baseline_valid.reshape(1, len(indices)) & np.isfinite(values)
+        valid &= baseline_valid.reshape(1, len(indices)) & np.isfinite(values)
     series = []
     for column, cell in enumerate(cells):
         points = []
@@ -62,7 +56,7 @@ def history_payload(runtime, latest_n: int | None = None) -> dict:
         "selectionRevision": selection.selectionRevision,
         "title": selection.title if mode == "CAP" else f"{mode} {selection.rowLabel} D{selection.detectorStart}-D{selection.detectorEnd}",
         "mode": mode,
-        "quantity": current.quantity,
+        "quantity": {"CAP": "capacitance", "VOLT": "voltage", "RES": "resistance"}.get(mode, current.quantity),
         "unit": unit,
         "revision": history.revision,
         "latestN": latest,

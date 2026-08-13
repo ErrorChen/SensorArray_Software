@@ -6,6 +6,7 @@ import type { BackendSnapshotPayload, BleDevice, SerialPort, SetupProfile, Trans
 import { isCapacitanceMode } from "../../state/measurement";
 import { isBleScanDisabled } from "../../state/transportUi";
 import { MeasurementModeControl } from "./MeasurementModeControl";
+import { RowModeProfileControl } from "./RowModeProfileControl";
 
 type Props = {
   client: BackendHttpClient | null;
@@ -17,6 +18,7 @@ type Props = {
 
 const connectedStates = new Set(["connected", "streaming"]);
 const busyStates = new Set(["connecting", "disconnecting", "reconnecting"]);
+export const supportedRowOptions = Array.from({ length: 8 }, (_, index) => index + 1);
 
 export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChange, onError }: Props): JSX.Element {
   const [transportMode, setTransportMode] = useSlot<TransportMode>("serial");
@@ -414,11 +416,19 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         onError={onError}
       />
 
+      <RowModeProfileControl
+        client={client}
+        snapshot={snapshot}
+        setupProfile={setupProfile}
+        onSetupProfileChange={onSetupProfileChange}
+        onError={onError}
+      />
+
       <div className="controlGroup">
         <div className="panelHeader small">Rows</div>
         <div className="inputRow">
           <select disabled={!client || rowsPending} value={rows} onChange={(event) => void handleRowsChange(Number(event.target.value))}>
-            {[1, 2, 4, 8].map((value) => (
+            {supportedRowOptions.map((value) => (
               <option key={value} value={value}>
                 {value}
               </option>
@@ -452,7 +462,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
             <div className="baselineStatus">{baselineMessage(snapshot)}</div>
           </>
         ) : (
-          <div className="modeOnlyNotice">Baseline, Delta C/C0, and capacitance offsets are available in capacitance mode only.</div>
+          <div className="modeOnlyNotice">Baseline, Delta C/C0, and capacitance offsets are available for active CAP rows only.</div>
         )}
         <label className="checkLine">
           <input
