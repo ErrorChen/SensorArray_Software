@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 from sensorarray_app.domain.models import CommandAccepted, CommandApplied, CommandTransactionEvent
+from sensorarray_app.transport.base import TransportNotSent, TransportWriteOutcomeUnknown
 
 
 @dataclass
@@ -25,6 +26,14 @@ class CommandRecord:
     error: str = ""
     message: str = ""
     rawFields: dict[str, str] = field(default_factory=dict)
+    acceptedMessage: str = ""
+    acceptedRawFields: dict[str, str] = field(default_factory=dict)
+    terminalMessage: str = ""
+    terminalRawFields: dict[str, str] = field(default_factory=dict)
+    timeoutObserved: bool = False
+    outcomeSource: str = "wire"
+    bootId: int | None = None
+    terminalCount: int = 0
 
     @property
     def requestedRows(self) -> int | None:
@@ -46,6 +55,9 @@ class CommandService:
         self.activeRows = 8
         self.pendingRows: int | None = None
         self.rowsRequestId: int | None = None
+        self.rowsGeneration: int | None = None
+        self.rowsAppliedRequestId: int | None = None
+        self.rowsFrameSeq: int | None = None
         self.appliedMode = "CAP"
         self.pendingMode: str | None = None
         self.transitionState = "applied"
@@ -78,47 +90,66 @@ class CommandService:
             "error": "",
         }
         self.sessionGeneration = 0
+        self.connectionGeneration = 0
+        self.bootId: int | None = None
+        self.previousBootId: int | None = None
+        self.authoritativeStateKnown = False
+        self.syncState = "not_attached"
+        self.resyncRequired = False
+        self.expectedRestart = False
+        self.expectedRestartRequestId: int | None = None
+        self.expectedRestartCommandType: str | None = None
+        self.protocolWarnings: list[str] = []
+        self._syncSeen = {"mode": False, "rows": False, "row_modes": False}
 
     def reset_session(self, session_generation: int) -> None:
         self.sessionGeneration = int(session_generation)
-        # A transport generation identifies a new device session.  Firmware
-        # boots in CAP, so carrying an applied VOLT/RES state or its generation
-        # gate into the next connection would let stale UI state disagree with
-        # the newly connected device.
-        self.appliedMode = "CAP"
-        self._commands.clear()
-        self.requestedRows = None
-        self.activeRows = 8
-        self.pendingRows = None
-        self.pendingMode = None
-        self.transitionState = "applied"
-        self.modeRequestId = None
-        self.modeGeneration = None
-        self.modeFrameSeq = None
-        self.modeError = ""
-        self.modePendingSince = None
-        self.appliedRowModes = ("CAP",) * 8
-        self.pendingRowModes = None
-        self.rowModeRequestId = None
-        self.rowModeGeneration = None
-        self.rowModeFrameSeq = None
-        self.rowModeTransitionState = "applied"
-        self.rowModeError = ""
-        self.rowModePendingSince = None
-        self.deviceState = "CAPACITANCE"
-        self.railConfigured = False
-        self.railState = "unconfigured"
-        self.railRequestId = None
-        self.desiredModeAfterRail = None
-        self.rowsRequestId = None
+        # A host transport epoch is not an MCU boot. Preserve the last known
+        # applied state as stale until BOOT?/STATE?/ROWS?/ROWMODES? establish
+        # authoritative truth. In-flight writes are ambiguous, not erased.
+        self.authoritativeStateKnown = False
+        self.syncState = "awaiting_bootstrap"
+        self.resyncRequired = True
+        self._syncSeen = {"mode": False, "rows": False, "row_modes": False}
+        # ADS identity/check output is connection-observed diagnostic state.
+        # Keep command audit records below, but do not present an old link's
+        # identity as current before the new bootstrap queries complete.
         self.adsDiagnostics = {
-            "state": "idle",
+            "state": "awaiting_resync",
             "requestId": None,
             "identity": {},
             "check": {},
             "statistics": {},
             "error": "",
         }
+        self._mark_inflight_outcome_unknown()
+        if self.pendingMode is not None:
+            self.transitionState = "outcome_unknown"
+        if self.pendingRowModes is not None:
+            self.rowModeTransitionState = "outcome_unknown"
+        if self.pendingRows is not None:
+            self.protocolWarnings.append("ROWS outcome unknown after connection change")
+
+    def begin_connection(self, connection_generation: int) -> None:
+        self.connectionGeneration = int(connection_generation)
+        self.authoritativeStateKnown = False
+        self.syncState = "bootstrapping"
+        self.resyncRequired = True
+        self._syncSeen = {"mode": False, "rows": False, "row_modes": False}
+        # Auto-reconnect deliberately keeps the host session generation.  Any
+        # write accepted by the old link is nevertheless ambiguous until the
+        # authoritative bootstrap queries prove whether it applied.
+        self._mark_inflight_outcome_unknown()
+        if self.pendingMode is not None:
+            self.transitionState = "outcome_unknown"
+        if self.pendingRowModes is not None:
+            self.rowModeTransitionState = "outcome_unknown"
+
+    def _mark_inflight_outcome_unknown(self) -> None:
+        for record in self._commands.values():
+            if record.state in {"REQUESTED", "ACCEPTED"}:
+                record.state = "OUTCOME_UNKNOWN"
+                record.error = "Connection changed before a terminal firmware event; resync required"
 
     def request_rows(self, rows: int, sender: Callable[[str], None]) -> CommandRecord:
         if not (1 <= int(rows) <= 8):
@@ -198,6 +229,23 @@ class CommandService:
         record = self._new_record(command_type, command, requested_value)
         self._send(record, sender)
         return record
+
+    def observe_action_state(self, command_type: str, applied_value: Any) -> bool:
+        """Complete an id-less setter whose authoritative reply is a state record."""
+
+        for record in reversed(list(self._commands.values())):
+            if record.commandType != command_type or record.state not in {"REQUESTED", "OUTCOME_UNKNOWN"}:
+                continue
+            if not _values_match(record.requestedValue, applied_value):
+                continue
+            record.state = "APPLIED"
+            record.appliedValue = applied_value
+            record.appliedTime = time.time()
+            record.outcomeSource = "state_readback"
+            record.error = ""
+            record.terminalCount += 1
+            return True
+        return False
 
     def accept(self, event: CommandAccepted) -> None:
         generic = CommandTransactionEvent(
@@ -314,15 +362,43 @@ class CommandService:
             if phase in {"accepted", "checking"}:
                 record.state = "ACCEPTED"
                 record.acceptedTime = now
+                record.error = ""
+                record.outcomeSource = "wire"
+                record.acceptedMessage = event.rawText
+                record.acceptedRawFields = dict(event.rawFields)
             elif phase in {"applied", "complete", "completed"}:
                 record.state = "APPLIED" if phase == "applied" else "COMPLETED"
                 record.appliedTime = now
                 record.appliedValue = event.appliedValue
+                record.error = ""
+                record.outcomeSource = "wire"
+                record.terminalMessage = event.rawText
+                record.terminalRawFields = dict(event.rawFields)
+            elif phase == "restarting":
+                record.state = "EXPECTED_RESTART"
+                record.acceptedTime = record.acceptedTime or now
+                record.error = ""
+                record.outcomeSource = "wire"
+                record.terminalMessage = event.rawText
+                record.terminalRawFields = dict(event.rawFields)
+                self.mark_expected_restart(event.requestId, command_type=command_type)
             elif phase in {"error", "failed", "rejected"}:
                 record.state = "ERROR"
                 record.error = str(event.error or event.state or "firmware rejected command")
+                record.terminalMessage = event.rawText
+                record.terminalRawFields = dict(event.rawFields)
 
         result: dict[str, Any] = {"modeApplied": False, "rowModesApplied": False, "railApplied": False}
+        if record is None and phase in {"applied", "complete", "completed", "failed", "rejected", "error"}:
+            if command_type in {"mode", "row_modes", "rows", "rail", "fdc_isolation", "restart", "recover"}:
+                self.protocolWarnings.append(f"terminal without local acceptance: {command_type} id={event.requestId}")
+                result["unsolicitedTerminal"] = True
+        if record is not None and phase in {"applied", "complete", "completed", "failed", "rejected", "error"}:
+            record.terminalCount += 1
+            if record.terminalCount > 1:
+                warning = f"duplicate terminal for {command_type} id={event.requestId}"
+                self.protocolWarnings.append(warning)
+                result["duplicateTerminal"] = True
         if command_type == "rows":
             self._handle_rows(event)
         elif command_type == "mode":
@@ -335,7 +411,149 @@ class CommandService:
             self._handle_ads_check(event)
         elif command_type == "ads_identity":
             self.adsDiagnostics["identity"] = dict(event.rawFields)
+        elif command_type == "device_state" and phase == "snapshot":
+            self._handle_state_snapshot(event.rawFields)
         return result
+
+    def observe_boot(self, boot_id: int) -> dict[str, Any]:
+        new_boot_id = int(boot_id)
+        old_boot_id = self.bootId
+        changed = old_boot_id is not None and old_boot_id != new_boot_id
+        first_attach = old_boot_id is None
+        self.previousBootId = old_boot_id if changed else self.previousBootId
+        self.bootId = new_boot_id
+        if changed:
+            for record in self._commands.values():
+                if record.state not in {"REQUESTED", "ACCEPTED", "OUTCOME_UNKNOWN", "EXPECTED_RESTART"}:
+                    continue
+                if self.expectedRestart and (
+                    self.expectedRestartRequestId is None or record.firmwareId == self.expectedRestartRequestId
+                ):
+                    record.state = "COMPLETED_AFTER_REBOOT"
+                    record.appliedTime = time.time()
+                    record.outcomeSource = "boot_resync"
+                else:
+                    record.state = "ABORTED_BY_REBOOT"
+                    record.error = f"Device rebooted ({old_boot_id} -> {new_boot_id})"
+            self.pendingMode = None
+            self.pendingRowModes = None
+            self.pendingRows = None
+            self.transitionState = "aborted_by_reboot"
+            self.rowModeTransitionState = "aborted_by_reboot"
+            self.modeRequestId = None
+            self.rowModeRequestId = None
+            self.rowsRequestId = None
+            self.rowsGeneration = None
+            self.rowsAppliedRequestId = None
+            self.rowsFrameSeq = None
+            self.modeGeneration = None
+            self.rowModeGeneration = None
+            self.railConfigured = False
+            self.railState = "unknown_after_reboot"
+            self.expectedRestart = False
+            self.expectedRestartRequestId = None
+            self.expectedRestartCommandType = None
+        self.authoritativeStateKnown = False
+        self.syncState = "querying_authoritative_state"
+        return {"firstAttach": first_attach, "bootChanged": changed, "oldBootId": old_boot_id, "newBootId": new_boot_id}
+
+    def mark_expected_restart(self, request_id: int | None, *, command_type: str = "restart") -> None:
+        self.expectedRestart = True
+        self.expectedRestartRequestId = request_id
+        self.expectedRestartCommandType = str(command_type).lower()
+        record = self._match_record(
+            command_type,
+            CommandTransactionEvent(commandType=command_type, phase="accepted", requestId=request_id),
+        )
+        if record is not None:
+            record.state = "EXPECTED_RESTART"
+
+    def resync_authoritative(
+        self,
+        *,
+        mode: str | None = None,
+        rows: int | None = None,
+        row_modes: Any | None = None,
+        mode_generation: int | None = None,
+        mode_request_id: int | None = None,
+        profile_generation: int | None = None,
+        profile_request_id: int | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        if mode is not None:
+            normalized_mode = _normalize_mode(mode)
+            if self.pendingMode is not None:
+                matching = normalized_mode == self.pendingMode
+                self._resolve_unknown_records("mode", matching)
+                result["modeOutcome"] = "RESYNC_CONFIRMED_APPLIED" if matching else "RESYNC_CONFIRMED_NOT_APPLIED"
+                self.pendingMode = None
+            self.appliedMode = normalized_mode
+            self.modeGeneration = mode_generation
+            self.modeRequestId = mode_request_id
+            self.transitionState = "resync_confirmed"
+            self.deviceState = {"CAP": "CAPACITANCE", "VOLT": "VOLTAGE", "RES": "RESISTANCE"}[normalized_mode]
+            self._syncSeen["mode"] = True
+        if rows is not None:
+            active_rows = int(rows)
+            if not 1 <= active_rows <= 8:
+                raise ValueError("authoritative ROWS must be 1..8")
+            if self.pendingRows is not None:
+                self._resolve_unknown_records("rows", active_rows == self.pendingRows)
+                self.pendingRows = None
+            self.activeRows = active_rows
+            self._syncSeen["rows"] = True
+        if row_modes is not None:
+            normalized_profile = _normalize_row_modes(row_modes)
+            if self.pendingRowModes is not None:
+                matching = normalized_profile == self.pendingRowModes
+                self._resolve_unknown_records("row_modes", matching)
+                result["rowModesOutcome"] = "RESYNC_CONFIRMED_APPLIED" if matching else "RESYNC_CONFIRMED_NOT_APPLIED"
+                self.pendingRowModes = None
+            self.appliedRowModes = normalized_profile
+            self.rowModeGeneration = profile_generation
+            self.rowModeRequestId = profile_request_id
+            self.rowModeTransitionState = "resync_confirmed"
+            self._syncSeen["row_modes"] = True
+        self.authoritativeStateKnown = all(self._syncSeen.values())
+        if self.authoritativeStateKnown:
+            self.syncState = "synced"
+            self.resyncRequired = False
+        return result
+
+    def _resolve_unknown_records(self, command_type: str, applied: bool) -> None:
+        for record in reversed(list(self._commands.values())):
+            if record.commandType != command_type or record.state not in {"REQUESTED", "ACCEPTED", "OUTCOME_UNKNOWN"}:
+                continue
+            record.state = "RESYNC_CONFIRMED_APPLIED" if applied else "RESYNC_CONFIRMED_NOT_APPLIED"
+            record.appliedTime = time.time()
+            record.outcomeSource = "state_resync"
+            return
+
+    def _handle_state_snapshot(self, fields: dict[str, str]) -> None:
+        active = fields.get("active")
+        normalized_active = str(active or "").strip().upper()
+        if normalized_active in {"CAP", "VOLT", "RES"}:
+            self.resync_authoritative(
+                mode=normalized_active,
+                mode_generation=_optional_int(fields.get("gen")),
+                mode_request_id=_optional_int(fields.get("rid")),
+            )
+            return
+        if normalized_active:
+            # Firmware explicitly uses active=NONE while its matrix engine is
+            # SAFE/DEGRADED. This is authoritative lifecycle information, not
+            # an unknown measurement mode to pass through the C/V/R parser.
+            if self.pendingMode is not None:
+                self._resolve_unknown_records("mode", False)
+                self.pendingMode = None
+                self.modePendingSince = None
+            state = str(fields.get("state") or normalized_active).strip().upper()
+            self.deviceState = state
+            self.authoritativeStateKnown = False
+            self.syncState = "device_degraded"
+            self.resyncRequired = True
+            self.transitionState = "error"
+            self.modeError = f"Device reported state={state}, active={normalized_active}"
 
     def observe_mode_frame(self, mode: str, generation: int | None, request_id: int | None, seq: int) -> bool:
         normalized = _normalize_mode(mode)
@@ -385,36 +603,36 @@ class CommandService:
         for record in self._commands.values():
             if record.state not in {"REQUESTED", "ACCEPTED"} or now - record.sentTime <= seconds:
                 continue
-            record.state = "TIMEOUT"
-            record.error = "Timed out waiting for firmware apply"
+            record.state = "OUTCOME_UNKNOWN"
+            record.timeoutObserved = True
+            record.error = "Timed out observing a terminal event; firmware outcome is unknown"
             if record.commandType == "mode" and self.pendingMode == record.requestedValue:
-                self.transitionState = "timeout"
+                self.transitionState = "outcome_unknown"
                 self.modeError = record.error
             if record.commandType == "row_modes" and self.pendingRowModes == record.requestedValue:
-                self.rowModeTransitionState = "timeout"
-                self.rowModeError = "Timed out waiting for firmware apply (RMAPP)"
+                self.rowModeTransitionState = "outcome_unknown"
+                self.rowModeError = "Timed out observing RMAPP/RMERR; firmware outcome is unknown"
             if record.commandType == "rail" and self.railState in {"requested", "accepted"}:
-                self.railState = "timeout"
+                self.railState = "outcome_unknown"
                 if self.desiredModeAfterRail:
-                    self.transitionState = "timeout"
-                    self.modeError = "Timed out waiting for firmware rail apply (RAPP)"
-                    self.desiredModeAfterRail = None
+                    self.transitionState = "outcome_unknown"
+                    self.modeError = "Timed out observing RAPP; firmware outcome is unknown"
         if (
             self.pendingMode is not None
             and self.modePendingSince is not None
             and self.transitionState in {"requested", "accepted"}
             and now - self.modePendingSince > seconds
         ):
-            self.transitionState = "timeout"
-            self.modeError = "Timed out waiting for firmware apply (MAPP)"
+            self.transitionState = "outcome_unknown"
+            self.modeError = "Timed out observing MAPP/MERR; firmware outcome is unknown"
         if (
             self.pendingRowModes is not None
             and self.rowModePendingSince is not None
             and self.rowModeTransitionState in {"requested", "accepted"}
             and now - self.rowModePendingSince > seconds
         ):
-            self.rowModeTransitionState = "timeout"
-            self.rowModeError = "Timed out waiting for firmware apply (RMAPP)"
+            self.rowModeTransitionState = "outcome_unknown"
+            self.rowModeError = "Timed out observing RMAPP/RMERR; firmware outcome is unknown"
 
     def measurement_snapshot(self) -> dict[str, Any]:
         self.timeout_old()
@@ -427,6 +645,13 @@ class CommandService:
             "frameSeq": self.modeFrameSeq,
             "error": self.modeError,
             "deviceState": self.deviceState,
+            "bootId": self.bootId,
+            "connectionGeneration": self.connectionGeneration,
+            "authoritativeStateKnown": self.authoritativeStateKnown,
+            "syncState": self.syncState,
+            "resyncRequired": self.resyncRequired,
+            "expectedRestart": self.expectedRestart,
+            "protocolWarnings": list(self.protocolWarnings[-20:]),
             "rowProfile": {
                 "appliedModes": list(self.appliedRowModes),
                 "pendingModes": list(self.pendingRowModes) if self.pendingRowModes is not None else None,
@@ -453,6 +678,9 @@ class CommandService:
             "activeRows": self.activeRows,
             "pendingRows": self.pendingRows,
             "rowsRequestId": self.rowsRequestId,
+            "rowsGeneration": self.rowsGeneration,
+            "rowsAppliedRequestId": self.rowsAppliedRequestId,
+            "rowsFrameSeq": self.rowsFrameSeq,
             "latestCommand": _record_payload(latest) if latest else None,
             "transactions": [_record_payload(item) for item in sorted(self._commands.values(), key=lambda item: item.localId)[-20:]],
         }
@@ -466,31 +694,53 @@ class CommandService:
     def _send(self, record: CommandRecord, sender: Callable[[str], None]) -> None:
         try:
             sender(record.command)
-        except Exception as exc:
-            record.state = "ERROR"
+        except TransportWriteOutcomeUnknown as exc:
+            record.state = "OUTCOME_UNKNOWN"
             record.error = str(exc)
+            record.outcomeSource = "ambiguous_write"
+            self.resyncRequired = True
+            self.syncState = "resync_required"
             if record.commandType == "mode":
+                self.transitionState = "outcome_unknown"
+                self.modeError = str(exc)
+            elif record.commandType == "row_modes":
+                self.rowModeTransitionState = "outcome_unknown"
+                self.rowModeError = str(exc)
+            elif record.commandType == "rail":
+                self.railState = "outcome_unknown"
+            raise
+        except TransportNotSent as exc:
+            self._mark_not_sent(record, exc)
+            raise
+        except Exception as exc:
+            self._mark_not_sent(record, exc)
+            raise
+
+    def _mark_not_sent(self, record: CommandRecord, exc: Exception) -> None:
+        record.state = "NOT_SENT"
+        record.error = str(exc)
+        record.outcomeSource = "host_pre_submit"
+        if record.commandType == "mode":
+            self.transitionState = "not_sent"
+            self.modeError = str(exc)
+            self.pendingMode = None
+            self.modePendingSince = None
+        if record.commandType == "row_modes":
+            self.rowModeTransitionState = "not_sent"
+            self.rowModeError = str(exc)
+            self.pendingRowModes = None
+            self.rowModePendingSince = None
+        if record.commandType == "rail":
+            self.railState = "not_sent"
+            if self.desiredModeAfterRail:
                 self.transitionState = "error"
                 self.modeError = str(exc)
                 self.pendingMode = None
                 self.modePendingSince = None
-            if record.commandType == "row_modes":
-                self.rowModeTransitionState = "error"
-                self.rowModeError = str(exc)
-                self.pendingRowModes = None
-                self.rowModePendingSince = None
-            if record.commandType == "rail":
-                self.railState = "error"
-                if self.desiredModeAfterRail:
-                    self.transitionState = "error"
-                    self.modeError = str(exc)
-                    self.pendingMode = None
-                    self.modePendingSince = None
-                    self.desiredModeAfterRail = None
-            if record.commandType == "rows":
-                self.pendingRows = None
-                self.rowsRequestId = None
-            raise
+                self.desiredModeAfterRail = None
+        if record.commandType == "rows":
+            self.pendingRows = None
+            self.rowsRequestId = None
 
     def _match_record(self, command_type: str, event: CommandTransactionEvent) -> CommandRecord | None:
         if event.requestId is not None:
@@ -504,7 +754,7 @@ class CommandService:
             if str(event.phase).lower() != "accepted":
                 return None
         for record in reversed(list(self._commands.values())):
-            if record.commandType != command_type or record.state not in {"REQUESTED", "ACCEPTED"}:
+            if record.commandType != command_type or record.state not in {"REQUESTED", "ACCEPTED", "OUTCOME_UNKNOWN"}:
                 continue
             if event.requestId is not None and record.firmwareId is not None and record.firmwareId != event.requestId:
                 continue
@@ -524,8 +774,16 @@ class CommandService:
             if self.rowsRequestId is None or event.requestId != self.rowsRequestId:
                 return
             self.activeRows = int(event.appliedValue)
+            self.rowsGeneration = event.generation
+            self.rowsAppliedRequestId = event.requestId
+            self.rowsFrameSeq = event.frameSeq
             self.pendingRows = None
             self.rowsRequestId = None
+        elif event.phase == "snapshot" and event.appliedValue is not None:
+            self.resync_authoritative(rows=int(event.appliedValue))
+            self.rowsGeneration = event.generation
+            self.rowsAppliedRequestId = event.requestId
+            self.rowsFrameSeq = event.frameSeq
 
     def _handle_mode(self, event: CommandTransactionEvent) -> bool:
         if event.phase == "accepted":
@@ -569,7 +827,7 @@ class CommandService:
             self.appliedRowModes = (applied,) * 8
             if self.pendingRowModes is None:
                 self.rowModeRequestId = event.requestId
-                # Firmware 331c445 completes its independent RowModeProfile
+                # Firmware completes its independent RowModeProfile
                 # state after MODE succeeds, but MAPP.gen belongs only to the
                 # MeasurementMode context.  The two counters can already have
                 # diverged after prior RMAPP transactions, so never forge a
@@ -601,6 +859,13 @@ class CommandService:
 
     def _handle_row_modes(self, event: CommandTransactionEvent) -> bool:
         phase = str(event.phase).lower()
+        if phase == "snapshot" and event.appliedValue is not None:
+            self.resync_authoritative(
+                row_modes=event.appliedValue,
+                profile_generation=event.generation,
+                profile_request_id=event.requestId,
+            )
+            return False
         if phase == "accepted":
             requested = _normalize_row_modes(event.requestedValue)
             if self.pendingRowModes is not None and requested != self.pendingRowModes:
@@ -628,6 +893,21 @@ class CommandService:
             self.rowModeFrameSeq = event.frameSeq
             self.rowModeError = ""
             self.rowModePendingSince = None
+            if len(set(applied)) == 1:
+                # Homogeneous ROWMODES uses the fast C/V/R frame family and
+                # updates MeasurementMode internally, but RMAPP.gen belongs to
+                # RowModeProfile.  Keep mode generation explicitly unknown
+                # until STATE? or the first authoritative frame supplies it.
+                self.appliedMode = applied[0]
+                self.modeGeneration = None
+                self.modeRequestId = event.requestId
+                self.modeFrameSeq = event.frameSeq
+                self.transitionState = "applied_by_row_profile"
+                self.deviceState = {
+                    "CAP": "CAPACITANCE",
+                    "VOLT": "VOLTAGE",
+                    "RES": "RESISTANCE",
+                }[applied[0]]
             return True
         if phase in {"error", "failed", "rejected"}:
             if self.rowModeRequestId is None:
@@ -744,6 +1024,15 @@ def _record_payload(record: CommandRecord) -> dict[str, Any]:
     payload = asdict(record)
     payload["requestedRows"] = record.requestedRows
     return payload
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _rejected_transaction_result(reason: str) -> dict[str, Any]:

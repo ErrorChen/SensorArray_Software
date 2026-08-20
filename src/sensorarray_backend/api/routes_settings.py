@@ -18,6 +18,7 @@ class DisplaySettingsRequest(BaseModel):
     pauseDisplay: bool | None = None
     freezeColor: bool | None = None
     unitMode: str | None = None
+    voltageReference: str | None = None
     circuitOffsetPf: float | None = None
 
 
@@ -27,6 +28,12 @@ class BaselineRequest(BaseModel):
 
 class SelectionRequest(BaseModel):
     cell: str
+
+
+class LifecycleSettingsRequest(BaseModel):
+    autoReconnect: bool | None = None
+    resumeMeasurementAfterDeviceRestart: bool | None = None
+    preferredUsbStream: str | None = None
 
 
 @router.post("/settings/display")
@@ -51,5 +58,13 @@ def selection(body: SelectionRequest, runtime: BackendRuntime = Depends(get_runt
         runtime.set_selection_from_cell(body.cell)
         payload = runtime.current_selection_payload()
         return {"ok": True, **payload}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/settings/lifecycle")
+def lifecycle_settings(body: LifecycleSettingsRequest, runtime: BackendRuntime = Depends(get_runtime)) -> dict[str, Any]:
+    try:
+        return runtime.update_lifecycle_settings(body.model_dump(exclude_unset=True))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

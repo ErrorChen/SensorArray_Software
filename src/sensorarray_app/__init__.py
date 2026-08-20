@@ -1,4 +1,4 @@
-"""SensorArray b41 host application."""
+"""SensorArray protocol-v1 desktop host application."""
 
 from __future__ import annotations
 

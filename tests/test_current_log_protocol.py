@@ -5,11 +5,15 @@ import time
 from sensorarray_app.domain.models import (
     AdsDiagnosticEvent,
     BatteryTelemetry,
+    CalibrationInfo,
     CommandAccepted,
     CommandApplied,
     CommandTransactionEvent,
     LogRecord,
+    PerformanceInfo,
     RailTelemetry,
+    RecoveryEvent,
+    RestartEvent,
     TransportEnvelope,
 )
 from sensorarray_app.protocol.log_protocol import TextLogProtocol
@@ -33,6 +37,57 @@ def transactions(events: list[object]) -> list[CommandTransactionEvent]:
 
 def ads_events(events: list[object]) -> list[AdsDiagnosticEvent]:
     return [event for event in events if isinstance(event, AdsDiagnosticEvent)]
+
+
+def calibration_info(events: list[object]) -> CalibrationInfo:
+    return next(event for event in events if isinstance(event, CalibrationInfo))
+
+
+def test_calibration_query_and_save_load_terminals_preserve_authoritative_metadata():
+    protocol = TextLogProtocol()
+    queried = calibration_info(
+        protocol.feed_line(
+            "CAL,source=0,schema=0,valid=0,boardId=00000000,hardwareRev=0,payloadLength=0",
+            envelope(),
+        )
+    )
+    assert queried.valid is False
+    assert queried.source == "0"
+    assert queried.boardId == "00000000"
+
+    accepted = transactions(protocol.feed_line("ACK,cmd=CAL,v=SAVE,status=accepted", envelope()))[0]
+    assert (accepted.commandType, accepted.phase, accepted.requestedValue) == (
+        "calibration_save",
+        "accepted",
+        "SAVE",
+    )
+
+    saved_events = protocol.feed_line(
+        "CALSV,state=saved,reason=persisted,source=1,schema=3,valid=1,boardId=12345678,hardwareRev=2,payloadLength=512,err=0x0",
+        envelope(),
+    )
+    saved = transactions(saved_events)[0]
+    saved_info = calibration_info(saved_events)
+    assert (saved.commandType, saved.phase) == ("calibration_save", "complete")
+    assert (saved_info.valid, saved_info.schema, saved_info.hardwareRev, saved_info.payloadLength) == (
+        True,
+        3,
+        2,
+        512,
+    )
+
+    default_events = protocol.feed_line(
+        "CALLD,state=default,reason=no_blob,source=0,schema=0,valid=0,boardId=00000000,hardwareRev=0,payloadLength=0,err=0x1102",
+        envelope(),
+    )
+    loaded = transactions(default_events)[0]
+    default_info = calibration_info(default_events)
+    assert (loaded.commandType, loaded.phase) == ("calibration_load", "failed")
+    assert (default_info.state, default_info.valid, default_info.rawFields["reason"]) == (
+        "default",
+        False,
+        "no_blob",
+    )
 
 
 def test_mode_ack_apply_and_error_are_generic_correlated_transactions():
@@ -159,6 +214,96 @@ def test_rail_rapp_is_disambiguated_from_rows_and_tracks_two_phase_state():
     assert rejected.error == "0x102"
 
 
+def test_rail_recover_and_restart_deferred_transactions_never_cross_route():
+    protocol = TextLogProtocol()
+
+    recover_ack = transactions(
+        protocol.feed_line("RACK,cmd=RECOVER,id=71,level=2,state=accepted", envelope())
+    )[0]
+    assert (recover_ack.commandType, recover_ack.phase, recover_ack.requestedValue) == (
+        "recover",
+        "accepted",
+        {"level": 2},
+    )
+
+    recover_events = protocol.feed_line(
+        "RAPP,cmd=RECOVER,id=71,level=2,state=restarting,kind=auto", envelope()
+    )
+    recover_transaction = transactions(recover_events)[0]
+    assert (recover_transaction.commandType, recover_transaction.phase) == ("recover", "restarting")
+    assert any(isinstance(event, RecoveryEvent) and event.kind == "restarting" for event in recover_events)
+    assert any(isinstance(event, RestartEvent) and event.kind == "auto" for event in recover_events)
+
+    rejected_events = protocol.feed_line(
+        "RERR,cmd=RECOVER,id=72,level=1,state=rejected,reason=fdc_restart_required,restartRequired=1",
+        envelope(),
+    )
+    rejected = transactions(rejected_events)[0]
+    assert (rejected.commandType, rejected.phase) == ("recover", "rejected")
+    assert rejected.requestedValue == {"level": 1}
+    assert not any(
+        isinstance(event, CommandTransactionEvent) and event.commandType == "rail"
+        for event in rejected_events
+    )
+    assert any(
+        isinstance(event, RecoveryEvent)
+        and event.kind == "rejected"
+        and event.resetReason == "fdc_restart_required"
+        for event in rejected_events
+    )
+
+    restart_ack = transactions(
+        protocol.feed_line("RACK,cmd=RESTART,id=73,state=accepted", envelope())
+    )[0]
+    restart_events = protocol.feed_line(
+        "RAPP,cmd=RESTART,id=73,state=restarting,kind=manual", envelope()
+    )
+    restart_transaction = transactions(restart_events)[0]
+    assert (restart_ack.commandType, restart_transaction.commandType) == ("restart", "restart")
+    assert restart_transaction.phase == "restarting"
+    assert any(isinstance(event, RestartEvent) and event.kind == "manual" for event in restart_events)
+
+
+def test_recover_safe_is_a_successful_terminal_not_a_rail_or_failure_event():
+    events = TextLogProtocol().feed_line(
+        "RAPP,cmd=RECOVER,id=81,level=2,state=safe,reason=restart_guard", envelope()
+    )
+    transaction = transactions(events)[0]
+    assert (transaction.commandType, transaction.phase, transaction.error) == ("recover", "complete", None)
+    recovery = next(event for event in events if isinstance(event, RecoveryEvent))
+    assert recovery.kind == "safe"
+
+
+def test_performance_families_are_typed_without_losing_composite_metrics():
+    protocol = TextLogProtocol()
+    sf_events = protocol.feed_line(
+        "SF50,seq=101-150,n=50,cfps=100.25,efps=20.50,"
+        "ofps=10.0/9.5/8.0,bad=2/1/3,drop=0/2/3,q=1/4",
+        envelope(),
+    )
+    sf = next(event for event in sf_events if isinstance(event, PerformanceInfo))
+    assert sf.kind == "SF50"
+    assert sf.physicalCaptureFps == 100.25
+    assert sf.outputFpsBySink == (10.0, 9.5, 8.0)
+    assert sf.firmwareDropsBySink == (0, 2, 3)
+    assert sf.firmwareDrops == 5
+    assert sf.queueDepthBySink == (1, 4)
+    assert (sf.sequenceStart, sf.sequenceEnd, sf.frameCount) == (101, 150, 50)
+    assert (sf.staleFrames, sf.mixedFrames, sf.invalidFrames) == (2, 1, 3)
+    assert sf.sourceTransport == "serial"
+
+    ot = next(
+        event
+        for event in protocol.feed_line(
+            "OT50,st=ALL,out=100/90,q=1/2/3,life=4/5/6", envelope()
+        )
+        if isinstance(event, PerformanceInfo)
+    )
+    assert ot.kind == "OT50"
+    assert ot.metrics["q"] == (1, 2, 3)
+    assert ot.metrics["st"] == "ALL"
+
+
 def test_ads_unknown_identity_stays_unconfirmed_and_is_not_battery_telemetry():
     protocol = TextLogProtocol()
     events = protocol.feed_line(
@@ -273,7 +418,7 @@ def test_battery_telemetry_preserves_firmware_authoritative_last_good_fields():
     assert telemetry.lastGoodFresh is True
     assert telemetry.lastGoodAgeMs == 1800
     assert telemetry.lastGoodFrame == 88
-    # Firmware 331c445 has no last-good-specific source/reason fields; the
+    # Firmware 8045e9e9 has no last-good-specific source/reason fields; the
     # store labels their provenance as firmware after detecting lastGood*.
     assert telemetry.lastGoodSource is None
     assert telemetry.lastGoodReason is None

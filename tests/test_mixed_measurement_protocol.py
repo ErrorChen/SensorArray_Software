@@ -33,22 +33,18 @@ def build_mixed_packet(
     rows: int = 5,
     seq: int = 71,
     profile: str = PROFILE,
-    canonicalFirmwareWire: bool = True,
 ) -> bytes:
     modes = {
         "C": ("CAP", "pF", -6, "pf6"),
         "V": ("VOLT", "V", -6, "uv-x"),
         "R": ("RES", "ohm", -3, "mohm-x"),
     }
-    identityFields = (
-        "rgen=4,rrid=14,pgen=9,prid=42"
-        if canonicalFirmwareWire
-        else "rowsGen=4,rowsRid=14,profileGen=9,profileRid=42"
-    )
+    identityFields = "rgen=4,rrid=14,pgen=9,prid=42"
+    wireProfile = profile[:rows] + ("N" * (8 - rows))
+    globalMask = (1 << (rows * 8)) - 1
     lines = [
         f"M,seq={seq},ts=998877,rows={rows},cells={rows * 8},{identityFields},"
-        f"profile={profile},fmt=mix1"
-        + ("" if canonicalFirmwareWire else f",n={rows * 8}")
+        f"profile={wireProfile},expected={globalMask:016X},acquired={globalMask:016X},fmt=mix1"
     ]
     for row in range(1, rows + 1):
         mode, unit, scale, rowFormat = modes[profile[row - 1]]
@@ -56,24 +52,14 @@ def build_mixed_packet(
             # CAP pf6 represents total capacitance; the host applies its
             # configured circuit offset only after preserving these integers.
             values = [str(39_000_000 + row * 100_000 + cell * 1_000) for cell in range(8)]
-            pga = ""
         elif mode == "VOLT":
             values = [str(-1_000_000 + row * 100_000 + cell * 10_000) for cell in range(8)]
-            pga = ",pga=0001020408102000"
         else:
             values = [str(10_025_000 + row * 1_000 + cell * 10) for cell in range(8)]
-            pga = ",pga=0001020408102000"
-        if canonicalFirmwareWire:
-            lines.append(
-                f"MR,s={row},m={profile[row - 1]},unit={unit},scale={scale},valid=FF,fresh=FF,error=00,"
-                f"fmt={rowFormat},D={','.join(values)}"
-            )
-        else:
-            lines.append(
-                f"MR,row={row},mode={mode},unit={unit},scale={scale},valid=FF,fresh=FF,error=00,"
-                f"ref={'FDC' if mode == 'CAP' else 'INTREF'},rail={0 if mode == 'CAP' else 1},age=1,"
-                f"values={'|'.join(values)}{pga}"
-            )
+        lines.append(
+            f"MR,s={row},m={mode},unit={unit},scale={scale},expected=FF,acquired=FF,"
+            f"valid=FF,fresh=FF,error=00,fmt={rowFormat},D={','.join(values)}"
+        )
     crcPayload = "".join(line + "\n" for line in lines).encode("ascii")
     lines.append(
         f"K,seq={seq},{identityFields},"
@@ -93,11 +79,7 @@ def errors(events: list[object]) -> list[ParserErrorEvent]:
 def rebuild_crc(lines: list[bytes]) -> bytes:
     headerFields = dict(item.split("=", 1) for item in lines[0].decode().strip().split(",")[1:])
     crcPayload = b"".join(line.rstrip(b"\r\n") + b"\n" for line in lines[:-1])
-    identityKeys = (
-        ("rgen", "rrid", "pgen", "prid")
-        if "rgen" in headerFields
-        else ("rowsGen", "rowsRid", "profileGen", "profileRid")
-    )
+    identityKeys = ("rgen", "rrid", "pgen", "prid")
     trailer = (
         f"K,seq={headerFields['seq']},"
         + ",".join(f"{key}={headerFields[key]}" for key in identityKeys)
@@ -118,20 +100,20 @@ def test_mixed_frame_is_atomic_and_preserves_physical_row_identity_and_units():
     assert (frame.seq, frame.rows, frame.cells) == (71, 5, 40)
     assert (frame.rowsGeneration, frame.rowsRequestId) == (4, 14)
     assert (frame.profileGeneration, frame.profileRequestId) == (9, 42)
-    assert frame.profile == ("RES", "VOLT", "VOLT", "CAP", "CAP", "VOLT", "VOLT", "RES")
+    assert frame.profile == ("RES", "VOLT", "VOLT", "CAP", "CAP", "NONE", "NONE", "NONE")
     assert [row.row for row in frame.rowFrames] == [1, 2, 3, 4, 5]
     assert [row.mode for row in frame.rowFrames] == ["RES", "VOLT", "VOLT", "CAP", "CAP"]
     assert [row.unit for row in frame.rowFrames] == ["ohm", "V", "V", "pF", "pF"]
     assert frame.rowFrames[0].physicalValues[0] == pytest.approx(10_026.0)
     assert frame.rowFrames[1].physicalValues[0] == pytest.approx(-0.8)
     assert frame.rowFrames[3].physicalValues[0] == pytest.approx(6.4)
-    # Firmware 331c445's MR formatter does not emit per-row PGA metadata.
+    # Firmware 8045e9e9's MR formatter does not emit per-row PGA metadata.
     assert frame.rowFrames[0].pgaBypassMask is None
     assert frame.rowFrames[3].pgaValues is None
 
 
 @pytest.mark.parametrize("rows", range(1, 9))
-def test_mixed_parser_accepts_every_geometry_when_saved_profile_is_heterogeneous(rows: int):
+def test_mixed_parser_accepts_every_geometry_with_n_in_inactive_wire_suffix(rows: int):
     frame = frames(MixedMeasurementAsciiParser().feed(envelope(build_mixed_packet(rows=rows))))[0]
     assert frame.rows == rows
     assert frame.cells == rows * 8
@@ -146,16 +128,19 @@ def test_mixed_parser_accepts_every_geometry_when_saved_profile_is_heterogeneous
         (8, "RRRRRRRR"),
     ],
 )
-def test_mixed_parser_rejects_fully_homogeneous_profile_reserved_for_legacy_frames(rows: int, profile: str):
-    events = MixedMeasurementAsciiParser().feed(envelope(build_mixed_packet(rows=rows, profile=profile)))
-    assert not frames(events)
-    assert "homogeneous_profile" in [event.reason for event in errors(events)]
+def test_mixed_parser_accepts_homogeneous_active_profile(rows: int, profile: str):
+    parsed = frames(MixedMeasurementAsciiParser().feed(envelope(build_mixed_packet(rows=rows, profile=profile))))
+    assert len(parsed) == 1
+    assert all(mode == {"C": "CAP", "V": "VOLT", "R": "RES"}[profile[0]] for mode in parsed[0].activeProfile)
+    assert parsed[0].wireProfile == profile[:rows] + ("N" * (8 - rows))
 
 
-def test_typed_mixed_frame_cannot_bypass_heterogeneous_saved_profile_invariant():
-    frame = frames(MixedMeasurementAsciiParser().feed(envelope(build_mixed_packet(rows=2))))[0]
-    with pytest.raises(ValueError, match="heterogeneous saved row profile"):
-        replace(frame, profile=("RES",) * 8)
+def test_typed_mixed_frame_accepts_homogeneous_wire_profile_with_n_suffix():
+    frame = frames(
+        MixedMeasurementAsciiParser().feed(envelope(build_mixed_packet(rows=2, profile="RRRRRRRR")))
+    )[0]
+    updated = replace(frame, profile=("RES", "RES", "NONE", "NONE", "NONE", "NONE", "NONE", "NONE"))
+    assert updated.wireProfile == "RRNNNNNN"
 
 
 def test_mixed_crc_covers_m_and_all_mr_lines_and_bad_crc_never_emits():
@@ -186,7 +171,7 @@ def test_duplicate_row_is_rejected_atomically_and_parser_recovers_next_frame():
 
 def test_profile_mismatch_is_rejected_before_quantity_can_pollute_a_domain():
     lines = build_mixed_packet(rows=2).splitlines(keepends=True)
-    lines[1] = lines[1].replace(b"m=R", b"m=C")
+    lines[1] = lines[1].replace(b"m=RES", b"m=CAP")
     events = MixedMeasurementAsciiParser().feed(envelope(rebuild_crc(lines)))
     assert not frames(events)
     assert "profile_mismatch" in [event.reason for event in errors(events)]
@@ -209,24 +194,11 @@ def test_mixed_row_mask_pga_and_quantity_consistency(mutation: tuple[bytes, byte
     assert reason in [event.reason for event in errors(events)]
 
 
-def test_voltage_and_resistance_rows_accept_omitted_optional_pga_metadata():
-    lines = build_mixed_packet(rows=2, canonicalFirmwareWire=False).splitlines(keepends=True)
-    lines[1] = lines[1].replace(b",pga=0001020408102000", b"")
-    lines[2] = lines[2].replace(b",pga=0001020408102000", b"")
-    frame = frames(MixedMeasurementAsciiParser().feed(envelope(rebuild_crc(lines))))[0]
+def test_voltage_and_resistance_rows_preserve_absent_pga_metadata_from_8045_wire():
+    frame = frames(MixedMeasurementAsciiParser().feed(envelope(build_mixed_packet(rows=2))))[0]
     assert [rowFrame.mode for rowFrame in frame.rowFrames] == ["RES", "VOLT"]
     assert all(rowFrame.pgaValues is None for rowFrame in frame.rowFrames)
     assert all(rowFrame.pgaBypassMask is None for rowFrame in frame.rowFrames)
-
-
-def test_saved_long_field_replay_alias_still_accepts_optional_pga_metadata():
-    frame = frames(
-        MixedMeasurementAsciiParser().feed(
-            envelope(build_mixed_packet(rows=2, canonicalFirmwareWire=False))
-        )
-    )[0]
-    assert frame.rowFrames[0].pgaValues is not None
-    assert frame.rowFrames[0].pgaBypassMask is not None
 
 
 def test_registry_routes_fragmented_mixed_stream_without_affecting_legacy_routes():
@@ -255,7 +227,7 @@ def test_firmware_ble_m_stage_diagnostic_is_not_misparsed_as_mixed_header():
 
 
 def test_mixed_header_profile_must_always_store_all_eight_rows():
-    badPacket = build_mixed_packet(rows=2).replace(b"profile=RVVCCVVR", b"profile=RV")
+    badPacket = build_mixed_packet(rows=2).replace(b"profile=RVNNNNNN", b"profile=RV")
     events = MixedMeasurementAsciiParser().feed(envelope(badPacket))
     assert not frames(events)
     assert errors(events)[0].reason == "bad_m_header"
@@ -294,8 +266,8 @@ def test_canonical_firmware_mixed_masks_are_exactly_two_hex_characters(mask: byt
 @pytest.mark.parametrize(
     "mutation",
     [
-        (b"MR,s=1,m=R", b"MR,row=1,m=R"),
-        (b"MR,s=1,m=R", b"MR,s=1,mode=RES"),
+        (b"MR,s=1,m=RES", b"MR,row=1,m=RES"),
+        (b"MR,s=1,m=RES", b"MR,s=1,mode=RES"),
         (b",D=", b",values="),
     ],
 )

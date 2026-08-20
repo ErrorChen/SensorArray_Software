@@ -1,5 +1,6 @@
 import type { WebSocketMessage } from "./types";
 import { normaliseBackendUrl } from "./backendUrl";
+import { setWebSocketConnected } from "../state/performanceInstrumentation";
 
 export type WebSocketHandlers = {
   onMessage: (message: WebSocketMessage) => void;
@@ -31,18 +32,23 @@ export class SnapshotWebSocket {
     }
     this.socket?.close();
     this.socket = null;
+    setWebSocketConnected(false);
   }
 
   private open(): void {
     this.handlers.onConnectionStatus(this.socket ? "reconnecting" : "connecting");
     const url = toWebSocketUrl(this.baseUrl);
     this.socket = new WebSocket(`${url}/ws`);
-    this.socket.onopen = () => this.handlers.onConnectionStatus("connected");
+    this.socket.onopen = () => {
+      setWebSocketConnected(true);
+      this.handlers.onConnectionStatus("connected");
+    };
     this.socket.onmessage = (event) => {
       const message = JSON.parse(event.data) as WebSocketMessage;
       this.handlers.onMessage(message);
     };
     this.socket.onclose = () => {
+      setWebSocketConnected(false);
       this.handlers.onConnectionStatus("disconnected");
       if (!this.stopped) {
         this.reconnectTimer = window.setTimeout(() => this.open(), 1000);

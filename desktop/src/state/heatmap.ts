@@ -29,7 +29,7 @@ export function resolveColourRange(
   }
   const legacy = snapshot.display.colorRange;
   const hasTypedRanges = Boolean(snapshot.display.colourRanges);
-  // Firmware 331c445 selects frame layout from all eight saved modes, even
+  // Firmware 8045e9e selects frame layout from all eight saved modes, even
   // when inactive configured rows are the only source of heterogeneity.
   const savedModes = snapshot.frame.rowModes ?? snapshot.matrix.modeByRow ?? [];
   const homogeneous = snapshot.frame.layout !== "MIXED" && savedModes.length === 8 && new Set(savedModes).size === 1;

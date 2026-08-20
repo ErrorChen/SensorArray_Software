@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sensorarray_app.app.configuration import AppConfiguration
 from sensorarray_app.constants import APP_VERSION
 from sensorarray_backend.api import (
+    routes_device,
     routes_export,
     routes_import,
     routes_measurement,
@@ -47,6 +48,7 @@ def create_app(config: AppConfiguration | None = None) -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(routes_status.router)
+    app.include_router(routes_device.router)
     app.include_router(routes_transport.router)
     app.include_router(routes_replay.router)
     app.include_router(routes_rows.router)

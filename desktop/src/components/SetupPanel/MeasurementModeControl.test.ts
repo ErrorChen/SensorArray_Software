@@ -125,4 +125,18 @@ describe("MeasurementModeControl state", () => {
     );
     expect((html.match(/disabled=""/g) ?? [])).toHaveLength(3);
   });
+
+  it("guards CAP while FDC shutdown requires a device restart", () => {
+    const snapshot = createBackendSnapshot({ mode: "RES" });
+    snapshot.fdcIsolation = { sd: "high", verified: true, restartRequired: true };
+    const html = renderToStaticMarkup(createElement(MeasurementModeControl, {
+      client: {} as never,
+      snapshot,
+      setupProfile: defaultSetupProfile("."),
+      onSetupProfileChange: () => undefined,
+      onError: () => undefined
+    }));
+    expect(html).toContain("CAP is unavailable while FDC shutdown is active");
+    expect(html).toContain("Restart the device to reinitialise FDC frontends before selecting CAP");
+  });
 });

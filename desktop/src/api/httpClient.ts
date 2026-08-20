@@ -53,8 +53,8 @@ export class BackendHttpClient {
     return { ok: payload.ok !== false, ports: payload.ports ?? [], error: payload.error ?? "" };
   }
 
-  async connectSerial(port: string, baud: number): Promise<void> {
-    await this.post("/api/transport/serial/connect", { port, baud });
+  async connectSerial(port: string, baud: number, autoReconnect = true): Promise<void> {
+    await this.post("/api/transport/serial/connect", { port, baud, autoReconnect });
   }
 
   async scanBle(timeoutSeconds = 10): Promise<BleScanResponse> {
@@ -69,8 +69,8 @@ export class BackendHttpClient {
     };
   }
 
-  async connectBle(address: string, deviceId = ""): Promise<void> {
-    await this.post("/api/transport/ble/connect", { address, deviceId });
+  async connectBle(address: string, deviceId = "", autoReconnect = true): Promise<void> {
+    await this.post("/api/transport/ble/connect", { address, deviceId, autoReconnect });
   }
 
   async discoverWifi(): Promise<WifiDevice[]> {
@@ -113,9 +113,14 @@ export class BackendHttpClient {
     pauseDisplay?: boolean;
     freezeColor?: boolean;
     unitMode?: string;
+    voltageReference?: "ground" | "vss_relative" | "rail_normalized";
     circuitOffsetPf?: number;
   }): Promise<Record<string, unknown>> {
     return this.post<Record<string, unknown>>("/api/settings/display", settings);
+  }
+
+  async setLifecycleSettings(settings: SetupProfile["lifecycle"]): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/settings/lifecycle", settings);
   }
 
   async baseline(action: "capture" | "reset" | "cancel"): Promise<BaselineSnapshot> {
@@ -160,6 +165,38 @@ export class BackendHttpClient {
 
   async importSession(path: string): Promise<Record<string, unknown>> {
     return this.post<Record<string, unknown>>("/api/import/session", { path });
+  }
+
+  async setUsbStream(mode: "DEBUG" | "FULL"): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/transport/usb-stream", { mode });
+  }
+
+  async setFdcIsolation(enabled: boolean): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/diagnostics/fdc-isolation", { enabled });
+  }
+
+  async restartDevice(): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/device/restart", {});
+  }
+
+  async recoverDevice(level?: 0 | 1 | 2): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/device/recover", { level: level ?? null });
+  }
+
+  async saveCalibration(): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/calibration/save", {});
+  }
+
+  async loadCalibration(): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/calibration/load", {});
+  }
+
+  async startRecording(directory: string, allowReducedStream = false): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/recording/start", { directory, allowReducedStream });
+  }
+
+  async stopRecording(): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>("/api/recording/stop", {});
   }
 
   async getSetupProfile(): Promise<SetupProfile> {

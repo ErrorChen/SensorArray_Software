@@ -64,11 +64,9 @@ until matching `RMAPP`. `RMERR`, timeout, wrong request ID, or wrong profile
 does not fabricate application. The draft can remain available for correction
 and retry.
 
-Firmware `331c445` currently omits `RMAPP`/`RMERR` and profile completion for
-homogeneous `ROWMODES` requests. The UI therefore reports the strict timeout
-and keeps the old applied profile; it does not infer success from a C/V/R data
-frame. The **Set all rows** `MODE=` quick action is the supported homogeneous
-path until firmware corrects that branch.
+Firmware `8045e9e9` completes homogeneous and heterogeneous `ROWMODES`
+requests with `RMAPP` or `RMERR`. The UI still keeps the old applied profile
+until the matching terminal and never infers success from a C/V/R data frame.
 
 Rows greater than current `ROWS` remain visible because the firmware profile
 always stores eight entries. They are dimmed and labelled **Inactive with
@@ -156,7 +154,7 @@ Battery status comes from backend typed state, not React local storage:
 - stale: `Battery 4.092 V (last known · stale)`;
 - failed attempt: `Battery 4.092 V (last known · adc_timeout)`.
 
-Firmware `331c445` authoritative `lastGoodMv/lastGoodValid/lastGoodFresh/
+Firmware `8045e9e9` authoritative `lastGoodMv/lastGoodValid/lastGoodFresh/
 lastGoodAgeMs/lastGoodFrame` fields are preferred. With older firmware,
 the backend retains the last valid value for the same device session. A later
 invalid attempt changes state/reason without erasing the number; a later fresh
@@ -191,6 +189,5 @@ real Electron with the built renderer and Python sidecar.
 
 Replay still does not prove that firmware emitted M/MR/K bytes or delivered
 `MAPP`/`RMAPP` on BLE `FF30`. Exact source compatibility targets firmware
-`331c44589318db9ba642cf3ab33bb08ca3dd8a34`; real BLE observations and the
-known homogeneous row-profile completion defect are reported separately from
-Replay PASS.
+`8045e9e9ec9599533c52c15dfcb6002f79fd15f1`; real BLE observations are
+reported separately from Replay PASS.

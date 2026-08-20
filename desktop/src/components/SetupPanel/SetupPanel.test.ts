@@ -19,5 +19,9 @@ describe("SetupPanel ROWS selector", () => {
     for (const rows of supportedRowOptions) {
       expect(html).toContain(`<option value="${rows}"`);
     }
+    expect(html).toContain("Automatically reconnect the selected physical device");
+    expect(html).toContain("Resume measurement configuration after device restart");
+    expect(html).toContain("Device default");
+    expect(html).toContain("never restored automatically");
   });
 });

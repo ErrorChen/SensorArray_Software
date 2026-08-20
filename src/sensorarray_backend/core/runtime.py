@@ -5,13 +5,23 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import uuid
 
 import numpy as np
 
 from sensorarray_app.app.configuration import AppConfiguration
 from sensorarray_app.app.runtime import SensorArrayRuntime
 from sensorarray_app.constants import APP_VERSION, CAP_FIXED_SCALE, CAP_INVALID_SENTINEL, DEFAULT_SERIAL_BAUD, WIFI_DEFAULT_HOST
-from sensorarray_app.domain.models import CapacitanceFrame, DisplayMode, MeasurementFrame, TransportEnvelope
+from sensorarray_app.domain.models import (
+    CapacitanceFrame,
+    CommandApplied,
+    CommandTransactionEvent,
+    DisplayMode,
+    MeasurementFrame,
+    MixedMeasurementFrame,
+    TransportEnvelope,
+    UsbStreamInfo,
+)
 from sensorarray_app.services.discovery_service import scan_ble, scan_wifi
 from sensorarray_app.transport.serial_transport import SerialTransport
 from sensorarray_backend.core.history import history_payload
@@ -50,8 +60,21 @@ class BackendRuntime(SensorArrayRuntime):
         self._frozenColourRanges = dict(self._lastColourRanges)
         self.preferredMeasurementMode = "CAP"
         self.preferredRowModes: tuple[str, ...] = ("CAP",) * 8
+        self.preferredRows = 8
+        self.autoReconnect = True
+        self.resumeMeasurementAfterDeviceRestart = False
+        self.preferredUsbStream = "DEVICE_DEFAULT"
+        self._preferenceApplyState: dict[str, Any] = {
+            "state": "IDLE",
+            "reason": "",
+            "targetBootId": None,
+            "error": "",
+            "commands": [],
+        }
+        self.synchronizer.onComplete = self._on_bootstrap_complete
         self.measuredAvddV: float | None = None
         self.measuredAvssV: float | None = None
+        self._exportSessionId = str(uuid.uuid4())
 
     def set_transport_mode(self, mode: str) -> dict[str, str]:
         if mode not in {"serial", "ble", "wifi", "replay"}:
@@ -62,21 +85,24 @@ class BackendRuntime(SensorArrayRuntime):
     def list_serial_ports(self) -> list[dict[str, str]]:
         return SerialTransport.list_ports()
 
-    def connect_serial(self, port: str, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = False) -> None:
+    def connect_serial(self, port: str, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = True) -> None:
         if not str(port or "").strip():
             raise ValueError("serial port is required")
         self.selectedMode = "serial"
         self.serialPort = str(port).strip()
         self.serialBaud = int(baud or DEFAULT_SERIAL_BAUD)
-        super().connect_serial(self.serialPort, self.serialBaud, bool(auto_reconnect))
+        self.autoReconnect = bool(auto_reconnect)
+        super().connect_serial(self.serialPort, self.serialBaud, self.autoReconnect)
 
-    def connect_ble(self, address: str, device_id: str = "") -> None:
+    def connect_ble(self, address: str, device_id: str = "", auto_reconnect: bool | None = None) -> None:
         if not str(address or "").strip():
             raise ValueError("BLE address is required")
         self.selectedMode = "ble"
         self.bleAddress = str(address).strip()
         self.bleDeviceId = str(device_id or "")
-        super().connect_ble(self.bleAddress, self.bleDeviceId)
+        reconnect = self.autoReconnect if auto_reconnect is None else bool(auto_reconnect)
+        self.autoReconnect = reconnect
+        super().connect_ble(self.bleAddress, self.bleDeviceId, reconnect)
 
     def connect_wifi(self, host: str) -> None:
         if not str(host or "").strip():
@@ -110,6 +136,7 @@ class BackendRuntime(SensorArrayRuntime):
         rows = int(rows)
         if not (1 <= rows <= 8):
             raise ValueError("ROWS must be 1..8")
+        self.preferredRows = rows
         transport = self.transport.status.get("transport", "none")
         if transport in {"none", "replay"}:
             self.matrixStore.set_active_rows_for_display(rows)
@@ -147,6 +174,7 @@ class BackendRuntime(SensorArrayRuntime):
     ) -> dict[str, Any]:
         normalized = str(mode).strip().upper()
         normalized = {"CAPACITANCE": "CAP", "VOLTAGE": "VOLT", "RESISTANCE": "RES"}.get(normalized, normalized)
+        self._guard_cap_available((normalized,))
         # measuredAvddV/measuredAvssV remain accepted for wire/API backwards
         # compatibility, but normal MODE operation no longer configures rails.
         # The legacy /rail endpoint is the only path which emits RAILCFG.
@@ -156,6 +184,7 @@ class BackendRuntime(SensorArrayRuntime):
 
     def request_row_modes_api(self, modes: Any) -> dict[str, Any]:
         normalized = _normalize_row_modes(modes)
+        self._guard_cap_available(normalized)
         super().request_row_modes(normalized)
         self.preferredRowModes = normalized
         return {
@@ -187,6 +216,119 @@ class BackendRuntime(SensorArrayRuntime):
     def measurement_mode_payload(self) -> dict[str, Any]:
         return {"ok": True, "measurement": self.commands.measurement_snapshot()}
 
+    def device_status_payload(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "device": dict(self.deviceInfo),
+            "bootstrap": self.synchronizer.snapshot(),
+            "transport": dict(self.transport.status),
+            "measurement": self.commands.measurement_snapshot(),
+        }
+
+    def request_usb_stream(self, mode: str) -> dict[str, Any]:
+        normalized = str(mode).strip().upper()
+        if normalized not in {"DEBUG", "FULL"}:
+            raise ValueError("USB stream mode must be DEBUG or FULL")
+        if self.transport.status.get("transport") != "serial":
+            raise ValueError("USBSTREAM applies only to the Serial USB sink")
+        self.commands.record_action("usb_stream", f"USBSTREAM={normalized}", normalized, self.transport.send_command)
+        return {"ok": True, "requested": normalized, "usbStream": self.deviceInfo.get("usbStream")}
+
+    def request_fdc_isolation(self, enabled: bool) -> dict[str, Any]:
+        requested = "ON" if bool(enabled) else "OFF"
+        current = self.deviceInfo.get("fdcIsolation") or {}
+        if requested == "OFF" and current.get("restartRequired"):
+            raise ValueError("Restart required to reinitialise FDC frontends")
+        if requested == "ON":
+            if current.get("restartRequired") or str(current.get("sd", "")).lower() == "high":
+                raise ValueError("FDC shutdown is already active; restart the device before using CAP again")
+            profile = tuple(self.commands.appliedRowModes)
+            homogeneous_ads = (
+                len(profile) == 8
+                and len(set(profile)) == 1
+                and profile[0] in {"VOLT", "RES"}
+                and self.commands.appliedMode == profile[0]
+            )
+            if not self.commands.authoritativeStateKnown:
+                raise ValueError("Wait for device bootstrap to confirm MODE/ROWS/ROWMODES before enabling FDC isolation")
+            if self.commands.pendingMode is not None or self.commands.pendingRowModes is not None:
+                raise ValueError("Wait for the current measurement transaction before enabling FDC isolation")
+            if not homogeneous_ads:
+                raise ValueError("FDC isolation requires an authoritative homogeneous VOLT or RES profile")
+        self.commands.record_action(
+            "fdc_isolation",
+            f"FDCISO={requested}",
+            requested,
+            self.transport.send_command,
+        )
+        return {"ok": True, "requested": requested, "fdcIsolation": current}
+
+    def _guard_cap_available(self, modes: tuple[str, ...]) -> None:
+        current = self.deviceInfo.get("fdcIsolation") or {}
+        if current.get("restartRequired") and "CAP" in modes:
+            raise ValueError("CAP is unavailable while FDC shutdown is active; restart the device to reinitialise FDC frontends")
+
+    def request_restart(self) -> dict[str, Any]:
+        record = self.commands.record_action("restart", "RESTART", None, self.transport.send_command)
+        return {"ok": True, "state": record.state, "message": "Restarting device when firmware accepts the request"}
+
+    def request_recover(self, level: int | None = None) -> dict[str, Any]:
+        if level is not None and int(level) not in {0, 1, 2}:
+            raise ValueError("RECOVER level must be 0, 1, or 2")
+        command = "RECOVER" if level is None else f"RECOVER={int(level)}"
+        # Bare RECOVER is defined by the 8045 firmware contract as the full
+        # level-1 recovery.  Record that effective value so the subsequent
+        # RACK,level=1 can be correlated instead of being mistaken for an
+        # unsolicited transaction.
+        effective_level = 1 if level is None else int(level)
+        record = self.commands.record_action(
+            "recover", command, {"level": effective_level}, self.transport.send_command
+        )
+        return {"ok": True, "state": record.state, "level": level}
+
+    def request_calibration(self, operation: str) -> dict[str, Any]:
+        normalized = str(operation).strip().upper()
+        if normalized not in {"SAVE", "LOAD"}:
+            raise ValueError("calibration operation must be SAVE or LOAD")
+        record = self.commands.record_action(
+            f"calibration_{normalized.lower()}",
+            f"CAL={normalized}",
+            normalized,
+            self.transport.send_command,
+        )
+        return {"ok": True, "state": record.state, "operation": normalized}
+
+    def start_scientific_recording(self, directory: str, *, allow_reduced_stream: bool = False) -> dict[str, Any]:
+        usb = self.deviceInfo.get("usbStream") or {}
+        if (
+            self.transport.status.get("transport") == "serial"
+            and str(usb.get("mode") or "").upper() == "DEBUG"
+            and not allow_reduced_stream
+        ):
+            return {
+                "ok": False,
+                "requiresConfirmation": True,
+                "reason": "USB stream is DEBUG and only a subset of physical frames is received.",
+                "actions": ["switch_to_full", "record_reduced_stream", "cancel"],
+            }
+        status = self.recorder.start(
+            directory,
+            {
+                "appVersion": APP_VERSION,
+                "device": self.transport.status.get("device", ""),
+                "transport": self.transport.status.get("transport", "none"),
+                "bootId": self.commands.bootId,
+                "configuredRowProfile": list(self.commands.appliedRowModes),
+            },
+        )
+        self._host_log("Recording", "info", f"Scientific recording started: {status['directory']}")
+        return {"ok": True, "recording": status}
+
+    def stop_scientific_recording(self) -> dict[str, Any]:
+        status = self.recorder.stop()
+        self._host_log("Recording", "info" if not status["error"] else "error", "Scientific recording finalized")
+        return {"ok": not bool(status["error"]), "recording": status}
+
     def update_display_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         if "displayMode" in payload and payload["displayMode"] is not None:
             mode = str(payload["displayMode"])
@@ -208,6 +350,11 @@ class BackendRuntime(SensorArrayRuntime):
             self.ui.freezeColor = freeze
         if "unitMode" in payload and payload["unitMode"] is not None:
             self.ui.unitMode = str(payload["unitMode"])
+        if "voltageReference" in payload and payload["voltageReference"] is not None:
+            reference = str(payload["voltageReference"]).strip().lower()
+            if reference not in {"ground", "vss_relative", "rail_normalized"}:
+                raise ValueError("voltageReference must be ground, vss_relative, or rail_normalized")
+            self.ui.voltageReference = reference
         if "circuitOffsetPf" in payload and payload["circuitOffsetPf"] is not None:
             offset = float(payload["circuitOffsetPf"])
             if offset != self.ui.circuitOffsetPf:
@@ -215,6 +362,26 @@ class BackendRuntime(SensorArrayRuntime):
                 self.registry.cap.circuit_offset_pf = offset
                 self.invalidate_baseline("circuit offset changed")
         return self.display_payload()
+
+    def update_lifecycle_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "autoReconnect" in payload:
+            self.autoReconnect = bool(payload["autoReconnect"])
+        if "resumeMeasurementAfterDeviceRestart" in payload:
+            self.resumeMeasurementAfterDeviceRestart = bool(payload["resumeMeasurementAfterDeviceRestart"])
+        if "preferredUsbStream" in payload:
+            preference = str(payload["preferredUsbStream"] or "DEVICE_DEFAULT").strip().upper()
+            if preference not in {"DEVICE_DEFAULT", "DEBUG", "FULL"}:
+                raise ValueError("preferredUsbStream must be DEVICE_DEFAULT, DEBUG, or FULL")
+            self.preferredUsbStream = preference
+        return {"ok": True, "lifecycle": self.lifecycle_settings_payload()}
+
+    def lifecycle_settings_payload(self) -> dict[str, Any]:
+        return {
+            "autoReconnect": self.autoReconnect,
+            "resumeMeasurementAfterDeviceRestart": self.resumeMeasurementAfterDeviceRestart,
+            "preferredUsbStream": self.preferredUsbStream,
+            "preferenceApply": dict(self._preferenceApplyState),
+        }
 
     def set_display_mode(self, mode: str) -> None:
         selected = DisplayMode(mode)
@@ -338,6 +505,7 @@ class BackendRuntime(SensorArrayRuntime):
             "pauseDisplay": self.ui.paused,
             "freezeColor": self.ui.freezeColor,
             "unitMode": self.ui.unitMode,
+            "voltageReference": self.ui.voltageReference,
             "circuitOffsetPf": self.ui.circuitOffsetPf,
             "trendLatestN": self.ui.trendLatestN,
             "baselineStatus": self.baseline_payload(),
@@ -439,10 +607,15 @@ class BackendRuntime(SensorArrayRuntime):
         snap = snapshot_payload(self)
         history = self._history_export_frames()
         logs = self.rawLogs.snapshot(show_data=True, limit=self.rawLogs.maxLines)
+        session_id = self.recorder.sessionId or self._exportSessionId
+        for frame in history:
+            if not frame.get("sessionId"):
+                frame["sessionId"] = session_id
         return {
             "metadata": {
                 "appVersion": APP_VERSION,
-                "schemaVersion": 2,
+                "schemaVersion": 3,
+                "sessionId": session_id,
                 "exportedAt": datetime.now(timezone.utc).isoformat(),
                 "sourceTransport": snap["connection"]["mode"],
                 "device": snap["connection"]["deviceLabel"],
@@ -461,6 +634,7 @@ class BackendRuntime(SensorArrayRuntime):
             "history": history_payload(self, latest_n=self.matrixStore.history.capacity),
             "historyFrames": history,
             "rawLogs": logs["rows"],
+            "events": list(self.deviceInfo.get("lifecycleEvents") or []),
             "parsedStatus": [],
             "diagnostics": snap["diagnostics"],
         }
@@ -502,16 +676,65 @@ class BackendRuntime(SensorArrayRuntime):
             parsed_frames = [
                 event
                 for event in self.registry.feed(envelope)
-                if isinstance(event, (CapacitanceFrame, MeasurementFrame))
+                if isinstance(event, (CapacitanceFrame, MeasurementFrame, MixedMeasurementFrame))
             ]
             if len(parsed_frames) != 1:
                 raise ValueError(f"session frame {frame.seq} did not produce exactly one valid measurement frame")
             parsed = parsed_frames[0]
-            mode = "CAP" if isinstance(parsed, CapacitanceFrame) else parsed.mode
-            generation = parsed.generation
-            request_id = parsed.requestId
-            self.commands.observe_mode_frame(mode, generation, request_id, parsed.seq)
-            self.matrixStore.apply_measurement_mode(mode, generation, request_id, parsed.seq)
+            if isinstance(parsed, MixedMeasurementFrame):
+                configured = frame.configuredRowProfile or tuple(
+                    mode if mode != "NONE" else "CAP" for mode in frame.row_mode_values()
+                )
+                # Offline import is an authoritative replay boundary. It has
+                # no live STATE? transaction, so install the identities
+                # carried by the verified M/MR/K frame before admitting it.
+                self.commands.resync_authoritative(
+                    mode=self.commands.appliedMode,
+                    rows=parsed.rows,
+                    row_modes=configured,
+                    profile_generation=parsed.profileGeneration,
+                    profile_request_id=parsed.profileRequestId,
+                )
+                self.matrixStore.complete_resync(
+                    mode=self.commands.appliedMode,
+                    rows=parsed.rows,
+                    row_modes=configured,
+                    rows_generation=parsed.rowsGeneration,
+                    rows_request_id=parsed.rowsRequestId,
+                    rows_frame_seq=parsed.seq,
+                    mode_generation=None,
+                    mode_request_id=None,
+                    profile_generation=parsed.profileGeneration,
+                    profile_request_id=parsed.profileRequestId,
+                )
+            else:
+                mode = "CAP" if isinstance(parsed, CapacitanceFrame) else parsed.mode
+                configured = frame.configuredRowProfile or (mode,) * 8
+                mode_generation = None if isinstance(parsed, CapacitanceFrame) else parsed.generation
+                mode_request_id = None if isinstance(parsed, CapacitanceFrame) else parsed.requestId
+                rows_generation = parsed.generation if isinstance(parsed, CapacitanceFrame) else frame.rowsGeneration
+                rows_request_id = parsed.requestId if isinstance(parsed, CapacitanceFrame) else frame.rowsRequestId
+                self.commands.resync_authoritative(
+                    mode=mode,
+                    rows=parsed.rows,
+                    row_modes=configured,
+                    mode_generation=mode_generation,
+                    mode_request_id=mode_request_id,
+                    profile_generation=frame.profileGeneration,
+                    profile_request_id=frame.profileRequestId,
+                )
+                self.matrixStore.complete_resync(
+                    mode=mode,
+                    rows=parsed.rows,
+                    row_modes=configured,
+                    rows_generation=rows_generation,
+                    rows_request_id=rows_request_id,
+                    rows_frame_seq=parsed.seq,
+                    mode_generation=mode_generation,
+                    mode_request_id=mode_request_id,
+                    profile_generation=frame.profileGeneration,
+                    profile_request_id=frame.profileRequestId,
+                )
             self._handle_event(parsed)
             imported_frames += 1
         self.selectedMode = "replay"
@@ -526,7 +749,6 @@ class BackendRuntime(SensorArrayRuntime):
         }
 
     def setup_profile_payload(self) -> dict[str, Any]:
-        snap = snapshot_payload(self)
         return {
             "schemaVersion": 3,
             "appVersion": APP_VERSION,
@@ -538,7 +760,7 @@ class BackendRuntime(SensorArrayRuntime):
                 "replay": {"path": self.replayPath or "", "speed": self.replaySpeed},
             },
             "acquisition": {
-                "rows": snap["frame"]["rows"],
+                "rows": self.preferredRows,
                 "measurementMode": self.preferredMeasurementMode,
                 "rowModes": list(self.preferredRowModes),
             },
@@ -553,10 +775,16 @@ class BackendRuntime(SensorArrayRuntime):
                 "pauseDisplay": self.ui.paused,
                 "freezeColor": self.ui.freezeColor,
                 "unitMode": self.ui.unitMode,
+                "voltageReference": self.ui.voltageReference,
                 "circuitOffsetPf": self.ui.circuitOffsetPf,
                 "trendLatestN": self.ui.trendLatestN,
             },
             "offsetsPf": self.offsets_payload(),
+            "lifecycle": {
+                "autoReconnect": self.autoReconnect,
+                "resumeMeasurementAfterDeviceRestart": self.resumeMeasurementAfterDeviceRestart,
+                "preferredUsbStream": self.preferredUsbStream,
+            },
             "command": {"lineEnding": self.commandLineEnding},
             "paths": {"defaultSaveDirectory": self.defaultSaveDirectory},
         }
@@ -611,6 +839,9 @@ class BackendRuntime(SensorArrayRuntime):
             if not directory:
                 raise ValueError("paths.defaultSaveDirectory must not be empty")
             self.defaultSaveDirectory = directory
+        lifecycle = payload.get("lifecycle") if isinstance(payload.get("lifecycle"), dict) else {}
+        if lifecycle:
+            self.update_lifecycle_settings(lifecycle)
         acquisition = payload.get("acquisition") if isinstance(payload.get("acquisition"), dict) else {}
         if "measurementMode" in acquisition:
             requested_mode = str(acquisition.get("measurementMode") or "CAP").upper()
@@ -624,10 +855,6 @@ class BackendRuntime(SensorArrayRuntime):
             row_modes = [self.preferredMeasurementMode] * 8
         normalized_row_modes = _normalize_row_modes(row_modes)
         self.preferredRowModes = normalized_row_modes
-        try:
-            self.request_row_modes_api(normalized_row_modes)
-        except Exception as exc:
-            warnings.append(f"row mode preference stored but not applied to hardware: {exc}")
         voltage_rail = payload.get("voltageRail") if isinstance(payload.get("voltageRail"), dict) else {}
         if voltage_rail.get("measuredAvddV") is not None:
             self.measuredAvddV = _finite_float(voltage_rail["measuredAvddV"], "voltageRail.measuredAvddV")
@@ -637,15 +864,128 @@ class BackendRuntime(SensorArrayRuntime):
             rows = int(acquisition.get("rows") or 0)
             if not (1 <= rows <= 8):
                 raise ValueError("acquisition.rows must be 1..8")
-            try:
-                self.request_rows(rows)
-            except Exception as exc:
-                warnings.append(f"rows preference stored but not applied to hardware: {exc}")
-                self.matrixStore.set_active_rows_for_display(rows)
-                self.commands.requestedRows = rows
-                self.commands.activeRows = rows
-                self.commands.pendingRows = None
+            self.preferredRows = rows
+        active_transport = str(self.transport.status.get("transport", "none"))
+        if active_transport in {"serial", "ble", "wifi"}:
+            self._start_preference_apply(
+                "explicit_setup_profile",
+                restore_measurement=True,
+                target_boot_id=self.commands.bootId,
+            )
+            if self._preferenceApplyState["state"] == "WAITING_BOOTSTRAP":
+                warnings.append("measurement preferences stored and will apply in order after bootstrap")
+        else:
+            # A profile remains a host preference while offline/replaying.
+            # Update only display geometry; no synthetic firmware transaction
+            # is created and no command is queued for a future connection.
+            self.matrixStore.set_active_rows_for_display(self.preferredRows)
+            self.commands.requestedRows = self.preferredRows
+            self.commands.activeRows = self.preferredRows
+            self.commands.pendingRows = None
         return {"ok": True, "profile": self.setup_profile_payload(), "warnings": warnings}
+
+    def _on_bootstrap_complete(self, _status: Any) -> None:
+        transition = self.lastBootTransition
+        boot_id = self.commands.bootId
+        existing_target = self._preferenceApplyState.get("targetBootId")
+        interrupted_apply = existing_target is not None and existing_target == boot_id and self._preferenceApplyState.get("state") not in {
+            "COMPLETE", "DISABLED", "IDLE"
+        }
+        if transition.get("bootChanged") and self.resumeMeasurementAfterDeviceRestart:
+            self._start_preference_apply("device_reboot", restore_measurement=True, target_boot_id=boot_id)
+            return
+        if interrupted_apply:
+            self._preferenceApplyState["state"] = "READY"
+            self._advance_preference_apply()
+            return
+        if transition.get("bootChanged") and not self.resumeMeasurementAfterDeviceRestart:
+            self._preferenceApplyState = {
+                "state": "DISABLED",
+                "reason": "resume_after_device_restart_disabled",
+                "targetBootId": boot_id,
+                "restoreMeasurement": False,
+                "error": "",
+                "commands": [],
+            }
+        if self.preferredUsbStream != "DEVICE_DEFAULT" and self.synchronizer.status.source == "serial":
+            self._start_preference_apply("safe_usb_preference", restore_measurement=False, target_boot_id=boot_id)
+
+    def _start_preference_apply(
+        self,
+        reason: str,
+        *,
+        restore_measurement: bool,
+        target_boot_id: int | None = None,
+    ) -> None:
+        self._preferenceApplyState = {
+            "state": "READY",
+            "reason": str(reason),
+            "targetBootId": self.commands.bootId if target_boot_id is None else target_boot_id,
+            "restoreMeasurement": bool(restore_measurement),
+            "error": "",
+            "commands": [],
+        }
+        self._advance_preference_apply()
+
+    def _advance_preference_apply(self) -> None:
+        state = str(self._preferenceApplyState.get("state", "IDLE"))
+        if state in {"IDLE", "DISABLED", "COMPLETE", "ERROR"}:
+            return
+        if self.synchronizer.status.state != "SYNCED" or not self.commands.authoritativeStateKnown:
+            self._preferenceApplyState["state"] = "WAITING_BOOTSTRAP"
+            return
+        if self.commands.pendingRows is not None or self.commands.pendingRowModes is not None or self.commands.pendingMode is not None:
+            self._preferenceApplyState["state"] = "WAITING_TRANSACTION"
+            return
+        try:
+            if self._preferenceApplyState.get("restoreMeasurement"):
+                if self.commands.activeRows != self.preferredRows:
+                    self.request_rows(self.preferredRows)
+                    self._preferenceApplyState["state"] = "WAITING_ROWS"
+                    self._preferenceApplyState["commands"].append(f"ROWS={self.preferredRows}")
+                    return
+                if tuple(self.commands.appliedRowModes) != tuple(self.preferredRowModes):
+                    encoded = "".join({"CAP": "C", "VOLT": "V", "RES": "R"}[mode] for mode in self.preferredRowModes)
+                    self.request_row_modes_api(self.preferredRowModes)
+                    self._preferenceApplyState["state"] = "WAITING_ROW_MODES"
+                    self._preferenceApplyState["commands"].append(f"ROWMODES={encoded}")
+                    return
+            if self.preferredUsbStream != "DEVICE_DEFAULT" and self.synchronizer.status.source == "serial":
+                current_usb = self.deviceInfo.get("usbStream") or (
+                    asdict(self.synchronizer.usbStream) if self.synchronizer.usbStream is not None else {}
+                )
+                if str(current_usb.get("mode", "")).upper() != self.preferredUsbStream:
+                    self.request_usb_stream(self.preferredUsbStream)
+                    self._preferenceApplyState["state"] = "WAITING_USB_STREAM"
+                    self._preferenceApplyState["commands"].append(f"USBSTREAM={self.preferredUsbStream}")
+                    return
+            self._preferenceApplyState["state"] = "COMPLETE"
+        except Exception as exc:
+            self._preferenceApplyState["state"] = "ERROR"
+            self._preferenceApplyState["error"] = str(exc)
+            self._host_log("Preferences", "error", f"Ordered preference restore failed: {exc}")
+
+    def _after_configuration_event(self, event: Any) -> None:
+        state = str(self._preferenceApplyState.get("state", "IDLE"))
+        if state in {"IDLE", "DISABLED", "COMPLETE", "ERROR", "WAITING_BOOTSTRAP"}:
+            return
+        if isinstance(event, UsbStreamInfo):
+            if state != "WAITING_USB_STREAM" or event.mode != self.preferredUsbStream:
+                return
+            self._advance_preference_apply()
+            return
+        if isinstance(event, CommandTransactionEvent):
+            if str(event.phase).lower() in {"failed", "rejected", "error"} and str(event.commandType).lower() in {
+                "rows", "row_modes"
+            }:
+                self._preferenceApplyState["state"] = "ERROR"
+                self._preferenceApplyState["error"] = str(event.error or event.state or "firmware rejected preference")
+                return
+            if str(event.phase).lower() != "applied":
+                return
+        elif not isinstance(event, CommandApplied):
+            return
+        self._advance_preference_apply()
 
     def _commit_offsets(self, offsets: np.ndarray, reason: str) -> None:
         current = self.user_offsets_array()
@@ -665,8 +1005,17 @@ class BackendRuntime(SensorArrayRuntime):
                 {
                     "seq": int(history.seq[index]),
                     "timeSeconds": _json_number(history.timeSeconds[index]),
+                    "deviceTimestampUs": _none_if_negative(history.deviceTimestampUs[index]),
+                    "hostWallTime": _json_number(history.hostWallTimes[index]),
+                    "hostReceivedUtc": (
+                        datetime.fromtimestamp(float(history.hostWallTimes[index]), timezone.utc).isoformat()
+                        if np.isfinite(history.hostWallTimes[index])
+                        else ""
+                    ),
+                    "hostReceivedMonotonicNs": _none_if_negative(history.hostMonotonicNs[index]),
                     "rows": int(history.rows[index]),
                     "measurementMode": str(history.modes[index]),
+                    "frameKind": str(history.modes[index]),
                     "unit": str(history.units[index]),
                     "scale": int(history.scales[index]),
                     "physicalValues": [_json_number(value) for value in values],
@@ -674,10 +1023,42 @@ class BackendRuntime(SensorArrayRuntime):
                     "rawFixed": [_json_number(value) for value in history.rawFixed[index, :]],
                     "valid": [bool(value) for value in history.valid[index, :].tolist()],
                     "fresh": [bool(value) for value in history.fresh[index, :].tolist()],
+                    "freshKnown": [bool(value) for value in history.freshKnown[index, :].tolist()],
+                    "expected": [bool(value) for value in history.expected[index, :].tolist()],
+                    "expectedKnown": [bool(value) for value in history.expectedKnown[index, :].tolist()],
+                    "acquired": [bool(value) for value in history.acquired[index, :].tolist()],
+                    "acquiredKnown": [bool(value) for value in history.acquiredKnown[index, :].tolist()],
+                    "error": [bool(value) for value in history.error[index, :].tolist()],
                     "errorCodes": [None if int(value) < 0 else int(value) for value in history.errorCodes[index, :]],
+                    "errorReasons": [str(value) for value in history.errorReasons[index, :]],
                     "pga": [None if int(value) < 0 else int(value) for value in history.pga[index, :]],
+                    "pgaBypass": [bool(value) for value in history.pgaBypass[index, :].tolist()],
                     "generation": None if int(history.generations[index]) < 0 else int(history.generations[index]),
                     "requestId": None if int(history.requestIds[index]) < 0 else int(history.requestIds[index]),
+                    "connectionGeneration": int(history.connectionGenerations[index]),
+                    "bootId": _none_if_negative(history.bootIds[index]),
+                    "rowsGeneration": _none_if_negative(history.rowsGenerations[index]),
+                    "rowsRequestId": _none_if_negative(history.rowsRequestIds[index]),
+                    "modeGeneration": _none_if_negative(history.modeGenerations[index]),
+                    "modeRequestId": _none_if_negative(history.modeRequestIds[index]),
+                    "profileGeneration": _none_if_negative(history.profileGenerations[index]),
+                    "profileRequestId": _none_if_negative(history.profileRequestIds[index]),
+                    "configuredRowProfile": [str(value) for value in history.rowModes[index, :]],
+                    "wireRowProfile": str(history.wireProfiles[index] or "") or None,
+                    "rowModes": [str(value) for value in history.rowModes[index, :]],
+                    "rowUnits": [str(value) for value in history.rowUnits[index, :]],
+                    "rowScales": [int(value) for value in history.rowScales[index, :]],
+                    "rail": {
+                        "railValid": bool(history.railValid[index]),
+                        "railFresh": bool(history.railFresh[index]),
+                        "railAge": _none_if_negative(history.railAge[index]),
+                        "avddUv": _none_if_negative(history.avddUv[index]),
+                        "avssUv": _none_if_signed_missing(history.avssUv[index]),
+                        "railSpanUv": _none_if_negative(history.railSpanUv[index]),
+                        "railSource": str(history.railSource[index]),
+                        "railReason": str(history.railReason[index]),
+                        "bootId": _none_if_negative(history.bootIds[index]),
+                    },
                     "source": str(history.sources[index] or "history"),
                 }
             )
@@ -974,3 +1355,13 @@ def _json_number(value: Any) -> float | None:
     if not np.isfinite(number):
         return None
     return number
+
+
+def _none_if_negative(value: Any) -> int | None:
+    parsed = int(value)
+    return None if parsed < 0 else parsed
+
+
+def _none_if_signed_missing(value: Any) -> int | None:
+    parsed = int(value)
+    return None if parsed == np.iinfo(np.int64).min else parsed

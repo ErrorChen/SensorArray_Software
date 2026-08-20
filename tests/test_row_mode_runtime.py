@@ -87,6 +87,8 @@ def row_measurement(row: int, mode: str, value: float) -> RowMeasurement:
         reference=None,
         railValid=True if mode != "CAP" else None,
         railAgeFrames=0 if mode != "CAP" else None,
+        expectedMask=np.ones(8, dtype=bool),
+        acquiredMask=np.ones(8, dtype=bool),
     )
 
 
@@ -111,6 +113,8 @@ def mixed_frame(seq: int, profile=PROFILE, cap_value: float = 6.3) -> MixedMeasu
         sessionGeneration=0,
         receivedTime=time.time(),
         receivedMonotonicNs=time.monotonic_ns(),
+        expectedMask=np.ones(64, dtype=bool),
+        acquiredMask=np.ones(64, dtype=bool),
     )
 
 
@@ -147,7 +151,7 @@ def test_row_profile_transaction_is_atomic_strict_and_times_out_without_fabricat
     next_profile = ("CAP", "RES", "VOLT", "CAP", "RES", "VOLT", "CAP", "RES")
     service.request_row_modes(next_profile, lambda _command: None)
     service.timeout_old(seconds=-1.0)
-    assert service.rowModeTransitionState == "timeout"
+    assert service.rowModeTransitionState == "outcome_unknown"
     assert service.appliedRowModes == PROFILE
     assert service.pendingRowModes == next_profile
     assert "RMAPP" in service.rowModeError
@@ -462,8 +466,8 @@ def test_heterogeneous_saved_profile_uses_mixed_even_when_active_prefix_is_cap()
         receivedMonotonicNs=time.monotonic_ns(),
     )
 
-    # Firmware 331c445 decides its frame family from all eight persisted row
-    # modes, so inactive S5..S8 still make this an M/MR/K profile.
+    # Firmware 8045 decides its frame family from all eight persisted row
+    # modes, while the actual M wire profile uses N for inactive S5..S8.
     assert store.add_capacitance(legacy_frame) is False
     frame = replace(
         mixed_frame(20, profile=profile),
@@ -471,7 +475,10 @@ def test_heterogeneous_saved_profile_uses_mixed_even_when_active_prefix_is_cap()
         cells=32,
         rowsGeneration=3,
         rowsRequestId=14,
+        profile=("CAP", "CAP", "CAP", "CAP", "NONE", "NONE", "NONE", "NONE"),
         rowFrames=tuple(row_measurement(row, "CAP", 7.0) for row in range(1, 5)),
+        expectedMask=np.ones(32, dtype=bool),
+        acquiredMask=np.ones(32, dtype=bool),
     )
     assert store.add_mixed(frame) is True
     snapshot = store.snapshot()
@@ -538,9 +545,21 @@ def test_mixed_store_rejects_wrong_rows_geometry_generation_and_request_identity
         rowsRequestId=14,
         profileGeneration=12,
         profileRequestId=63,
+        profile=("RES", "VOLT", "VOLT", "CAP", "CAP", "NONE", "NONE", "NONE"),
         rowFrames=mixed_frame(102, profile=five_row_profile).rowFrames[:5],
+        expectedMask=np.ones(40, dtype=bool),
+        acquiredMask=np.ones(40, dtype=bool),
     )
-    assert store.add_mixed(replace(five_rows, rows=4, cells=32, rowFrames=five_rows.rowFrames[:4])) is False
+    wrong_geometry = replace(
+        five_rows,
+        rows=4,
+        cells=32,
+        profile=("RES", "VOLT", "VOLT", "CAP", "NONE", "NONE", "NONE", "NONE"),
+        rowFrames=five_rows.rowFrames[:4],
+        expectedMask=np.ones(32, dtype=bool),
+        acquiredMask=np.ones(32, dtype=bool),
+    )
+    assert store.add_mixed(wrong_geometry) is False
     assert store.add_mixed(replace(five_rows, rowsGeneration=5)) is False
     assert store.add_mixed(replace(five_rows, rowsRequestId=99)) is False
     assert store.add_mixed(five_rows) is True
@@ -686,7 +705,7 @@ def test_row_modes_api_sends_one_atomic_command_and_get_reports_pending_then_app
     assert applied["rowProfile"]["generation"] == 11
 
 
-def test_homogeneous_rmapp_snapshot_keeps_global_quick_mode_independent():
+def test_homogeneous_rmapp_snapshot_updates_effective_global_mode_without_forging_generation():
     fixture = Path(__file__).parent / "fixtures" / "current_protocol" / "volt_rows2_mixed.txt"
     envelope = TransportEnvelope(
         source="replay",
@@ -713,7 +732,9 @@ def test_homogeneous_rmapp_snapshot_keeps_global_quick_mode_independent():
     runtime._handle_event(voltage_frame)
     payload = snapshot_payload(runtime)
 
-    assert payload["measurement"]["appliedMode"] == "CAP"
+    assert payload["measurement"]["appliedMode"] == "VOLT"
+    assert payload["measurement"]["transitionState"] == "applied_by_row_profile"
+    assert payload["measurement"]["generation"] is None
     assert payload["measurement"]["rowProfile"]["appliedModes"] == ["VOLT"] * 8
     assert payload["measurement"]["rowProfile"]["generation"] == voltage_frame.generation
     assert payload["measurement"]["rowProfile"]["requestId"] == voltage_frame.requestId
@@ -811,6 +832,10 @@ def test_history_inserts_mode_discontinuity_for_same_cell():
 
 def test_mixed_baseline_and_delta_touch_only_cap_rows():
     runtime = BackendRuntime(AppConfiguration())
+    # Keep this assertion focused on the CAP baseline transform.  The default
+    # voltage view is VSS-relative and correctly becomes unavailable without
+    # same-boot rail telemetry.
+    runtime.ui.voltageReference = "ground"
     runtime.transport.status.update({"transport": "serial", "device": ""})
     runtime._handle_event(mixed_frame(1, cap_value=6.0))
     runtime.capture_baseline()

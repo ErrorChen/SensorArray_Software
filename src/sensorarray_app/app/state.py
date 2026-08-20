@@ -22,6 +22,7 @@ class UiState:
     cellText: bool = True
     freezeColor: bool = False
     unitMode: str = "auto"
+    voltageReference: str = "vss_relative"
     circuitOffsetPf: float = FDC_CIRCUIT_OFFSET_PF
     frozenColorMin: float | None = None
     frozenColorMax: float | None = None

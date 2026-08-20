@@ -137,7 +137,7 @@ type HomogeneousProfileAuthority = {
 function homogeneousProfileAuthority(snapshot: BackendSnapshotPayload | null): HomogeneousProfileAuthority | null {
   const profile = snapshot?.measurement?.rowProfile;
   const modes = profile?.appliedModes;
-  // Firmware 331c445 chooses the legacy versus mixed frame grammar from the
+  // Firmware 8045e9e9 chooses the legacy versus mixed frame grammar from the
   // complete persisted eight-row profile. Inactive configured rows therefore
   // remain semantically relevant: ROWS=4 + CCCCRVVR is mixed, not CAP.
   const savedModes = Array.isArray(modes) && modes.length === 8 ? modes : [];

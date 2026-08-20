@@ -21,12 +21,13 @@ class ModeRequest(BaseModel):
 class SerialConnectRequest(BaseModel):
     port: str = Field(min_length=1)
     baud: int = DEFAULT_SERIAL_BAUD
-    autoReconnect: bool = False
+    autoReconnect: bool = True
 
 
 class BleConnectRequest(BaseModel):
     address: str = Field(min_length=1)
     deviceId: str = ""
+    autoReconnect: bool = True
 
 
 class WifiConnectRequest(BaseModel):
@@ -99,7 +100,7 @@ async def ble_scan(timeout: float = 10.0, runtime: BackendRuntime = Depends(get_
 @router.post("/ble/connect")
 def ble_connect(body: BleConnectRequest, runtime: BackendRuntime = Depends(get_runtime)) -> dict:
     try:
-        runtime.connect_ble(body.address, body.deviceId)
+        runtime.connect_ble(body.address, body.deviceId, body.autoReconnect)
         return {"ok": True, "mode": "ble", "address": body.address}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

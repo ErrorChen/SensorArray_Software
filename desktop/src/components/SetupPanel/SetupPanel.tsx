@@ -49,6 +49,7 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
   const currentModeBusy = connectionMode === transportMode && busyStates.has(connectionState);
   const bleScanDisabled = isBleScanDisabled(connectionMode, connectionState);
   const capacitanceMode = isCapacitanceMode(snapshot);
+  const voltageAvailable = (snapshot?.frame.rowModes ?? snapshot?.matrix.modeByRow ?? []).slice(0, snapshot?.frame.rows ?? 8).includes("VOLT");
 
   useEffect(() => {
     setTransportMode(setupProfile.transport.mode);
@@ -186,9 +187,9 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
       return;
     }
     if (transportMode === "serial") {
-      await run("Connecting...", () => client.connectSerial(selectedPort, baud));
+      await run("Connecting...", () => client.connectSerial(selectedPort, baud, setupProfile.lifecycle.autoReconnect));
     } else if (transportMode === "ble") {
-      await run("Connecting...", () => client.connectBle(selectedBle, selectedBle));
+      await run("Connecting...", () => client.connectBle(selectedBle, selectedBle, setupProfile.lifecycle.autoReconnect));
     } else if (transportMode === "wifi") {
       await run("Connecting...", () => client.connectWifi(selectedWifi || fallbackHost));
     } else {
@@ -441,6 +442,38 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
       </div>
 
       <div className="controlGroup">
+        <div className="panelHeader small">Lifecycle &amp; reconnect</div>
+        <label className="checkLine">
+          <input
+            type="checkbox"
+            checked={setupProfile.lifecycle.autoReconnect}
+            onChange={(event) => updateLifecycleProfile({ autoReconnect: event.target.checked })}
+          />
+          Automatically reconnect the selected physical device
+        </label>
+        <label className="checkLine">
+          <input
+            type="checkbox"
+            checked={setupProfile.lifecycle.resumeMeasurementAfterDeviceRestart}
+            onChange={(event) => updateLifecycleProfile({ resumeMeasurementAfterDeviceRestart: event.target.checked })}
+          />
+          Resume measurement configuration after device restart
+        </label>
+        <label>Preferred USB stream after bootstrap</label>
+        <select
+          value={setupProfile.lifecycle.preferredUsbStream}
+          onChange={(event) => updateLifecycleProfile({
+            preferredUsbStream: event.target.value as SetupProfile["lifecycle"]["preferredUsbStream"]
+          })}
+        >
+          <option value="DEVICE_DEFAULT">Device default</option>
+          <option value="DEBUG">DEBUG</option>
+          <option value="FULL">FULL</option>
+        </select>
+        <div className="modeOnlyNotice">FDC isolation, Recover, Restart, and ADS checks are never restored automatically.</div>
+      </div>
+
+      <div className="controlGroup">
         <div className="panelHeader small">Display</div>
         {capacitanceMode ? (
           <>
@@ -464,6 +497,29 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
         ) : (
           <div className="modeOnlyNotice">Baseline, Delta C/C0, and capacitance offsets are available for active CAP rows only.</div>
         )}
+        {voltageAvailable ? (
+          <>
+            <label>Voltage display reference</label>
+            <select
+              disabled={!client}
+              value={snapshot?.display.voltageReference ?? "vss_relative"}
+              onChange={(event) =>
+                void run("Saving...", async () => {
+                  const voltageReference = event.target.value as "ground" | "vss_relative" | "rail_normalized";
+                  onSetupProfileChange({ ...setupProfile, display: { ...setupProfile.display, voltageReference } });
+                  await client!.setDisplaySettings({ voltageReference });
+                })
+              }
+            >
+              <option value="ground">Ground referenced</option>
+              <option value="vss_relative">VSS-relative (recommended)</option>
+              <option value="rail_normalized">Rail normalized (%)</option>
+            </select>
+            {snapshot?.display.voltageReference !== "ground" && !snapshot?.voltage?.derivedValid ? (
+              <div className="modeOnlyNotice">Derived voltage is unavailable until a fresh, valid rail sample from the same boot is present.</div>
+            ) : null}
+          </>
+        ) : null}
         <label className="checkLine">
           <input
             type="checkbox"
@@ -522,6 +578,10 @@ export function SetupPanel({ client, snapshot, setupProfile, onSetupProfileChang
 
   function updateTransportProfile(partial: Partial<SetupProfile["transport"]>): void {
     onSetupProfileChange({ ...setupProfile, transport: { ...setupProfile.transport, ...partial } });
+  }
+
+  function updateLifecycleProfile(partial: Partial<SetupProfile["lifecycle"]>): void {
+    onSetupProfileChange({ ...setupProfile, lifecycle: { ...setupProfile.lifecycle, ...partial } });
   }
 }
 

@@ -72,6 +72,8 @@ export function RowModeProfileControl({ client, snapshot, setupProfile, onSetupP
 
   const activeRows = clampActiveRows(snapshot?.frame.rows ?? setupProfile.acquisition.rows);
   const changed = !profilesEqual(draftModes, view.appliedModes);
+  const capRestartRequired = snapshot?.fdcIsolation?.restartRequired === true;
+  const capBlocked = capRestartRequired && draftModes.includes("CAP");
   const error = localError || view.error;
 
   return (
@@ -96,9 +98,10 @@ export function RowModeProfileControl({ client, snapshot, setupProfile, onSetupP
           );
         })}
       </div>
-      <button className="primary" disabled={!client || busy || !changed} onClick={() => void applyRowModes()}>
+      <button className="primary" disabled={!client || busy || !changed || capBlocked} onClick={() => void applyRowModes()}>
         {busy ? "Applying row modes\u2026" : "Apply row modes"}
       </button>
+      {capBlocked ? <div className="modeOnlyNotice">This profile contains CAP, which is unavailable until the device is restarted.</div> : null}
       <dl className="rowModeStatus" data-testid="row-mode-status">
         <div><dt>Applied profile</dt><dd>{profileCode(view.appliedModes)}</dd></div>
         <div><dt>Pending profile</dt><dd>{view.pendingModes ? profileCode(view.pendingModes) : "\u2014"}</dd></div>

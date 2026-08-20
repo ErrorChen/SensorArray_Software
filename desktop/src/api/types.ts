@@ -16,7 +16,10 @@ export type MeasurementTransitionState =
   | "configuring_rail"
   | "timeout"
   | "error"
-  | "synced";
+  | "synced"
+  | "not_sent"
+  | "outcome_unknown"
+  | "resync_required";
 
 export type VoltageRailSnapshot = {
   configured: boolean;
@@ -31,6 +34,7 @@ export type RailTelemetry = {
   valid: boolean | null;
   fresh: boolean | null;
   age: number | null;
+  ageMs?: number | null;
   ageSeconds?: number | null;
   source: string;
   reason: string;
@@ -56,6 +60,12 @@ export type MeasurementSnapshot = {
   frameSeq: number | null;
   error: string;
   deviceState?: string;
+  bootId?: number | null;
+  connectionGeneration?: number;
+  authoritativeStateKnown?: boolean;
+  syncState?: string;
+  resyncRequired?: boolean;
+  expectedRestart?: boolean;
   rail: VoltageRailSnapshot;
   railTelemetry?: RailTelemetry;
   rowProfile?: RowModeProfileSnapshot;
@@ -67,6 +77,10 @@ export type ConnectionSnapshot = {
   state: string;
   deviceLabel: string;
   generation: number;
+  connectionGeneration?: number;
+  reconnectAttempt?: number;
+  reconnectBackoff?: number;
+  deviceIdentity?: Record<string, unknown> | string | null;
   error?: string;
 };
 
@@ -84,6 +98,15 @@ export type FrameSnapshot = {
   rowModes?: RowMeasurementMode[];
   profileGeneration?: number | null;
   profileRequestId?: number | null;
+  connectionGeneration?: number;
+  bootId?: number | null;
+  expected?: boolean[][];
+  acquired?: boolean[][];
+  fresh?: boolean[][];
+  validMask?: boolean[][];
+  errorMask?: boolean[][];
+  acquisitionMasksKnown?: boolean;
+  quarantinedReason?: string;
 };
 
 export type MatrixDiagnostics = {
@@ -121,6 +144,9 @@ export type MatrixSnapshot = {
   rawFixed: (number | null)[][];
   valid: boolean[][];
   fresh: boolean[][];
+  expected?: boolean[][];
+  acquired?: boolean[][];
+  acquisitionMasksKnown?: boolean;
   error?: boolean[][];
   errorCodes: (number | null)[][];
   errorReasons: (string | null)[][];
@@ -140,6 +166,9 @@ export type MatrixSnapshot = {
   modeByRow?: RowMeasurementMode[];
   unitByRow?: (MeasurementUnit | "%")[];
   scaleByRow?: number[];
+  connectionGeneration?: number;
+  bootId?: number | null;
+  quarantinedReason?: string;
 };
 
 export type SelectionSnapshot = {
@@ -161,6 +190,7 @@ export type DisplaySnapshot = {
   pauseDisplay: boolean;
   freezeColor: boolean;
   unitMode: string;
+  voltageReference?: "ground" | "vss_relative" | "rail_normalized";
   circuitOffsetPf: number;
   trendLatestN?: number;
   colorRange: {
@@ -204,6 +234,9 @@ export type LogRow = {
   parsedFields: Record<string, string>;
   recognised: boolean;
   sessionGeneration: number;
+  category?: "MEASUREMENT" | "CONTROL" | "LIFECYCLE" | "FAULT" | "DIAGNOSTIC" | "HOST" | string;
+  connectionGeneration?: number;
+  bootId?: number | null;
 };
 
 export type LogsSnapshot = {
@@ -251,7 +284,10 @@ export type DiscoverySnapshot = {
 };
 
 export type BackendSnapshotPayload = {
+  transport?: TransportLifecycleSnapshot;
   connection: ConnectionSnapshot;
+  device?: DeviceLifecycleSnapshot;
+  bootstrap?: Record<string, unknown>;
   measurement: MeasurementSnapshot;
   frame: FrameSnapshot;
   matrix: MatrixSnapshot;
@@ -266,6 +302,86 @@ export type BackendSnapshotPayload = {
   battery?: BatterySnapshot;
   ads?: AdsSnapshot;
   rates?: RateSnapshot;
+  rail?: RailTelemetry & { avddUv?: number | null; avssUv?: number | null; spanUv?: number | null; bootId?: number | null };
+  voltage?: {
+    groundV: (number | null)[][];
+    vssRelativeV: (number | null)[][];
+    railNormalised: (number | null)[][];
+    derivedValid: boolean;
+    railBootMatchesFrame: boolean;
+  };
+  fdcIsolation?: FdcIsolationSnapshot | null;
+  usbStream?: UsbStreamSnapshot | null;
+  calibration?: CalibrationSnapshot | null;
+  performance?: Record<string, unknown>;
+  recording?: RecordingSnapshot;
+};
+
+export type CalibrationSnapshot = {
+  source: string;
+  schema: number | null;
+  valid: boolean;
+  boardId: string | null;
+  hardwareRev: number | null;
+  payloadLength: number | null;
+  state?: string;
+  rawFields?: Record<string, string>;
+};
+
+export type TransportLifecycleSnapshot = {
+  source: string;
+  state: string;
+  connectionGeneration: number;
+  sessionGeneration: number;
+  reconnectAttempt: number;
+  reconnectBackoff: number;
+  deviceIdentity: Record<string, unknown> | string | null;
+  deviceLabel: string;
+  error: string;
+};
+
+export type DeviceLifecycleSnapshot = {
+  bootId: number | null;
+  bootCount: number | null;
+  resetReason: string | null;
+  resetCategory?: string | null;
+  resetLabel?: string | null;
+  resetSeverity?: string | null;
+  powerRelated?: boolean;
+  ready: boolean | null;
+  stage: string | null;
+  lastError: string | null;
+  protocol: Record<string, unknown> | null;
+  build: Record<string, unknown> | null;
+  lifecycleEvents: Array<Record<string, unknown>>;
+};
+
+export type FdcIsolationSnapshot = {
+  sd?: "high" | "low" | "unknown" | string | null;
+  verified?: boolean | null;
+  restartRequired?: boolean | null;
+  [key: string]: unknown;
+};
+
+export type UsbStreamSnapshot = {
+  mode?: "DEBUG" | "FULL" | string;
+  dataEvery?: number | null;
+  diagEvery?: number | null;
+  [key: string]: unknown;
+};
+
+export type RecordingSnapshot = {
+  state: "NOT_RECORDING" | "RECORDING" | "FINALIZING" | "ERROR" | string;
+  sessionId?: string | null;
+  directory?: string | null;
+  receivedFrames: number;
+  writtenFrames: number;
+  writtenEvents?: number;
+  queueDepth: number;
+  queueCapacity?: number;
+  droppedFrames: number;
+  pendingGapFrames?: number;
+  error?: string;
 };
 
 export type CapacitanceSnapshot = {
@@ -469,7 +585,7 @@ export type OffsetResponse = {
   changedCells?: number;
 };
 
-export type SessionDataFormat = "csv" | "xlsx" | "mat" | "h5";
+export type SessionDataFormat = "csv" | "xlsx" | "mat" | "h5" | "zip";
 
 export type SetupProfile = {
   schemaVersion: 1 | 2 | 3;
@@ -493,10 +609,16 @@ export type SetupProfile = {
     pauseDisplay: boolean;
     freezeColor: boolean;
     unitMode: string;
+    voltageReference: "ground" | "vss_relative" | "rail_normalized";
     circuitOffsetPf: number;
     trendLatestN?: number;
   };
   offsetsPf: number[][];
+  lifecycle: {
+    autoReconnect: boolean;
+    resumeMeasurementAfterDeviceRestart: boolean;
+    preferredUsbStream: "DEVICE_DEFAULT" | "DEBUG" | "FULL";
+  };
   command: { lineEnding: CommandLineEnding };
   paths: { defaultSaveDirectory: string };
 };

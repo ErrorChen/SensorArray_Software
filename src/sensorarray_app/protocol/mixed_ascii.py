@@ -12,7 +12,7 @@ from sensorarray_app.domain.models import (
     ParserErrorEvent,
     RowMeasurement,
     TransportEnvelope,
-    normalize_row_modes,
+    normalize_wire_mixed_profile,
 )
 from sensorarray_app.protocol.crc import crc32_reflected
 from sensorarray_app.protocol.measurement_ascii import (
@@ -32,7 +32,7 @@ MODE_WIRE = {
     "VOLT": ("V", -6, "uv-x"),
     "RES": ("ohm", -3, "mohm-x"),
 }
-MODE_FROM_WIRE = {"C": "CAP", "V": "VOLT", "R": "RES"}
+MODE_FROM_WIRE = {"CAP": "CAP", "VOLT": "VOLT", "RES": "RES"}
 
 
 @dataclass
@@ -63,15 +63,17 @@ class _PendingMixedFrame:
     profileGeneration: int
     profileRequestId: int
     profile: tuple[str, ...]
-    canonicalFirmwareWire: bool
+    expectedBits: int
+    acquiredBits: int
     startMonotonicNs: int
     rowLines: dict[int, bytes] = field(default_factory=dict)
+    rowLineOrder: list[bytes] = field(default_factory=list)
     rowFrames: dict[int, RowMeasurement] = field(default_factory=dict)
 
     def payload_bytes(self) -> bytes:
         payload = bytearray(self.headerBytes)
-        for row in sorted(self.rowLines):
-            payload.extend(self.rowLines[row])
+        for rowLine in self.rowLineOrder:
+            payload.extend(rowLine)
         return bytes(payload)
 
 
@@ -82,17 +84,17 @@ class MixedMeasurementAsciiParser:
 
         M,seq=1,ts=2,rows=2,cells=16,rgen=3,rrid=4,
           pgen=5,prid=6,profile=RVVCCVVR,fmt=mix1
-        MR,s=1,m=R,unit=ohm,scale=-3,valid=FF,fresh=FF,
+        MR,s=1,m=RES,unit=ohm,scale=-3,valid=FF,fresh=FF,
           error=00,fmt=mohm-x,D=...,...
-        MR,s=2,m=V,unit=V,scale=-6,...,fmt=uv-x,D=...,...
+        MR,s=2,m=VOLT,unit=V,scale=-6,...,fmt=uv-x,D=...,...
         K,seq=1,rgen=3,rrid=4,pgen=5,prid=6,crc=12345678
 
-    This is the exact schema emitted by firmware 331c445.  The former long
-    field aliases remain readable for saved replay compatibility, but newly
-    generated traffic uses the short firmware keys.  Physical row records
-    must be unique and ascending, and exactly one record must exist for each
-    active row.  CRC covers the exact M and MR bytes including LF, with CRLF
-    normalised to LF, and excludes K as in the legacy C/V/R formatters.
+    This is the exact schema emitted by firmware 8045e9e9.  The wire profile
+    always has eight characters, with C/V/R in the active prefix and N in the
+    inactive suffix.  Physical row records may be routed by ``s`` rather than
+    arrival order, but must be unique and complete.  CRC covers the exact M
+    and MR bytes in arrival order including LF, with CRLF normalised to LF,
+    and excludes K.
     """
 
     name = "MixedMeasurementAsciiProtocol"
@@ -188,51 +190,38 @@ class MixedMeasurementAsciiParser:
         envelope: TransportEnvelope,
     ) -> _PendingMixedFrame | ParserErrorEvent:
         fields = _parse_key_values(line)
-        shortIdentityKeys = ("rgen", "rrid", "pgen", "prid")
-        canonicalFirmwareWire = any(key in fields for key in shortIdentityKeys)
-        if canonicalFirmwareWire and not all(key in fields for key in shortIdentityKeys):
-            return self._reject(
-                "mixed_identity_schema",
-                "canonical M header requires rgen,rrid,pgen,prid",
-                envelope,
-                rawLine,
-            )
         try:
             seq = _decimal(fields, "seq")
             timestampUs = _decimal(fields, "ts")
             rows = _decimal(fields, "rows")
             cells = _decimal(fields, "cells")
-            rowsGeneration = _decimal_alias(fields, "rgen", "rowsGen")
-            rowsRequestId = _decimal_alias(fields, "rrid", "rowsRid")
-            profileGeneration = _decimal_alias(fields, "pgen", "profileGen")
-            profileRequestId = _decimal_alias(fields, "prid", "profileRid")
-            profile = normalize_row_modes(fields["profile"])
-            count = _decimal(fields, "n") if "n" in fields else cells
+            rowsGeneration = _decimal(fields, "rgen")
+            rowsRequestId = _decimal(fields, "rrid")
+            profileGeneration = _decimal(fields, "pgen")
+            profileRequestId = _decimal(fields, "prid")
+            profile = normalize_wire_mixed_profile(fields["profile"], rows)
+            expectedBits = _hex(fields, "expected", width=16)
+            acquiredBits = _hex(fields, "acquired", width=16)
         except (KeyError, ValueError) as exc:
             return self._reject("bad_m_header", f"invalid M header fields: {exc}", envelope, rawLine)
         if not (1 <= rows <= 8):
             return self._reject("bad_rows", f"rows out of range: {rows}", envelope, rawLine)
-        if cells != rows * ROW_CELLS or count != cells:
-            return self._reject("bad_cells", f"cells/n must both equal rows*8 ({rows * ROW_CELLS})", envelope, rawLine)
-        if canonicalFirmwareWire and fields.get("fmt") != "mix1":
+        if cells != rows * ROW_CELLS:
+            return self._reject("bad_cells", f"cells must equal rows*8 ({rows * ROW_CELLS})", envelope, rawLine)
+        if fields.get("fmt") != "mix1":
             return self._reject(
                 "header_format_mismatch",
-                "canonical M header requires fmt=mix1",
-                envelope,
-                rawLine,
-            )
-        # Firmware 331c445 selects M/MR/K from the persisted eight-row
-        # profile, even when the active ROWS prefix happens to be homogeneous.
-        # A fully homogeneous profile remains on the legacy C/V/R grammar.
-        if len(set(profile)) < 2:
-            return self._reject(
-                "homogeneous_profile",
-                "M/MR/K requires at least two measurement modes in the saved profile",
+                "M header requires fmt=mix1",
                 envelope,
                 rawLine,
             )
         if min(seq, timestampUs, rowsGeneration, rowsRequestId, profileGeneration, profileRequestId) < 0:
             return self._reject("negative_identity", "M identities and timestamp must be non-negative", envelope, rawLine)
+        activeBits = (1 << cells) - 1 if cells < 64 else (1 << 64) - 1
+        if expectedBits & ~activeBits or acquiredBits & ~activeBits:
+            return self._reject("mask_out_of_range", "M expected/acquired contains inactive cell bits", envelope, rawLine)
+        if acquiredBits & ~expectedBits:
+            return self._reject("acquired_outside_expected", "M acquired must be a subset of expected", envelope, rawLine)
         return _PendingMixedFrame(
             headerLine=line,
             headerBytes=rawLine,
@@ -245,7 +234,8 @@ class MixedMeasurementAsciiParser:
             profileGeneration=profileGeneration,
             profileRequestId=profileRequestId,
             profile=profile,
-            canonicalFirmwareWire=canonicalFirmwareWire,
+            expectedBits=expectedBits,
+            acquiredBits=acquiredBits,
             startMonotonicNs=envelope.receivedMonotonicNs,
         )
 
@@ -253,40 +243,30 @@ class MixedMeasurementAsciiParser:
         assert self._pending is not None
         pending = self._pending
         fields = _parse_key_values(line)
-        if pending.canonicalFirmwareWire:
-            if "s" not in fields or "m" not in fields or ",D=" not in line:
-                return [
-                    self._reject_pending(
-                        "mixed_row_schema",
-                        "canonical MR row requires s,m,D",
-                        envelope,
-                    )
-                ]
-            if fields["m"].strip().upper() not in MODE_FROM_WIRE:
-                return [
-                    self._reject_pending(
-                        "bad_row_mode_wire",
-                        "canonical MR m must be one of C,V,R",
-                        envelope,
-                    )
-                ]
-            if any(re.fullmatch(r"[0-9A-Fa-f]{2}", fields.get(name, "")) is None for name in ("valid", "fresh", "error")):
+        if "s" not in fields or "m" not in fields or ",D=" not in line:
+            return [self._reject_pending("mixed_row_schema", "MR row requires s,m,D", envelope)]
+        if fields["m"].strip().upper() not in MODE_FROM_WIRE:
+            return [self._reject_pending("bad_row_mode_wire", "MR m must be CAP, VOLT, or RES", envelope)]
+        for maskName in ("expected", "acquired", "valid", "fresh", "error"):
+            if re.fullmatch(r"[0-9A-Fa-f]{2}", fields.get(maskName, "")) is None:
                 return [
                     self._reject_pending(
                         "bad_row_mask_width",
-                        "canonical MR valid/fresh/error masks must be exactly two hex characters",
+                        f"MR {maskName} must be exactly two hex characters",
                         envelope,
                     )
                 ]
         try:
-            row = _decimal_alias(fields, "s", "row")
-            rawMode = _string_alias(fields, "m", "mode").strip().upper()
-            mode = MODE_FROM_WIRE.get(rawMode, rawMode)
+            row = _decimal(fields, "s")
+            rawMode = fields["m"].strip().upper()
+            mode = MODE_FROM_WIRE[rawMode]
             unit = fields["unit"].strip()
             scale = _decimal(fields, "scale", allowNegative=True)
-            validBits = _hex(fields, "valid")
-            freshBits = _hex(fields, "fresh")
-            errorBits = _hex(fields, "error")
+            expectedBits = _hex(fields, "expected", width=2)
+            acquiredBits = _hex(fields, "acquired", width=2)
+            validBits = _hex(fields, "valid", width=2)
+            freshBits = _hex(fields, "fresh", width=2)
+            errorBits = _hex(fields, "error", width=2)
             valueTokens = _mixed_value_tokens(line, fields)
         except (KeyError, ValueError) as exc:
             return [self._reject_pending("bad_mr", f"invalid MR fields: {exc}", envelope)]
@@ -296,10 +276,6 @@ class MixedMeasurementAsciiParser:
             return [self._reject_pending("duplicate_row", f"duplicate MR row {row}", envelope)]
         if not (1 <= row <= pending.rows):
             return [self._reject_pending("row_out_of_range", f"MR row {row} outside active rows", envelope)]
-        expectedRow = len(pending.rowFrames) + 1
-        if row != expectedRow:
-            self.stats.missingRows += 1
-            return [self._reject_pending("row_order", f"expected MR row {expectedRow}, got {row}", envelope)]
         if mode not in MODE_WIRE:
             return [self._reject_pending("bad_row_mode", f"unsupported MR mode {mode}", envelope)]
         if mode != pending.profile[row - 1]:
@@ -315,9 +291,7 @@ class MixedMeasurementAsciiParser:
                 )
             ]
         rowFormat = fields.get("fmt")
-        if (pending.canonicalFirmwareWire and rowFormat != expectedFormat) or (
-            not pending.canonicalFirmwareWire and rowFormat is not None and rowFormat != expectedFormat
-        ):
+        if rowFormat != expectedFormat:
             return [
                 self._reject_pending(
                     "row_format_mismatch",
@@ -327,8 +301,12 @@ class MixedMeasurementAsciiParser:
             ]
         if len(valueTokens) != ROW_CELLS:
             return [self._reject_pending("row_cell_count", f"MR row {row} has {len(valueTokens)} values, expected 8", envelope)]
-        if any(mask & ~0xFF for mask in (validBits, freshBits, errorBits)):
+        if any(mask & ~0xFF for mask in (expectedBits, acquiredBits, validBits, freshBits, errorBits)):
             return [self._reject_pending("row_mask_out_of_range", f"MR row {row} mask exceeds 8 cells", envelope)]
+        if acquiredBits & ~expectedBits:
+            return [self._reject_pending("acquired_outside_expected", f"MR row {row} acquired is outside expected", envelope)]
+        if freshBits & ~acquiredBits:
+            return [self._reject_pending("fresh_outside_acquired", f"MR row {row} fresh is outside acquired", envelope)]
 
         rawValues: list[float] = []
         errorCodes: list[int] = []
@@ -352,6 +330,8 @@ class MixedMeasurementAsciiParser:
         validMask = _mask_array(validBits)
         freshMask = _mask_array(freshBits)
         errorMask = _mask_array(errorBits)
+        expectedMask = _mask_array(expectedBits)
+        acquiredMask = _mask_array(acquiredBits)
         tokenInvalid = ~np.isfinite(rawFixedValues)
         if not np.array_equal(validMask, ~tokenInvalid):
             return [self._reject_pending("valid_token_mismatch", f"MR row {row} valid mask disagrees with Xhh", envelope)]
@@ -408,8 +388,11 @@ class MixedMeasurementAsciiParser:
             railValid=railValid,
             railAgeFrames=railAgeFrames,
             rawFields=dict(fields),
+            expectedMask=expectedMask,
+            acquiredMask=acquiredMask,
         )
         pending.rowLines[row] = _crc_line_bytes(rawLine)
+        pending.rowLineOrder.append(_crc_line_bytes(rawLine))
         pending.rowFrames[row] = rowFrame
         return []
 
@@ -421,17 +404,15 @@ class MixedMeasurementAsciiParser:
         assert self._pending is not None
         pending = self._pending
         fields = _parse_key_values(line)
-        if pending.canonicalFirmwareWire and not all(
-            key in fields for key in ("rgen", "rrid", "pgen", "prid")
-        ):
+        if not all(key in fields for key in ("rgen", "rrid", "pgen", "prid")):
             return [
                 self._reject_pending(
                     "mixed_trailer_schema",
-                    "canonical K trailer requires rgen,rrid,pgen,prid",
+                    "mixed K trailer requires rgen,rrid,pgen,prid",
                     envelope,
                 )
             ]
-        if pending.canonicalFirmwareWire and re.fullmatch(r"[0-9A-Fa-f]{8}", fields.get("crc", "")) is None:
+        if re.fullmatch(r"[0-9A-Fa-f]{8}", fields.get("crc", "")) is None:
             return [
                 self._reject_pending(
                     "bad_crc_width",
@@ -442,10 +423,10 @@ class MixedMeasurementAsciiParser:
         try:
             identities = (
                 _decimal(fields, "seq"),
-                _decimal_alias(fields, "rgen", "rowsGen"),
-                _decimal_alias(fields, "rrid", "rowsRid"),
-                _decimal_alias(fields, "pgen", "profileGen"),
-                _decimal_alias(fields, "prid", "profileRid"),
+                _decimal(fields, "rgen"),
+                _decimal(fields, "rrid"),
+                _decimal(fields, "pgen"),
+                _decimal(fields, "prid"),
             )
             expectedCrc = int(fields["crc"], 16)
         except (KeyError, ValueError) as exc:
@@ -462,6 +443,19 @@ class MixedMeasurementAsciiParser:
         if len(pending.rowFrames) != pending.rows:
             self.stats.missingRows += 1
             return [self._reject_pending("missing_rows", "not all active MR rows received before K", envelope)]
+        composedExpected = 0
+        composedAcquired = 0
+        for row, rowFrame in pending.rowFrames.items():
+            composedExpected |= _mask_bits(rowFrame.expectedMask) << ((row - 1) * ROW_CELLS)
+            composedAcquired |= _mask_bits(rowFrame.acquiredMask) << ((row - 1) * ROW_CELLS)
+        if composedExpected != pending.expectedBits or composedAcquired != pending.acquiredBits:
+            return [
+                self._reject_pending(
+                    "MIXED_MASK_MISMATCH",
+                    "M global expected/acquired does not equal composed MR row masks",
+                    envelope,
+                )
+            ]
         actualCrc = crc32_reflected(pending.payload_bytes())
         if actualCrc != expectedCrc:
             self.stats.crcFailures += 1
@@ -485,6 +479,10 @@ class MixedMeasurementAsciiParser:
             deviceId=envelope.deviceId,
             rawHeader=pending.headerLine,
             rawTrailer=line,
+            expectedMask=_mask_array_width(pending.expectedBits, pending.cells),
+            acquiredMask=_mask_array_width(pending.acquiredBits, pending.cells),
+            connectionGeneration=envelope.connectionGeneration,
+            bootId=envelope.bootId,
         )
         if self.stats.lastSeq is not None and pending.seq > self.stats.lastSeq + 1:
             self.stats.sequenceGaps += pending.seq - self.stats.lastSeq - 1
@@ -575,8 +573,11 @@ def _mixed_value_tokens(line: str, fields: dict[str, str]) -> list[str]:
     return fields["values"].split("|")
 
 
-def _hex(fields: dict[str, str], name: str) -> int:
-    return int(fields[name], 16)
+def _hex(fields: dict[str, str], name: str, *, width: int) -> int:
+    text = fields[name].strip()
+    if re.fullmatch(rf"[0-9A-Fa-f]{{{width}}}", text) is None:
+        raise ValueError(f"{name} must be exactly {width} hex characters")
+    return int(text, 16)
 
 
 def _optional_binary_bool(fields: dict[str, str], name: str) -> bool | None:
@@ -599,6 +600,14 @@ def _optional_nonnegative_decimal(fields: dict[str, str], name: str) -> int | No
 
 def _mask_array(mask: int) -> np.ndarray:
     return np.asarray([bool((mask >> cellIndex) & 1) for cellIndex in range(ROW_CELLS)], dtype=bool)
+
+
+def _mask_array_width(mask: int, cells: int) -> np.ndarray:
+    return np.asarray([bool((mask >> cellIndex) & 1) for cellIndex in range(cells)], dtype=bool)
+
+
+def _mask_bits(mask: np.ndarray) -> int:
+    return sum((1 << index) for index, value in enumerate(np.asarray(mask, dtype=bool)) if bool(value))
 
 
 def _safe_ascii(rawLine: bytes) -> str:

@@ -59,3 +59,14 @@ def test_strict_ascii_rejects_invalid_bytes():
     parser = CapAsciiParser()
     events = parser.feed(envelope(b"C,seq=1,\xff\n"))
     assert any(isinstance(event, ParserErrorEvent) and event.reason == "strict_ascii" for event in events)
+
+
+def test_pending_frame_reject_preserves_the_offending_wire_line():
+    packet = (FIXTURES / "rows1_valid.txt").read_bytes()
+    malformed = packet.replace(b"D0,", b"D0,not-an-integer,", 1)
+    event = next(
+        event
+        for event in CapAsciiParser().feed(envelope(malformed))
+        if isinstance(event, ParserErrorEvent) and event.reason == "bad_d_value"
+    )
+    assert event.rawText.startswith("D0,not-an-integer,")

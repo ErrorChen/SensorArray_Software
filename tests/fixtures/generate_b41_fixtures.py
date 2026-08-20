@@ -14,7 +14,12 @@ from sensorarray_app.protocol.crc import crc32_reflected  # noqa: E402
 def build_frame(seq: int, rows: int, gen: int = 12, rid: int = 9, start: int = 33_000_000) -> str:
     cells = rows * 8
     values = [start + index * 1_000_000 for index in range(cells)]
-    header = f"C,seq={seq},ts={seq * 1000},rows={rows},cells={cells},gen={gen},rid={rid},rf={(1 << rows) - 1:02X},pf={(1 << rows) - 1:02X},sf={(1 << rows) - 1:02X},bad=0/0/0,fmt=pf6,n={cells}\n"
+    active_mask = (1 << cells) - 1 if cells < 64 else (1 << 64) - 1
+    header = (
+        f"C,seq={seq},ts={seq * 1000},rows={rows},cells={cells},gen={gen},rid={rid},"
+        f"rf={(1 << rows) - 1:02X},pf={(1 << rows) - 1:02X},sf={(1 << rows) - 1:02X},"
+        f"expected={active_mask:016X},acquired={active_mask:016X},bad=0/0/0,fmt=pf6,n={cells}\n"
+    )
     lines = [header]
     for idx in range((cells + 15) // 16):
         chunk = values[idx * 16 : (idx + 1) * 16]
@@ -38,7 +43,11 @@ def main() -> None:
     write(b41 / "rows2_valid.txt", build_frame(2, 2))
     write(b41 / "rows4_valid.txt", build_frame(4, 4))
     write(b41 / "rows8_valid.txt", build_frame(8, 8))
-    invalid = build_frame(10, 1).replace("33000000", str(CAP_INVALID_SENTINEL), 1)
+    invalid = (
+        build_frame(10, 1)
+        .replace("33000000", str(CAP_INVALID_SENTINEL), 1)
+        .replace("bad=0/0/0", "bad=0/0/1", 1)
+    )
     # Regenerate CRC after changing the payload.
     body = "\n".join(invalid.splitlines()[:-1]) + "\n"
     trailer = f"K,seq=10,gen=12,rid=9,crc={crc32_reflected(body.encode('ascii')):08X}\n"

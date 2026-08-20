@@ -18,7 +18,7 @@ def parse_battery_fields(fields: dict[str, str], received_time: float | None = N
     battery_mv = _int_or_none(fields.get("bt"))
     if battery_mv == -1:
         battery_mv = None
-    # Firmware 331c445 emits the long ``lastGood*`` names in both ABAT and
+    # Firmware 8045e9e9 emits the long ``lastGood*`` names in both ABAT and
     # AB50.  The former ``bl*`` spellings were emitted by older saved replay
     # fixtures, so they remain read-only aliases rather than replacing the
     # production schema.

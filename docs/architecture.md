@@ -108,17 +108,35 @@ identities agree with the trailer, and CRC succeeds. Partial frames never
 reach MatrixStore.
 
 The parser follows the production formatter at firmware
-`331c44589318db9ba642cf3ab33bb08ca3dd8a34`: `M` and `K` use
-`rgen/rrid/pgen/prid`; `MR` uses one-based `s`, `m=C|V|R`, canonical
+`8045e9e9ec9599533c52c15dfcb6002f79fd15f1`: `M` and `K` use
+`rgen/rrid/pgen/prid`; `MR` uses one-based `s`, `m=CAP|VOLT|RES`, canonical
 unit/scale/format, and eight comma-separated `D=` tokens. The complete saved
 profile, not only the active prefix, determines whether firmware emits mixed
 frames. Long-key/pipe-separated records remain a Replay compatibility alias
 only.
 
-The same firmware has no terminal row-profile event in its homogeneous
-`ROWMODES` branch. CommandService deliberately keeps strict pending/error state
-rather than synchronizing application from a legacy data frame. This limits
-firmware HIL but does not change the architecture's transaction invariant.
+The same firmware emits terminal `RMAPP`/`RMERR` events for both homogeneous
+and heterogeneous `ROWMODES` branches. CommandService completes a profile
+transaction only from the matching terminal event; a legacy data frame is
+never used as a substitute acknowledgement.
+
+## Integrity accounting and serial wire recovery
+
+Physical sequence spacing is partitioned into intentional USB DEBUG
+decimation, firmware non-fresh suppression, source-specific firmware transport
+drops, Host ingress drops, and an explicitly unexplained remainder. SF50's
+`drop=0/<text-bus>/<all-sinks>` aggregate remains health evidence and is not
+allowed to claim that one particular transport lost a measurement. PERF
+`usbDrop` and BLE `BL50.dropD` establish per-source cumulative baselines on
+attach; later deltas may reconcile sequence gaps only after SF50/PERF
+non-fresh evidence has had priority.
+
+The ESP USB CDC output can interleave diagnostic `printf` bytes with a queued
+measurement packet. ProtocolRegistry may recover only an exact embedded
+8045 `C`, `V`, `R`, or `M` header carrying the complete identity/geometry
+signature. It emits a typed `WIRE_INTERLEAVE` warning and discards an existing
+partial frame if necessary. It never repairs values, invents rows, fills zeros,
+or bypasses the normal CRC and identity checks.
 
 ## Matrix and history storage
 

@@ -15,6 +15,11 @@ describe("setup profile", () => {
     expect(profile.acquisition.measurementMode).toBe("CAP");
     expect(profile.acquisition.rowModes).toEqual(Array.from({ length: 8 }, () => "CAP"));
     expect(profile.voltageRail).toEqual({ measuredAvddV: null, measuredAvssV: null });
+    expect(profile.lifecycle).toEqual({
+      autoReconnect: true,
+      resumeMeasurementAfterDeviceRestart: false,
+      preferredUsbStream: "DEVICE_DEFAULT"
+    });
   });
 
   it("fills missing optional fields while preserving imported preferences", () => {
@@ -96,5 +101,23 @@ describe("setup profile", () => {
     const profile = normaliseSetupProfile({ acquisition: { rows: 5, measurementMode: "CAP", rowModes } }, "C:/runtime");
     expect(profile.acquisition.rowModes).toEqual(rowModes);
     expect(() => normaliseSetupProfile({ acquisition: { rowModes: ["CAP"] } }, "C:/runtime")).toThrow("exactly 8");
+  });
+
+  it("persists conservative reboot resume and USB stream preferences", () => {
+    const profile = normaliseSetupProfile(
+      {
+        lifecycle: {
+          autoReconnect: false,
+          resumeMeasurementAfterDeviceRestart: true,
+          preferredUsbStream: "FULL"
+        }
+      },
+      "C:/runtime"
+    );
+    expect(profile.lifecycle).toEqual({
+      autoReconnect: false,
+      resumeMeasurementAfterDeviceRestart: true,
+      preferredUsbStream: "FULL"
+    });
   });
 });

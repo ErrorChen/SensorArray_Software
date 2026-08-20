@@ -14,14 +14,16 @@ export function LogPanel({ logs, error, notice }: Props): JSX.Element {
   const [search, setSearch] = useState("");
   const [limit, setLimit] = useState(500);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [showMeasurement, setShowMeasurement] = useState(false);
   const terminalRef = useRef<HTMLPreElement | null>(null);
   const rows = logs?.rows ?? [];
   const visibleRows = useMemo(() => {
+    const categoryFiltered = showMeasurement ? rows : rows.filter((row) => row.category !== "MEASUREMENT");
     const filtered = search
-      ? rows.filter((row) => `${row.severity} ${row.source} ${row.channel} ${row.tag} ${row.rawText}`.toLowerCase().includes(search.toLowerCase()))
-      : rows;
+      ? categoryFiltered.filter((row) => `${row.severity} ${row.source} ${row.channel} ${row.tag} ${row.rawText}`.toLowerCase().includes(search.toLowerCase()))
+      : categoryFiltered;
     return filtered.slice(-limit);
-  }, [limit, rows, search]);
+  }, [limit, rows, search, showMeasurement]);
   const statusItems = useMemo(() => parseLogStatusRows(rows), [rows]);
 
   useEffect(() => {
@@ -55,6 +57,14 @@ export function LogPanel({ logs, error, notice }: Props): JSX.Element {
             <label className="checkLine compact">
               <input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />
               Auto-scroll
+            </label>
+            <label className="checkLine compact">
+              <input
+                type="checkbox"
+                checked={showMeasurement}
+                onChange={(event) => setShowMeasurement(event.target.checked)}
+              />
+              Show Measurement Data
             </label>
             <button onClick={() => void copyVisible()}>Copy visible</button>
           </div>

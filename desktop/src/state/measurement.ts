@@ -11,6 +11,10 @@ export type CellMeasurementState = {
   rawFixed: number | null;
   valid: boolean;
   fresh: boolean;
+  expected: boolean;
+  acquired: boolean;
+  acquisitionKnown: boolean;
+  quality: "usable" | "invalid" | "not_expected" | "not_acquired" | "stale" | "acquisition_unknown";
   error: boolean;
   errorCode: number | null;
   errorReason: string | null;
@@ -80,6 +84,9 @@ export function unitForRow(snapshot: BackendSnapshotPayload, row: number): strin
   if (mode === "CAP" && snapshot.display.displayMode === "delta_percent") {
     return "%";
   }
+  if (mode === "VOLT" && snapshot.display.voltageReference === "rail_normalized") {
+    return "%";
+  }
   const unit = snapshot.matrix.unitByRow?.[row]
     ?? (mode === "CAP" ? "pF" : mode === "VOLT" ? "V" : "ohm");
   return unit === "ohm" ? "\u03A9" : unit;
@@ -117,15 +124,39 @@ export function cellMeasurementState(matrix: MatrixSnapshot, row: number, col: n
   const value = finiteOrNull(matrix.displayValues?.[row]?.[col] ?? matrix.values?.[row]?.[col]);
   const legacyValid = matrix.validMask?.[row]?.[col];
   const valid = matrix.valid?.[row]?.[col] ?? legacyValid ?? false;
-  const fresh = matrix.fresh?.[row]?.[col] ?? true;
+  const fresh = matrix.fresh?.[row]?.[col] ?? false;
+  const acquisitionKnown = matrix.acquisitionMasksKnown === true;
+  const expected = matrix.expected?.[row]?.[col] ?? false;
+  const acquired = matrix.acquired?.[row]?.[col] ?? false;
+  const error = Boolean(matrix.error?.[row]?.[col]);
   const errorCode = finiteIntegerOrNull(matrix.errorCodes?.[row]?.[col]);
   const providedReason = matrix.errorReasons?.[row]?.[col];
+  // Acquisition state answers a different question from electrical/data
+  // validity.  A firmware Xhh token is acquired but invalid; a cell omitted
+  // by the acquisition mask is NOT_ACQUIRED even though its value/valid bit
+  // is necessarily empty.  Keep these states visually and scientifically
+  // distinct.
+  const quality = acquisitionKnown && !expected
+    ? "not_expected"
+    : acquisitionKnown && !acquired
+      ? "not_acquired"
+      : !acquisitionKnown
+        ? "acquisition_unknown"
+        : !valid || error
+          ? "invalid"
+          : !fresh
+            ? "stale"
+            : "usable";
   return {
     value,
     rawFixed: finiteOrNull(matrix.rawFixed?.[row]?.[col]),
     valid,
     fresh,
-    error: Boolean(matrix.error?.[row]?.[col]),
+    expected,
+    acquired,
+    acquisitionKnown,
+    quality,
+    error,
     errorCode,
     errorReason: errorReason(errorCode, providedReason),
     pga: finiteNonNegativeOrNull(matrix.pga?.[row]?.[col]),
@@ -134,7 +165,8 @@ export function cellMeasurementState(matrix: MatrixSnapshot, row: number, col: n
 }
 
 export function isCellDisplayable(cell: CellMeasurementState): boolean {
-  return cell.valid && cell.fresh && !cell.error && typeof cell.value === "number" && Number.isFinite(cell.value);
+  const acquired = !cell.acquisitionKnown || (cell.expected && cell.acquired);
+  return cell.valid && cell.fresh && acquired && !cell.error && typeof cell.value === "number" && Number.isFinite(cell.value);
 }
 
 export function matrixDisplayUnit(snapshot: BackendSnapshotPayload): string {
@@ -201,6 +233,33 @@ export function errorReason(code: number | null | undefined, provided: string | 
   }
   if (typeof code !== "number" || !Number.isInteger(code) || code < 0) {
     return null;
+  }
+  const known: Record<number, string> = {
+    0x00: "No firmware cell error",
+    0x01: "Matrix route error",
+    0x02: "ADS SPI error",
+    0x03: "ADS DRDY timeout",
+    0x04: "Stale measurement",
+    0x05: "Reference alarm",
+    0x06: "PGA absolute input alarm",
+    0x07: "PGA differential input alarm",
+    0x08: "ADC saturated",
+    0x09: "ADC common-mode violation",
+    0x0a: "Rail configuration invalid",
+    0x0b: "Reference invalid",
+    0x0c: "Resistance divider denominator near zero",
+    0x0d: "Open circuit",
+    0x0e: "Short circuit",
+    0x0f: "Negative resistance",
+    0x10: "Measurement out of range",
+    0x11: "Measurement overflow",
+    0x12: "Unstable measurement",
+    0x13: "Autorange failed",
+    0x14: "Unsupported measurement",
+    0x15: "ADS register readback mismatch"
+  };
+  if (known[code]) {
+    return known[code];
   }
   return `Unknown firmware cell error ${formatErrorCode(code)}`;
 }

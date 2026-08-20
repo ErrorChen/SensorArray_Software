@@ -25,10 +25,16 @@ export function defaultSetupProfile(runtimeDirectory: string): SetupProfile {
       pauseDisplay: false,
       freezeColor: false,
       unitMode: "auto",
+      voltageReference: "vss_relative",
       circuitOffsetPf: 33,
       trendLatestN: 600
     },
     offsetsPf: zeroOffsets(),
+    lifecycle: {
+      autoReconnect: true,
+      resumeMeasurementAfterDeviceRestart: false,
+      preferredUsbStream: "DEVICE_DEFAULT"
+    },
     command: { lineEnding: "lf" },
     paths: { defaultSaveDirectory: runtimeDirectory }
   };
@@ -67,6 +73,7 @@ export function setupProfileFromSnapshot(snapshot: BackendSnapshotPayload | null
       pauseDisplay: snapshot.display.pauseDisplay,
       freezeColor: snapshot.display.freezeColor,
       unitMode: snapshot.display.unitMode,
+      voltageReference: snapshot.display.voltageReference ?? current.display.voltageReference,
       circuitOffsetPf: snapshot.display.circuitOffsetPf,
       trendLatestN: snapshot.display.trendLatestN
     },
@@ -98,6 +105,7 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
   const paths = objectValue<SetupProfile["paths"]>(payload.paths);
   const acquisition = objectValue<SetupProfile["acquisition"]>(payload.acquisition);
   const voltageRail = objectValue<SetupProfile["voltageRail"]>(payload.voltageRail);
+  const lifecycle = objectValue<SetupProfile["lifecycle"]>(payload.lifecycle);
   const baud = finitePositive(serial.baud ?? fallback.transport.serial.baud, "transport.serial.baud");
   const rows = supportedRows(acquisition.rows ?? fallback.acquisition.rows);
   const lineEnding = normaliseLineEnding(command.lineEnding ?? fallback.command.lineEnding);
@@ -135,17 +143,40 @@ export function normaliseSetupProfile(value: unknown, runtimeDirectory: string):
       pauseDisplay: Boolean(display.pauseDisplay ?? fallback.display.pauseDisplay),
       freezeColor: Boolean(display.freezeColor ?? fallback.display.freezeColor),
       unitMode: String(display.unitMode ?? fallback.display.unitMode),
+      voltageReference: normaliseVoltageReference(display.voltageReference ?? fallback.display.voltageReference),
       circuitOffsetPf: finiteNumber(display.circuitOffsetPf ?? fallback.display.circuitOffsetPf, "display.circuitOffsetPf"),
       trendLatestN: integerRange(display.trendLatestN ?? fallback.display.trendLatestN, 1, 18000, "display.trendLatestN")
     },
     offsetsPf: normaliseOffsets(payload.offsetsPf, fallback.offsetsPf),
+    lifecycle: {
+      autoReconnect: Boolean(lifecycle.autoReconnect ?? fallback.lifecycle.autoReconnect),
+      resumeMeasurementAfterDeviceRestart: Boolean(
+        lifecycle.resumeMeasurementAfterDeviceRestart ?? fallback.lifecycle.resumeMeasurementAfterDeviceRestart
+      ),
+      preferredUsbStream: normaliseUsbStreamPreference(
+        lifecycle.preferredUsbStream ?? fallback.lifecycle.preferredUsbStream
+      )
+    },
     command: { lineEnding },
     paths: { defaultSaveDirectory }
   };
 }
 
+function normaliseUsbStreamPreference(value: unknown): "DEVICE_DEFAULT" | "DEBUG" | "FULL" {
+  const normalized = String(value || "").trim().toUpperCase();
+  return normalized === "DEBUG" || normalized === "FULL" ? normalized : "DEVICE_DEFAULT";
+}
+
 function zeroOffsets(): number[][] {
   return Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => 0));
+}
+
+function normaliseVoltageReference(value: unknown): "ground" | "vss_relative" | "rail_normalized" {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "ground" || normalized === "vss_relative" || normalized === "rail_normalized") {
+    return normalized;
+  }
+  return "vss_relative";
 }
 
 function objectValue<T>(value: unknown): Partial<T> {

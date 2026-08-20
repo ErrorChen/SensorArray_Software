@@ -1,4 +1,4 @@
-R,seq=9,ts=124000,rows=1,cells=8,gen=8,rid=43,mode=RES,unit=ohm,scale=-3,valid=00000000000000FB,fresh=00000000000000F3,error=0000000000000004,ref=INTREF,rail=1,age=1,avdd=3300000,avss=-2500000,vexc=2500000,rref=100000,dur=13000,tr=600,gc=1,ov=0,aa=8,fb=0,ir=0,to=0,st=1,spi=0,fmt=mohm-x,n=8,bad=1
+R,seq=9,ts=124000,rows=1,cells=8,gen=8,rid=43,mode=RES,unit=ohm,scale=-3,valid=00000000000000FB,fresh=00000000000000F3,error=0000000000000004,expected=00000000000000FF,acquired=00000000000000FF,ref=INTREF,rail=1,age=1,avdd=3300000,avss=-2500000,vexc=2500000,rref=100000,dur=13000,tr=600,gc=1,ov=0,aa=8,fb=0,ir=0,to=0,st=1,spi=0,fmt=mohm-x,n=8,bad=1
 D0,1000,2200,X0D,1000000,0,1,100000000,999
 P0,0001020408102001
-K,seq=9,gen=8,rid=43,crc=C3BE337C
+K,seq=9,gen=8,rid=43,crc=AF205E86

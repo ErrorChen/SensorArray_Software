@@ -208,11 +208,16 @@ function resolveBackendCommand(options: BackendStartOptions): BackendCommand {
 }
 
 function resolvePython(projectRoot: string): string {
-  const localPython = path.join(projectRoot, ".venv", "Scripts", "python.exe");
-  if (existsSync(localPython)) {
-    return localPython;
+  const localCandidates =
+    process.platform === "win32"
+      ? [path.join(projectRoot, ".venv", "Scripts", "python.exe")]
+      : [path.join(projectRoot, ".venv", "bin", "python"), path.join(projectRoot, ".venv", "bin", "python3")];
+  for (const candidate of localCandidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
   }
-  return "python";
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 function buildPythonPath(projectRoot: string): string {

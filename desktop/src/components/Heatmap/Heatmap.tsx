@@ -5,6 +5,7 @@ import type { KeyboardEvent as ReactKeyboardEvent, MutableRefObject } from "reac
 import type { BackendSnapshotPayload, ColourDomain, MeasurementMode } from "../../api/types";
 import { cellLabel, selectedCells } from "../../state/appStore";
 import { colourDomainForMode, resolveColourRange, type HeatmapDatum } from "../../state/heatmap";
+import { recordRenderDuration, registerChartInstance, registerResizeObserver } from "../../state/performanceInstrumentation";
 import {
   cellMeasurementState,
   formatErrorCode,
@@ -37,6 +38,7 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
   const latestSnapshotRef = useRef<BackendSnapshotPayload | null>(null);
   const latestSelectedRef = useRef<Set<string>>(new Set());
   const rafIdRef = useRef<number | null>(null);
+  const resizeRafIdRef = useRef<number | null>(null);
   const pendingDynamicOptionRef = useRef<echarts.EChartsOption | null>(null);
   const [invalidHover, setInvalidHover] = useState<InvalidHover | null>(null);
 
@@ -74,23 +76,35 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
       return;
     }
     const chart = initialiseHeatmapChart(hostRef.current);
+    const unregisterChart = registerChartInstance();
     chartRef.current = chart;
     chart.setOption(buildStaticHeatmapOption(latestSnapshotRef), { notMerge: true, lazyUpdate: false });
 
     const removeHandlers = installHeatmapPointerHandlers(chart, onSelectCellRef, latestSnapshotRef);
     const observer = new ResizeObserver(() => {
-      requestAnimationFrame(() => chartRef.current?.resize());
+      if (resizeRafIdRef.current !== null) return;
+      resizeRafIdRef.current = requestAnimationFrame(() => {
+        resizeRafIdRef.current = null;
+        chartRef.current?.resize();
+      });
     });
+    const unregisterObserver = registerResizeObserver();
     observer.observe(hostRef.current);
 
     return () => {
       removeHandlers();
       observer.disconnect();
+      unregisterObserver();
       if (rafIdRef.current !== null) {
         cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;
       }
+      if (resizeRafIdRef.current !== null) {
+        cancelAnimationFrame(resizeRafIdRef.current);
+        resizeRafIdRef.current = null;
+      }
       chart.dispose();
+      unregisterChart();
       chartRef.current = null;
     };
   }, []);
@@ -111,11 +125,13 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
       if (!pending || !chartRef.current) {
         return;
       }
+      const started = performance.now();
       chartRef.current.setOption(pending, {
         notMerge: false,
         lazyUpdate: true,
         replaceMerge: ["visualMap", "series"]
       });
+      recordRenderDuration(performance.now() - started);
     });
   }, [snapshot]);
 
@@ -192,6 +208,9 @@ export function Heatmap({ snapshot, onSelectCell, onSetFreezeColor }: Props): JS
         />
       ) : null}
       {snapshot?.frame.valid ? null : <div className="emptyOverlay">No data yet</div>}
+      {snapshot?.frame.quarantinedReason ? (
+        <div className="emptyOverlay">Waiting for authoritative frame: {snapshot.frame.quarantinedReason}</div>
+      ) : null}
     </section>
   );
 }
@@ -299,7 +318,10 @@ export function buildDynamicHeatmapOption(snapshot: BackendSnapshotPayload, sele
     type: "heatmap",
     data: data
       .filter((item) => snapshot.frame.valid && !item[4])
-      .map((item) => ({ value: [item[0], item[1], 0, item[3], 0] })),
+      .map((item) => ({
+        value: [item[0], item[1], 0, item[3], 0],
+        itemStyle: { color: qualityColour(cellMeasurementState(snapshot.matrix, item[1], item[0])) }
+      })),
     cursor: "pointer",
     encode: { x: 0, y: 1, value: 2 },
     itemStyle: { color: "#e5e7eb", borderColor: "#ffffff", borderWidth: 1 },
@@ -404,6 +426,12 @@ export function formatHeatmapCellLabel(
   if (!cell.valid) {
     return cell.errorCode === null ? "invalid" : `X${cell.errorCode.toString(16).toUpperCase().padStart(2, "0")}`;
   }
+  if (cell.acquisitionKnown && !cell.expected) {
+    return "not expected";
+  }
+  if (cell.acquisitionKnown && !cell.acquired) {
+    return "not acquired";
+  }
   if (!cell.fresh) {
     return "stale";
   }
@@ -451,8 +479,11 @@ export function formatHeatmapTooltip(params: echarts.TooltipComponentFormatterCa
   }
   lines.push(
     `Unit: ${escapeHtml(displayUnit)}`,
+    `Expected: ${cell.acquisitionKnown ? (cell.expected ? "yes" : "no") : "unknown"}`,
+    `Acquired: ${cell.acquisitionKnown ? (cell.acquired ? "yes" : "no") : "unknown"}`,
     `Valid: ${cell.valid ? "yes" : "no"}`,
     `Fresh: ${cell.fresh ? "yes" : "no"}`,
+    `Quality: ${escapeHtml(cell.quality.replace(/_/g, " "))}`,
     `Error: ${formatErrorCode(cell.errorCode)}${cell.errorReason ? ` \u2014 ${escapeHtml(cell.errorReason)}` : ""}`,
     "<span class=\"tooltipDiagnostics\">Frame diagnostics</span>",
     `Seq: ${snapshot.frame.seq ?? "-"}`,
@@ -460,6 +491,19 @@ export function formatHeatmapTooltip(params: echarts.TooltipComponentFormatterCa
     `Request ID: ${snapshot.frame.profileRequestId ?? snapshot.matrix.requestId ?? snapshot.measurement?.requestId ?? "-"}`,
     `Source: ${escapeHtml(snapshot.matrix.sourceTransport || snapshot.connection.mode)}`
   );
+  if (mode === "VOLT") {
+    const vss = snapshot.voltage?.vssRelativeV?.[row]?.[col];
+    const normalised = snapshot.voltage?.railNormalised?.[row]?.[col];
+    lines.push(
+      `Ground referenced: ${formatMeasurementValue(physical, "voltage")}`,
+      `VSS relative: ${snapshot.voltage?.derivedValid ? formatMeasurementValue(vss, "voltage") : "NA (rail invalid/stale)"}`,
+      `AVSS: ${formatRailVoltage(snapshot.rail?.avssUv)}`,
+      `AVDD: ${formatRailVoltage(snapshot.rail?.avddUv)}`,
+      `Rail age: ${formatRailAge(snapshot.rail?.ageMs, snapshot.rail?.age)}`,
+      `Rail valid/fresh: ${String(Boolean(snapshot.rail?.valid))}/${String(Boolean(snapshot.rail?.fresh))}`,
+      `Rail normalised: ${snapshot.voltage?.derivedValid && typeof normalised === "number" ? `${(normalised * 100).toFixed(3)} %` : "NA"}`
+    );
+  }
   lines.push(...diagnosticTooltipLines(snapshot));
   return lines.join("<br/>");
 }
@@ -589,6 +633,18 @@ function formatValue(value: number | null | undefined, digits = 3): string {
   return value.toFixed(digits);
 }
 
+function formatRailVoltage(valueUv: number | null | undefined): string {
+  return typeof valueUv === "number" && Number.isFinite(valueUv)
+    ? formatMeasurementValue(valueUv * 1e-6, "voltage")
+    : "NA";
+}
+
+function formatRailAge(ageMs: number | null | undefined, ageFrames: number | null | undefined): string {
+  if (typeof ageMs === "number" && Number.isFinite(ageMs)) return `${ageMs} ms`;
+  if (typeof ageFrames === "number" && Number.isFinite(ageFrames)) return `${ageFrames} frame(s)`;
+  return "unknown";
+}
+
 function diagnosticTooltipLines(snapshot: BackendSnapshotPayload): string[] {
   const diagnostics = snapshot.matrix.diagnostics ?? {};
   const telemetry = snapshot.measurement?.railTelemetry;
@@ -607,6 +663,13 @@ function diagnosticTooltipLines(snapshot: BackendSnapshotPayload): string[] {
     lines.push(`Recovered I/O retries: ${escapeHtml(String(recoveredRetryCount))}`);
   }
   return lines;
+}
+
+function qualityColour(cell: ReturnType<typeof cellMeasurementState>): string {
+  if (cell.quality === "not_expected") return "#f3f4f6";
+  if (cell.quality === "not_acquired") return "#bfdbfe";
+  if (cell.quality === "stale" || cell.quality === "acquisition_unknown") return "#fde68a";
+  return "#fecaca";
 }
 
 function escapeHtml(value: string): string {

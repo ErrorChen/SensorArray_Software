@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import queue
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -126,10 +127,74 @@ class _CommandTransport:
         return None
 
 
-def _dispatch_log(runtime: BackendRuntime, line: str, *, session_generation: int = 0) -> None:
-    envelope = replace(_envelope(b"", session_generation=session_generation), channel="log")
+def _dispatch_log(
+    runtime: BackendRuntime,
+    line: str,
+    *,
+    session_generation: int = 0,
+    source: str = "replay",
+) -> None:
+    envelope = replace(
+        _envelope(b"", session_generation=session_generation),
+        channel="log",
+        source=source,
+    )
     for event in TextLogProtocol().feed_line(line, envelope):
         runtime._handle_event(event)
+
+
+def test_rows_legacy_and_generic_compatibility_events_count_one_wire_terminal_once():
+    runtime = BackendRuntime(AppConfiguration())
+    runtime.commands.request_rows(4, lambda _command: None)
+
+    _dispatch_log(runtime, "RCMD,id=8,old=8,req=4,generation=2,status=accepted")
+    _dispatch_log(runtime, "RAPP,id=8,seq=90,old=8,new=4,gen=3,status=applied")
+
+    latest = runtime.commands.snapshot()["latestCommand"]
+    assert latest["state"] == "APPLIED"
+    assert latest["terminalCount"] == 1
+    assert runtime.commands.protocolWarnings == []
+
+
+def test_degraded_none_state_is_typed_without_crashing_or_inventing_a_mode():
+    runtime = BackendRuntime(AppConfiguration())
+    runtime.commands.resync_authoritative(mode="VOLT", rows=8, row_modes=("VOLT",) * 8)
+
+    _dispatch_log(
+        runtime,
+        "MODE,state=DEGRADED,active=NONE,pending=NONE,gen=3,rid=2,seq=9140,profile=VVVVVVVV,route=SAFE",
+    )
+
+    measurement = runtime.commands.measurement_snapshot()
+    assert measurement["appliedMode"] == "VOLT"
+    assert measurement["authoritativeStateKnown"] is False
+    assert measurement["syncState"] == "device_degraded"
+    assert measurement["resyncRequired"] is True
+    assert measurement["transitionState"] == "error"
+    assert "active=NONE" in measurement["error"]
+
+
+def test_bare_recover_correlates_firmware_default_level_and_retains_wire_audit():
+    runtime = BackendRuntime(AppConfiguration())
+    transport = _CommandTransport()
+    runtime.transport.current = transport
+    runtime.transport.status.update({"transport": "serial", "state": "STREAMING", "sessionGeneration": 0})
+
+    runtime.request_recover()
+    assert transport.commands == ["RECOVER"]
+    _dispatch_log(runtime, "RACK,cmd=RECOVER,id=71,level=1,state=accepted")
+    runtime.commands.timeout_old(seconds=-1.0)
+    _dispatch_log(runtime, "RAPP,cmd=RECOVER,id=71,level=1,state=applied,err=0x0")
+
+    latest = runtime.commands.snapshot()["latestCommand"]
+    assert latest["requestedValue"] == {"level": 1}
+    assert latest["firmwareId"] == 71
+    assert latest["state"] == "COMPLETED"
+    assert latest["timeoutObserved"] is True
+    assert latest["error"] == ""
+    assert latest["acceptedMessage"].startswith("RACK,cmd=RECOVER,id=71")
+    assert latest["terminalMessage"].startswith("RAPP,cmd=RECOVER,id=71")
+    assert runtime.commands.protocolWarnings == []
 
 
 def test_mode_transaction_never_commits_on_mack_and_requires_matching_mapp() -> None:
@@ -179,12 +244,17 @@ def test_mode_error_keeps_last_applied_value_but_releases_pending_gate() -> None
     assert "0x103" in service.modeError
 
 
-def test_new_transport_generation_resets_mode_and_ignores_old_session_apply() -> None:
+def test_new_transport_generation_preserves_stale_mode_and_ignores_old_session_apply() -> None:
     service = CommandService()
     service.observe_mode_frame("VOLT", 7, 42, 8)
     assert service.appliedMode == "VOLT"
     service.reset_session(5)
-    assert service.appliedMode == "CAP"
+    # A new host transport epoch is not evidence that the MCU rebooted or
+    # returned to CAP. Preserve the last known value as stale until bootstrap
+    # queries establish authoritative state.
+    assert service.appliedMode == "VOLT"
+    assert service.authoritativeStateKnown is False
+    assert service.resyncRequired is True
     ignored = service.handle(
         _command_event(
             "mode", "applied", 42, requested="VOLT", applied="VOLT", generation=7, seq=8,
@@ -192,7 +262,7 @@ def test_new_transport_generation_resets_mode_and_ignores_old_session_apply() ->
         )
     )
     assert ignored["ignoredOldSession"] is True
-    assert service.appliedMode == "CAP"
+    assert service.appliedMode == "VOLT"
 
 
 def test_modern_store_rejects_preboundary_old_generation_and_wrong_request_id() -> None:
@@ -205,7 +275,13 @@ def test_modern_store_rejects_preboundary_old_generation_and_wrong_request_id() 
     assert not store.add_measurement(replace(frame, seq=9, generation=6))
     assert not store.add_measurement(replace(frame, seq=9, requestId=99))
     assert not store.add_measurement(replace(frame, seq=7))
-    assert store.snapshot().revision == initial_revision
+    # Rejected frames do not replace measurement data, but quarantine is
+    # observable UI state and therefore advances the snapshot revision.
+    rejected_snapshot = store.snapshot()
+    assert rejected_snapshot.revision == initial_revision + 3
+    assert rejected_snapshot.seq == frame.seq
+    assert rejected_snapshot.matrix[0, 0] == pytest.approx(frame.physicalValues[0])
+    assert rejected_snapshot.quarantinedReason == "GENERATION_MISMATCH"
     assert store.rejectedStaleGeneration == 2
     assert store.rejectedBeforeBoundary == 1
 
@@ -213,6 +289,29 @@ def test_modern_store_rejects_preboundary_old_generation_and_wrong_request_id() 
     changed_values[0] = 0.5
     assert store.add_measurement(replace(frame, seq=10, physicalValues=changed_values))
     assert store.snapshot().matrix[0, 0] == pytest.approx(0.5)
+    assert store.snapshot().quarantinedReason == ""
+
+
+def test_resync_with_unknown_profile_identity_preserves_modern_mode_gate() -> None:
+    frame = _measurement_fixture("volt_rows2_mixed.txt")
+    store = MatrixStore()
+    store.complete_resync(
+        mode="VOLT",
+        rows=frame.rows,
+        row_modes=("VOLT",) * 8,
+        rows_generation=None,
+        rows_request_id=None,
+        rows_frame_seq=None,
+        mode_generation=frame.generation,
+        mode_request_id=frame.requestId,
+        profile_generation=None,
+        profile_request_id=None,
+    )
+
+    assert store.add_measurement(frame)
+    assert not store.add_measurement(replace(frame, seq=frame.seq + 1, generation=frame.generation - 1))
+    assert store.rejectedStaleGeneration == 1
+    assert store.snapshot().seq == frame.seq
 
 
 def test_late_old_mode_frame_cannot_reverse_a_mapp_applied_mode() -> None:
@@ -251,6 +350,33 @@ def test_replay_can_observe_multiple_distinct_mode_transactions_in_one_session()
     assert runtime.commands.appliedMode == "CAP"
     assert runtime.commands.modeRequestId == 44
     assert runtime.commands.modeGeneration == 9
+
+
+def test_replay_vr_boundary_does_not_invent_rows_sequence_before_cap_return() -> None:
+    runtime = BackendRuntime(AppConfiguration())
+    runtime.matrixStore.reset_session()
+    runtime._handle_event(_measurement_fixture("res_rows1_mixed.txt"))
+    assert runtime.matrixStore.snapshot().seq == 9
+
+    runtime._handle_event(_command_event("mode", "accepted", 44, old="RES", requested="CAP"))
+    runtime._handle_event(
+        _command_event(
+            "mode",
+            "applied",
+            44,
+            old="RES",
+            requested="CAP",
+            applied="CAP",
+            generation=9,
+            seq=1,
+        )
+    )
+    runtime._handle_event(_cap_frame(1, generation=12, request_id=9))
+
+    snapshot = runtime.matrixStore.snapshot()
+    assert snapshot.mode == "CAP"
+    assert snapshot.seq == 1
+    assert snapshot.quarantinedReason == ""
 
 
 def test_cap_mode_boundary_uses_sequence_not_cap_rows_generation_or_request_id() -> None:
@@ -329,7 +455,7 @@ def test_explicit_debug_rail_configuration_remains_available() -> None:
     assert runtime.commands.railState == "requested"
 
 
-def test_rail_apply_timeout_releases_voltage_transition_for_retry() -> None:
+def test_rail_apply_timeout_marks_unknown_and_freezes_transition_until_resync() -> None:
     service = CommandService()
     service.request_rail(3_391_000, -2_500_000, lambda _command: None, desired_mode="VOLT")
     service.handle(
@@ -341,10 +467,10 @@ def test_rail_apply_timeout_releases_voltage_transition_for_retry() -> None:
         )
     )
     service.timeout_old(seconds=-1.0)
-    assert service.railState == "timeout"
-    assert service.transitionState == "timeout"
+    assert service.railState == "outcome_unknown"
+    assert service.transitionState == "outcome_unknown"
     assert service.pendingMode == "VOLT"
-    assert service.desiredModeAfterRail is None
+    assert service.desiredModeAfterRail == "VOLT"
     assert "RAPP" in service.modeError
 
 
@@ -398,6 +524,8 @@ def test_rows_and_ads_check_ignore_nonmatching_request_ids() -> None:
 def test_snapshot_is_quantity_typed_and_excludes_invalid_stale_cells_from_display_range() -> None:
     runtime = BackendRuntime(AppConfiguration())
     runtime.ui.userOffsetsPf[0][0] = 999.0
+    runtime.commands.bootId = 12
+    runtime.telemetry.observe_boot(12)
     frame = _measurement_fixture("volt_rows2_mixed.txt")
     runtime._handle_event(frame)
     payload = snapshot_payload(runtime)
@@ -409,7 +537,12 @@ def test_snapshot_is_quantity_typed_and_excludes_invalid_stale_cells_from_displa
     assert payload["matrix"]["scale"] == -6
     assert payload["matrix"]["rawFixed"][0][0] == -1250.0
     assert payload["matrix"]["values"][0][0] == pytest.approx(-0.00125)
-    assert payload["matrix"]["displayValues"][0][0] == pytest.approx(-0.00125)
+    # Raw scientific values stay ground referenced; the recommended heatmap
+    # view is derived VSS-relative from this frame's same-boot rail.
+    assert payload["matrix"]["displayValues"][0][0] == pytest.approx(2.49875)
+    assert payload["display"]["voltageReference"] == "vss_relative"
+    assert payload["voltage"]["groundV"][0][0] == pytest.approx(-0.00125)
+    assert payload["voltage"]["vssRelativeV"][0][0] == pytest.approx(2.49875)
     assert payload["matrix"]["values"][0][4] is None
     assert payload["matrix"]["errorCodes"][0][4] == 0x03
     assert payload["matrix"]["errorReasons"][0][4] == "ADS DRDY timeout"
@@ -426,8 +559,33 @@ def test_snapshot_is_quantity_typed_and_excludes_invalid_stale_cells_from_displa
         runtime.set_display_mode("delta_percent")
 
 
+def test_voltage_reference_selector_never_uses_missing_or_old_boot_rail() -> None:
+    runtime = BackendRuntime(AppConfiguration())
+    runtime.commands.bootId = 22
+    runtime.telemetry.observe_boot(22)
+    runtime._handle_event(_measurement_fixture("volt_rows2_mixed.txt"))
+
+    runtime.update_display_settings({"voltageReference": "rail_normalized"})
+    normalized = snapshot_payload(runtime)
+    assert normalized["matrix"]["unit"] == "%"
+    assert normalized["matrix"]["displayValues"][0][0] == pytest.approx((2.49875 / 5.891) * 100.0)
+
+    runtime.update_display_settings({"voltageReference": "ground"})
+    ground = snapshot_payload(runtime)
+    assert ground["matrix"]["displayValues"][0][0] == pytest.approx(-0.00125)
+
+    runtime.telemetry.railTelemetry = replace(runtime.telemetry.railTelemetry, bootId=21)
+    runtime.update_display_settings({"voltageReference": "vss_relative"})
+    old_boot = snapshot_payload(runtime)
+    assert old_boot["voltage"]["derivedValid"] is False
+    assert old_boot["matrix"]["displayValues"][0][0] is None
+
+    with pytest.raises(ValueError, match="voltageReference"):
+        runtime.update_display_settings({"voltageReference": "nominal"})
+
+
 @pytest.mark.parametrize("fixture_name", ["volt_rows2_mixed.txt", "res_rows1_mixed.txt"])
-@pytest.mark.parametrize("fmt", ["csv", "xlsx", "mat", "h5"])
+@pytest.mark.parametrize("fmt", ["csv", "xlsx", "mat", "h5", "zip"])
 def test_voltage_and_resistance_export_import_round_trip(
     tmp_path: Path,
     fixture_name: str,
@@ -475,7 +633,7 @@ def test_voltage_and_resistance_export_import_round_trip(
     assert snapshot["matrix"]["values"][0][0] == pytest.approx(float(frame.physicalValues[0]))
     assert snapshot["matrix"]["pga"][0][0] == int(frame.pgaValues[0])
     assert snapshot["measurement"]["pendingMode"] is None
-    assert snapshot["measurement"]["transitionState"] in {"applied", "synced"}
+    assert snapshot["measurement"]["transitionState"] == "resync_confirmed"
 
 
 def test_replay_transport_registry_store_chain_uses_current_voltage_fixture() -> None:
@@ -646,9 +804,65 @@ def test_new_transport_session_clears_battery_ads_and_rate_fallbacks() -> None:
         runtime.stop()
 
 
+def test_runtime_routes_typed_sf50_window_into_sequence_loss_reconciliation() -> None:
+    runtime = BackendRuntime(AppConfiguration())
+    runtime.commands.bootId = 12
+    runtime.stats.record_frame(seq=101, source="replay", boot_id=12)
+    runtime.stats.record_frame(seq=105, source="replay", boot_id=12)
+    assert runtime.stats.unknownSequenceGap == 3
+
+    _dispatch_log(
+        runtime,
+        "SF50,seq=101-110,n=10,cfps=10.0,efps=8.0,"
+        "ofps=0.0/8.0/0.0,bad=2/0/2,drop=0/0/0,q=0/1",
+    )
+    diagnostics = runtime.stats.snapshot(0.0)
+    assert diagnostics["firmwareSuppressedNonFresh"] == 2
+    assert diagnostics["hostUnexplainedSequenceGap"] == 1
+    assert runtime.deviceInfo["performance"]["SF50"]["invalidFrames"] == 2
+
+
+def test_runtime_uses_ble_data_drop_counter_as_attach_relative_sequence_evidence() -> None:
+    runtime = BackendRuntime(AppConfiguration())
+    runtime.commands.bootId = 13
+    runtime.transport.status.update({"transport": "ble", "connectionGeneration": 3})
+    runtime.stats.record_frame(seq=1, source="ble", boot_id=13, connection_generation=3)
+
+    _dispatch_log(runtime, "BL50,conn=1,sub=111,dropD=10,dropL=2,dropC=0", source="ble")
+    assert runtime.stats.firmwareAttributedSequenceGap == 0
+    runtime.stats.record_frame(seq=4, source="ble", boot_id=13, connection_generation=3)
+    assert runtime.stats.unknownSequenceGap == 2
+
+    _dispatch_log(runtime, "BL50,conn=1,sub=111,dropD=12,dropL=2,dropC=0", source="ble")
+    assert runtime.stats.firmwareAttributedSequenceGap == 2
+    assert runtime.stats.unknownSequenceGap == 0
+
+
+def test_backend_snapshot_waits_for_atomic_parser_state_batch() -> None:
+    runtime = BackendRuntime(AppConfiguration())
+    entered = threading.Event()
+    completed = threading.Event()
+
+    def capture() -> None:
+        entered.set()
+        snapshot_payload(runtime)
+        completed.set()
+
+    runtime._lock.acquire()
+    worker = threading.Thread(target=capture, daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(1.0)
+        assert not completed.wait(0.05)
+    finally:
+        runtime._lock.release()
+    assert completed.wait(1.0)
+
+
 def test_transport_state_information_is_not_reported_as_an_error() -> None:
     manager = TransportManager(queue.Queue())
     manager.status["sessionGeneration"] = 3
+    manager.status["deviceIdentity"] = {"transport": "serial", "serialNumber": "old"}
 
     manager.apply_state_event(TransportStateEvent("replay", "STREAMING", 3, r"C:\fixtures\cap.replay"))
     assert manager.status["message"] == r"C:\fixtures\cap.replay"
@@ -661,6 +875,7 @@ def test_transport_state_information_is_not_reported_as_an_error() -> None:
     assert manager.status["device"] == ""
     assert manager.status["message"] == ""
     assert manager.status["error"] == ""
+    assert manager.status["deviceIdentity"] is None
 
 
 def test_cap_session_rebuild_keeps_freshness_independent_from_invalid_cell() -> None:
@@ -680,6 +895,8 @@ def test_cap_session_rebuild_keeps_freshness_independent_from_invalid_cell() -> 
         measurementMode="CAP",
         physicalValues=values,
         fresh=fresh,
+        expected=np.arange(64) < 8,
+        acquired=np.arange(64) < 8,
         generation=99,
         requestId=88,
     )
@@ -708,6 +925,8 @@ def test_cap_session_rebuild_preserves_primary_stale_secondary_fresh() -> None:
         measurementMode="CAP",
         physicalValues=values,
         fresh=fresh,
+        expected=np.arange(64) < 8,
+        acquired=np.arange(64) < 8,
         generation=5,
         requestId=6,
     )

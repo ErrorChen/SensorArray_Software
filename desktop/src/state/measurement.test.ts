@@ -41,6 +41,28 @@ describe("measurement presentation", () => {
     expect(isCellDisplayable(cell)).toBe(false);
   });
 
+  it("keeps not-expected, not-acquired, and acquired Xhh failures distinct", () => {
+    const snapshot = createBackendSnapshot({ mode: "RES" });
+
+    snapshot.matrix.expected![0][0] = false;
+    snapshot.matrix.acquired![0][0] = false;
+    snapshot.matrix.valid[0][0] = false;
+    expect(cellMeasurementState(snapshot.matrix, 0, 0).quality).toBe("not_expected");
+
+    snapshot.matrix.expected![0][1] = true;
+    snapshot.matrix.acquired![0][1] = false;
+    snapshot.matrix.valid[0][1] = false;
+    expect(cellMeasurementState(snapshot.matrix, 0, 1).quality).toBe("not_acquired");
+
+    snapshot.matrix.expected![0][2] = true;
+    snapshot.matrix.acquired![0][2] = true;
+    snapshot.matrix.valid[0][2] = false;
+    snapshot.matrix.error![0][2] = true;
+    snapshot.matrix.errorCodes[0][2] = 0x0d;
+    expect(cellMeasurementState(snapshot.matrix, 0, 2).quality).toBe("invalid");
+    expect(cellMeasurementState(snapshot.matrix, 0, 2).errorReason).toContain("Open");
+  });
+
   it("keeps the applied mode unchanged while waiting for MAPP", () => {
     const snapshot = createBackendSnapshot();
     snapshot.measurement.pendingMode = "VOLT";

@@ -4,6 +4,12 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { BackendHttpClient } from "../../api/httpClient";
 import type { BackendSnapshotPayload, HistoryPayload, HistorySeries, MeasurementMode, MeasurementQuantity } from "../../api/types";
 import { formatMeasurementValue, modeForRow, quantityForMode, quantityLabel } from "../../state/measurement";
+import {
+  recordRenderDuration,
+  registerChartInstance,
+  registerResizeObserver,
+  setHistoryPointCount
+} from "../../state/performanceInstrumentation";
 
 type Props = {
   client: BackendHttpClient | null;
@@ -29,6 +35,10 @@ export function TrendGrid({ client, snapshot, history, onHistory, onError }: Pro
   const series = visibleHistory?.series ?? [];
   const padded = [0, 1, 2, 3].map((index) => series[index] ?? { cell: "-", points: [] });
   const hasData = series.some((item) => item.points.some((point) => point.value !== null));
+
+  useEffect(() => {
+    setHistoryPointCount(series.reduce((total, item) => total + item.points.length, 0));
+  }, [series]);
 
   useEffect(() => {
     if (typeof history?.latestN === "number") {
@@ -86,20 +96,33 @@ export function TrendGrid({ client, snapshot, history, onHistory, onError }: Pro
 function TrendChart({ series, unit, quantity }: { series: HistorySeries; unit: string; quantity: MeasurementQuantity }): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
+  const resizeRafRef = useRef<number | null>(null);
 
   useLayoutEffect(() => {
     if (!hostRef.current) {
       return;
     }
     const chart = echarts.init(hostRef.current, undefined, { renderer: "canvas" });
+    const unregisterChart = registerChartInstance();
     chartRef.current = chart;
     const observer = new ResizeObserver(() => {
-      requestAnimationFrame(() => chartRef.current?.resize());
+      if (resizeRafRef.current !== null) return;
+      resizeRafRef.current = requestAnimationFrame(() => {
+        resizeRafRef.current = null;
+        chartRef.current?.resize();
+      });
     });
+    const unregisterObserver = registerResizeObserver();
     observer.observe(hostRef.current);
     return () => {
       observer.disconnect();
+      unregisterObserver();
+      if (resizeRafRef.current !== null) {
+        cancelAnimationFrame(resizeRafRef.current);
+        resizeRafRef.current = null;
+      }
       chart.dispose();
+      unregisterChart();
       chartRef.current = null;
     };
   }, []);
@@ -113,6 +136,7 @@ function TrendChart({ series, unit, quantity }: { series: HistorySeries; unit: s
     const xValues = points.map((point) => point.value[0]);
     const firstX = xValues.length === 1 ? xValues[0] - 1 : xValues[0] ?? 0;
     const lastX = xValues.length === 1 ? xValues[0] + 1 : xValues[xValues.length - 1] ?? 1;
+    const started = performance.now();
     chart.setOption(
       {
         animation: false,
@@ -144,7 +168,13 @@ function TrendChart({ series, unit, quantity }: { series: HistorySeries; unit: s
       },
       { notMerge: true, lazyUpdate: false }
     );
-    requestAnimationFrame(() => chart.resize());
+    recordRenderDuration(performance.now() - started);
+    if (resizeRafRef.current === null) {
+      resizeRafRef.current = requestAnimationFrame(() => {
+        resizeRafRef.current = null;
+        chart.resize();
+      });
+    }
   }, [quantity, series, unit]);
 
   return <div ref={hostRef} className="trendCanvas" />;

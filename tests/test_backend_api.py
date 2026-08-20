@@ -184,7 +184,7 @@ def test_session_export_formats_round_trip(tmp_path):
     with TestClient(app) as client:
         runtime = app.state.runtime
         runtime._handle_event(make_cap_frame(1, [20.0] * 64))
-        for fmt in ["csv", "xlsx", "mat", "h5"]:
+        for fmt in ["csv", "xlsx", "mat", "h5", "zip"]:
             response = client.get(f"/api/export/session?format={fmt}")
             assert response.status_code == 200
             path = tmp_path / f"session.{fmt}"

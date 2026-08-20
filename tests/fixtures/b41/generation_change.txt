@@ -1,6 +1,6 @@
-C,seq=30,ts=30000,rows=1,cells=8,gen=1,rid=9,rf=01,pf=01,sf=01,bad=0/0/0,fmt=pf6,n=8
+C,seq=30,ts=30000,rows=1,cells=8,gen=1,rid=9,rf=01,pf=01,sf=01,expected=00000000000000FF,acquired=00000000000000FF,bad=0/0/0,fmt=pf6,n=8
 D0,33000000,34000000,35000000,36000000,37000000,38000000,39000000,40000000
-K,seq=30,gen=1,rid=9,crc=14EA9FA2
-C,seq=31,ts=31000,rows=1,cells=8,gen=2,rid=9,rf=01,pf=01,sf=01,bad=0/0/0,fmt=pf6,n=8
+K,seq=30,gen=1,rid=9,crc=D37520B5
+C,seq=31,ts=31000,rows=1,cells=8,gen=2,rid=9,rf=01,pf=01,sf=01,expected=00000000000000FF,acquired=00000000000000FF,bad=0/0/0,fmt=pf6,n=8
 D0,33000000,34000000,35000000,36000000,37000000,38000000,39000000,40000000
-K,seq=31,gen=2,rid=9,crc=7F16336F
+K,seq=31,gen=2,rid=9,crc=0B17EC72

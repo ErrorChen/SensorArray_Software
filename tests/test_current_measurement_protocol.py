@@ -7,7 +7,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sensorarray_app.domain.models import BatteryTelemetry, MeasurementFrame, ParserErrorEvent, TransportEnvelope, VoltageFrame
+from sensorarray_app.domain.models import (
+    BatteryTelemetry,
+    CapacitanceFrame,
+    LogRecord,
+    MeasurementFrame,
+    ParserErrorEvent,
+    TransportEnvelope,
+    VoltageFrame,
+)
 from sensorarray_app.protocol.crc import crc32_reflected
 from sensorarray_app.protocol.measurement_ascii import MeasurementAsciiParser
 from sensorarray_app.protocol.registry import ProtocolRegistry
@@ -50,6 +58,8 @@ def build_measurement_packet(
     errorBits = ((1 << cells) - 1) ^ validBits
     if freshBits is None:
         freshBits = (1 << cells) - 1
+    expectedBits = (1 << cells) - 1
+    acquiredBits = expectedBits
     mode, unit, scale, frameFormat, reference = (
         ("VOLT", "V", -6, "uv", "AVDD_AVSS")
         if tag == "V"
@@ -58,7 +68,8 @@ def build_measurement_packet(
     lines = [
         f"{tag},seq={seq},ts=987654,rows={rows},cells={cells},gen={generation},rid={requestId},"
         f"mode={mode},unit={unit},scale={scale},valid={validBits:016X},fresh={freshBits:016X},"
-        f"error={errorBits:016X},ref={reference},rail=1,age=2,avdd=3391000,avss=-2500000,"
+        f"error={errorBits:016X},expected={expectedBits:016X},acquired={acquiredBits:016X},"
+        f"ref={reference},rail=1,age=2,avdd=3391000,avss=-2500000,"
         f"vexc=2500000,rref=100000,dur=12345,tr=234,gc=2,ov=1,aa={cells},fb=0,ir=1,to=0,"
         f"st=0,spi=0,fmt={frameFormat}-x,n={cells},bad={cells - validBits.bit_count()}"
     ]
@@ -90,6 +101,70 @@ def frames(events: list[object]) -> list[MeasurementFrame]:
 
 def errors(events: list[object]) -> list[ParserErrorEvent]:
     return [event for event in events if isinstance(event, ParserErrorEvent)]
+
+
+@pytest.mark.parametrize(
+    ("fixture_path", "frame_type"),
+    [
+        (FIXTURES / "volt_rows2_mixed.txt", MeasurementFrame),
+        (FIXTURES.parent / "b41" / "rows8_valid.txt", CapacitanceFrame),
+    ],
+)
+def test_firmware_d4_runtime_diagnostic_can_interleave_without_corrupting_frame(fixture_path: Path, frame_type: type):
+    lines = fixture_path.read_bytes().splitlines(keepends=True)
+    diagnostic = b"D4,d=secondary,r=7,e=748159,mode=fast,k=FULL,statusFallbackUsed=1\n"
+    events = ProtocolRegistry().feed(envelope(b"".join([lines[0], diagnostic, *lines[1:]])))
+
+    assert len([event for event in events if isinstance(event, frame_type)]) == 1
+    assert not errors(events)
+    diagnostic_logs = [event for event in events if isinstance(event, LogRecord) and event.tag == "D4"]
+    assert len(diagnostic_logs) == 1
+    assert diagnostic_logs[0].parsedFields["d"] == "secondary"
+
+
+def test_firmware_p5_performance_diagnostic_can_interleave_with_vr_pga_chunks():
+    lines = (FIXTURES / "volt_rows2_mixed.txt").read_bytes().splitlines(keepends=True)
+    diagnostic = b"P5,s=123,n=8,profile=fast_runtime,cnt=40,avg=900,max=1100,row=2,d=secondary\n"
+    events = ProtocolRegistry().feed(envelope(b"".join([lines[0], diagnostic, *lines[1:]])))
+
+    assert len(frames(events)) == 1
+    assert not errors(events)
+    diagnostic_logs = [event for event in events if isinstance(event, LogRecord) and event.tag == "P5"]
+    assert len(diagnostic_logs) == 1
+    assert diagnostic_logs[0].parsedFields["profile"] == "fast_runtime"
+
+
+def test_embedded_cap_header_is_recovered_from_truncated_firmware_diagnostic():
+    packet = (FIXTURES.parent / "b41" / "rows8_valid.txt").read_bytes()
+    events = ProtocolRegistry().feed(envelope(b"PFU,d=s,r=4,arg0=acti" + packet))
+
+    assert len([event for event in events if isinstance(event, CapacitanceFrame)]) == 1
+    assert not errors(events)
+    recovery = next(event for event in events if isinstance(event, LogRecord) and event.tag == "WIRE_INTERLEAVE")
+    assert recovery.parsedFields == {
+        "prefixTag": "PFU",
+        "embeddedTag": "C",
+        "embeddedSeq": "8",
+        "droppedPendingFrame": "0",
+        "activeFrameType": "NONE",
+        "prefixLength": "21",
+    }
+
+
+def test_embedded_header_discards_only_unrecoverable_old_pending_frame():
+    packet = (FIXTURES.parent / "b41" / "rows8_valid.txt").read_bytes()
+    lines = packet.splitlines(keepends=True)
+    corrupted = b"".join([lines[0], lines[1], lines[2][:40].rstrip(b"\n"), packet])
+    events = ProtocolRegistry().feed(envelope(corrupted))
+
+    recovered = [event for event in events if isinstance(event, CapacitanceFrame)]
+    assert len(recovered) == 1
+    assert recovered[0].seq == 8
+    assert not errors(events)
+    recovery = next(event for event in events if isinstance(event, LogRecord) and event.tag == "WIRE_INTERLEAVE")
+    assert recovery.parsedFields["prefixTag"] == "D1"
+    assert recovery.parsedFields["droppedPendingFrame"] == "1"
+    assert recovery.parsedFields["activeFrameType"] == "C"
 
 
 def test_firmware_derived_voltage_fixture_parses_negative_pga_masks_and_errors():
@@ -325,3 +400,16 @@ def test_registry_keeps_legacy_matv_support_separate_from_current_v_header():
     legacyFrames = [event for event in events if isinstance(event, VoltageFrame)]
     assert len(legacyFrames) == 1
     assert legacyFrames[0].frameType == "MATV"
+
+
+def test_unrelated_malformed_csv_diagnostic_is_not_a_legacy_matv_reject():
+    registry = ProtocolRegistry()
+    events = registry.feed(envelope(b'DIAG,detail="unterminated\n', source="serial"))
+    assert not errors(events)
+    assert any(getattr(event, "tag", "") == "DIAG" for event in events)
+
+
+def test_malformed_legacy_matv_csv_remains_an_explicit_reject():
+    registry = ProtocolRegistry()
+    events = registry.feed(envelope(b'MATV,3,123,5,uV,"unterminated\n', source="serial"))
+    assert any(event.reason == "matv_csv" for event in errors(events))

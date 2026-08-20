@@ -59,6 +59,15 @@ class ProtocolRegistry:
         self._text_buffers.clear()
         self._streamStates.clear()
 
+    def reset_connection(self) -> None:
+        """Discard only connection-scoped framing/reassembly state.
+
+        A reconnect is not evidence of an MCU reboot, but partial ASCII lines
+        and BLE G envelopes can never cross a physical link epoch.
+        """
+
+        self.reset_session()
+
     def feed(self, envelope: TransportEnvelope) -> list[DomainEvent]:
         normalized = _normalized_envelope(envelope)
         if _contains_g_fragment(normalized.rawPayload):
@@ -96,6 +105,9 @@ class ProtocolRegistry:
             protocolEvents = self._feed_current_line(raw_line, envelope, state)
             for event in protocolEvents:
                 if isinstance(event, LogRecord):
+                    if event.tag == "WIRE_INTERLEAVE":
+                        events.append(event)
+                        continue
                     matv = self.legacy_matv.parse_line(event.rawText, envelope)
                     if matv is not None:
                         events.append(matv)
@@ -157,6 +169,34 @@ class ProtocolRegistry:
                     rawText=rawLine.hex(" "),
                 )
             ]
+
+        embedded = _embedded_frame_header(line)
+        if embedded is not None:
+            offset, header = embedded
+            active_frame = state.activeFrameType
+            dropped_pending = _reset_active_frame(state)
+            prefix = line[:offset]
+            recovery = LogRecord(
+                timestamp=envelope.receivedWallTime,
+                monotonicTime=envelope.receivedMonotonicNs,
+                source=envelope.source,
+                channel=envelope.channel,
+                tag="WIRE_INTERLEAVE",
+                severity="warning",
+                rawText=line,
+                parsedFields={
+                    "prefixTag": prefix.split(",", maxsplit=1)[0].strip() or "UNKNOWN",
+                    "embeddedTag": header.split(",", maxsplit=1)[0],
+                    "embeddedSeq": _field_value(header, "seq"),
+                    "droppedPendingFrame": "1" if dropped_pending else "0",
+                    "activeFrameType": active_frame or "NONE",
+                    "prefixLength": str(len(prefix)),
+                },
+                recognised=True,
+                sessionGeneration=envelope.sessionGeneration,
+            )
+            recovered_line = (header + "\n").encode("ascii")
+            return [recovery, *self._feed_current_line(recovered_line, envelope, state)]
 
         tag = line.split(",", maxsplit=1)[0].strip()
         events: list[CapacitanceFrame | MeasurementFrame | MixedMeasurementFrame | LogRecord | ParserErrorEvent] = []
@@ -288,6 +328,8 @@ def _replace_envelope(envelope: TransportEnvelope, channel: str, payload: bytes)
         rawPayload=payload,
         remoteAddress=envelope.remoteAddress,
         metadata=dict(envelope.metadata),
+        connectionGeneration=envelope.connectionGeneration,
+        bootId=envelope.bootId,
     )
 
 
@@ -305,3 +347,59 @@ def _looks_like_mixed_header(line: str) -> bool:
     canonicalIdentity = {"rgen", "rrid", "pgen", "prid"}
     legacyIdentity = {"rowsGen", "rowsRid", "profileGen", "profileRid"}
     return geometry <= fields and (canonicalIdentity <= fields or legacyIdentity <= fields)
+
+
+def _embedded_frame_header(line: str) -> tuple[int, str] | None:
+    """Find a complete 8045 header spliced into another firmware line.
+
+    Exact firmware 8045 can write high-volume diagnostic ``printf`` output
+    concurrently with the USB sink's complete-frame ``fwrite``.  On the real
+    CDC stream this occasionally produces ``PFU,...actiC,seq=...`` or a new C
+    header in the middle of an old D line.  Match the full geometry/identity
+    signature so arbitrary log text containing ``C,`` is never promoted into
+    measurement authority.
+    """
+
+    candidates: list[tuple[int, str]] = []
+    for marker in ("C,seq=", "V,seq=", "R,seq=", "M,seq="):
+        offset = line.find(marker, 1)
+        if offset > 0:
+            candidates.append((offset, line[offset:]))
+    for offset, header in sorted(candidates):
+        tag = header.split(",", maxsplit=1)[0]
+        fields = {
+            item.split("=", maxsplit=1)[0].strip()
+            for item in header.split(",")[1:]
+            if "=" in item
+        }
+        common = {"seq", "ts", "rows", "cells", "n"}
+        if tag == "C" and common | {"gen", "rid", "expected", "acquired", "fmt"} <= fields:
+            return offset, header
+        if tag in {"V", "R"} and common | {"gen", "rid", "mode", "unit", "scale", "valid", "fresh", "error", "fmt"} <= fields:
+            return offset, header
+        if tag == "M" and _looks_like_mixed_header(header) and common <= fields:
+            return offset, header
+    return None
+
+
+def _reset_active_frame(state: _StreamState) -> bool:
+    dropped = False
+    if state.activeFrameType == "C":
+        dropped = state.cap.hasPendingFrame
+        state.cap.reset()
+    elif state.activeFrameType in {"V", "R"}:
+        dropped = state.measurement.hasPendingFrame
+        state.measurement.reset()
+    elif state.activeFrameType == "M":
+        dropped = state.mixed.hasPendingFrame
+        state.mixed.reset()
+    state.activeFrameType = None
+    return dropped
+
+
+def _field_value(line: str, name: str) -> str:
+    prefix = f"{name}="
+    for item in line.split(",")[1:]:
+        if item.startswith(prefix):
+            return item[len(prefix):]
+    return ""

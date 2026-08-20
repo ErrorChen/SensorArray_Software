@@ -11,9 +11,10 @@ and adds two ways to select the measurement quantity:
 
 For example, `ROWMODES=RVVCCVVR` configures S1/S8 as RES, S2/S3/S6/S7 as
 VOLT, and S4/S5 as CAP. A homogeneous saved eight-row profile continues to use
-the established single-quantity frame families. Firmware `331c445` selects the
-mixed `M/MR/K` family whenever the complete saved profile is heterogeneous,
-even if the currently active `ROWS` prefix happens to contain one mode.
+the established single-quantity frame families. Firmware `8045e9e9` also emits
+the atomic `M/MR/K` family for mixed-row acquisition. The host accepts a
+homogeneous active prefix in an `M` frame and does not invent a heterogeneity
+requirement that is absent from the wire contract.
 
 Serial, Bluetooth LE, Wi-Fi UDP, and Replay all feed the same content-routed
 protocol layer, typed command/domain state, stores, WebSocket snapshot, and
@@ -27,7 +28,7 @@ is authoritative for production wire bytes. Formatter and command code plus
 their tests outrank copied host fixtures and prose.
 
 This host upgrade targets exact firmware commit
-`331c44589318db9ba642cf3ab33bb08ca3dd8a34`, which adds:
+`8045e9e9ec9599533c52c15dfcb6002f79fd15f1`, which provides:
 
 - `ROWMODES?`, `ROWMODES=...`, `RMACK`, `RMAPP`, and `RMERR`;
 - heterogeneous `M/MR/K` measurement frames;
@@ -36,17 +37,13 @@ This host upgrade targets exact firmware commit
 
 The Python mixed assembler and Replay fixtures follow the exact formatter in
 `main/output/sensorarrayTextProtocol.c`: short identity keys
-`rgen/rrid/pgen/prid`, `MR,s=...,m=C|V|R`, comma-separated `D=` values, and CRC
+`rgen/rrid/pgen/prid`, `MR,s=...,m=CAP|VOLT|RES`, comma-separated `D=` values, and CRC
 over the exact `M` and `MR` lines including LF.
 
-Firmware `331c445` has one source-level transaction blocker that the Host must
-not conceal: a homogeneous `ROWMODES=CCCCCCCC`, `VVVVVVVV`, or `RRRRRRRR`
-request emits `RMACK` and enters the legacy frame path, but that path contains
-no row-profile `CompleteTransition`, `RMAPP`, or `RMERR`. The strict Host
-therefore times out and keeps the prior applied profile. Data frames are not
-used as an applied-event substitute. Homogeneous row-profile transaction and
-the requested switching-stress acceptance remain firmware-blocked until that
-completion path is fixed; the global `MODE=` set-all action remains supported.
+Firmware `8045e9e9` completes both heterogeneous and homogeneous
+`ROWMODES=CCCCCCCC|VVVVVVVV|RRRRRRRR` through strict `RMACK` followed by one
+terminal `RMAPP` or `RMERR`. Data frames are never used as an applied-event
+substitute; request-ID correlation remains mandatory.
 
 See [measurement protocol compatibility notes](docs/measurement-protocol.md)
 for the exact target schema and the firmware evidence boundary.
@@ -129,7 +126,7 @@ Serial / BLE / Wi-Fi / Replay
 ```
 
 The logical backing geometry remains 8x8. `frame.rows` is the active geometry
-authority and can be any integer from 1 through 8. Canonical `331c445` mixed
+authority and can be any integer from 1 through 8. Canonical `8045e9e9` mixed
 rows keep explicit row mode, unit, scale, validity, freshness, error, `fmt`, and
 eight fixed-point/error tokens. The store also keeps separate CAP, VOLT, and RES value caches so
 an ohm value cannot later be interpreted as pF. A row mode change starts a new
@@ -237,11 +234,17 @@ reported as BLE HIL.
 Real-hardware acceptance requires the full Electron application and the exact
 firmware artifact under test. Each CAP, VOLT, RES, and
 `RVVCCVVR` mixed run is 120 seconds. Switching stress includes at least ten
-cycles of the global CAP/RES/CAP and CAP/VOLT/CAP sequences plus the requested
-row-profile sequence. BLE acceptance must observe accepted responses on `FF11`
+cycles of `CAP -> RES -> VOLT -> RVVCCVVR -> CCCCCCCC -> RRRRRRRR ->
+VVVVVVVV`. BLE acceptance must observe accepted responses on `FF11`
 and matching applied events on `FF30`; Serial is not an applied-event sidecar.
-The known homogeneous `ROWMODES` completion defect must be reported as a
-firmware BLOCKED/FAIL result rather than bypassed in Host code.
+Homogeneous and heterogeneous `ROWMODES` terminals must both be observed and
+reported from the real transport. BLE reconnect acceptance forces 30
+unexpected disconnects and requires automatic same-device resubscription and
+bootstrap on every connection generation. The Serial scientific-recorder
+endurance interval is 450 seconds (7.5 minutes). Its sequence audit is bounded
+by the opening and closing `PERF.frames` watermarks; frames beyond the closing
+watermark are a recorded live tail, not silently assigned to that closed
+interval. Replay remains software evidence only.
 See [validation](docs/validation.md) for the complete evidence checklist and
 required screenshots.
 

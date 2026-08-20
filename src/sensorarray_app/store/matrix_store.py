@@ -57,6 +57,12 @@ class MatrixSnapshot:
     capValues: np.ndarray = field(default_factory=lambda: np.full((8, 8), np.nan))
     voltValues: np.ndarray = field(default_factory=lambda: np.full((8, 8), np.nan))
     resValues: np.ndarray = field(default_factory=lambda: np.full((8, 8), np.nan))
+    expected: np.ndarray = field(default_factory=lambda: np.zeros((8, 8), dtype=bool))
+    acquired: np.ndarray = field(default_factory=lambda: np.zeros((8, 8), dtype=bool))
+    acquisitionMasksKnown: bool = False
+    connectionGeneration: int = 0
+    bootId: int | None = None
+    quarantinedReason: str = ""
 
 
 class MatrixStore:
@@ -87,6 +93,10 @@ class MatrixStore:
         self._profile_generation: int | None = None
         self._profile_request_id: int | None = None
         self._profile_frame_seq: int | None = None
+        self._connection_generation = 0
+        self._boot_id: int | None = None
+        self._resync_required = False
+        self._quarantined_reason = ""
         self._domain_values = {
             "CAP": np.full((8, 8), np.nan, dtype=np.float64),
             "VOLT": np.full((8, 8), np.nan, dtype=np.float64),
@@ -104,6 +114,11 @@ class MatrixStore:
     def appliedMode(self) -> str:
         with self._lock:
             return self._applied_mode
+
+    @property
+    def resyncRequired(self) -> bool:
+        with self._lock:
+            return self._resync_required
 
     def apply_measurement_mode(
         self,
@@ -131,6 +146,7 @@ class MatrixStore:
             # physical quantity while waiting for the first target-mode frame.
             if changed:
                 self._latest = None
+                self._quarantined_reason = "WAITING_FOR_AUTHORITATIVE_FRAME"
 
     def apply_row_modes(
         self,
@@ -147,7 +163,7 @@ class MatrixStore:
             self._profile_request_id = request_id
             self._profile_frame_seq = frame_seq
 
-            # Firmware 331c445 selects M/MR/K from the complete persisted
+            # Firmware selects M/MR/K from the complete persisted
             # eight-row profile, including inactive rows.  Only a profile
             # homogeneous across all eight rows uses the legacy C/V/R family.
             # RMAPP is therefore
@@ -159,14 +175,30 @@ class MatrixStore:
             if homogeneous_mode is not None:
                 changed = changed or homogeneous_mode != self._applied_mode
                 self._applied_mode = homogeneous_mode
-                self._gate_generation = generation
-                self._gate_request_id = request_id
-                self._gate_frame_seq = frame_seq
+                # RMAPP.gen identifies RowModeProfile, while homogeneous V/R
+                # frames carry MeasurementMode.generation.  They can diverge.
+                # Preserve a STATE?-derived mode generation only when both
+                # snapshots describe the same applied request; otherwise the
+                # first post-RMAPP frame is gated by request ID + boundary and
+                # supplies the mode generation without pretending it was the
+                # profile generation.
+                # A ROWMODES? snapshot (and replay resync) may know the
+                # homogeneous profile without knowing an RMAPP identity.
+                # Unknown profile fields must not erase the independent,
+                # authoritative MODE generation/request gate supplied by
+                # STATE?/MAPP or the first verified V/R frame.
+                if request_id is not None:
+                    if self._gate_request_id != request_id:
+                        self._gate_generation = None
+                    self._gate_request_id = request_id
+                if frame_seq is not None:
+                    self._gate_frame_seq = frame_seq
             self._revision += 1
             # Do not relabel values captured under the previous row profile.
             # Wait for one complete CRC-valid mixed/homogeneous frame.
             if changed:
                 self._latest = None
+                self._quarantined_reason = "WAITING_FOR_AUTHORITATIVE_FRAME"
 
     def apply_rows(
         self,
@@ -210,6 +242,8 @@ class MatrixStore:
         self.apply_measurement_mode(frame.mode, frame.generation, frame.requestId, frame.seq)
 
     def add_capacitance(self, frame: CapacitanceFrame) -> bool:
+        if not self._accept_identity(frame.connectionGeneration, frame.bootId):
+            return False
         if not self._accept(
             "CAP",
             frame.rows,
@@ -224,6 +258,8 @@ class MatrixStore:
         raw_fixed64 = np.full(64, np.nan, dtype=np.float64)
         valid64 = np.zeros(64, dtype=bool)
         fresh64 = np.zeros(64, dtype=bool)
+        expected64 = _frame_mask64(frame.expectedMask, frame.cells)
+        acquired64 = _frame_mask64(frame.acquiredMask, frame.cells)
         values64[: frame.cells] = frame.correctedPfValues
         raw_pf64[: frame.cells] = frame.rawPfValues
         valid64[: frame.cells] = np.asarray(frame.validMask, dtype=bool)
@@ -270,12 +306,20 @@ class MatrixStore:
                 "badStaleCount": frame.badStaleCount,
                 "badMixedCount": frame.badMixedCount,
                 "badInvalidCount": frame.badInvalidCount,
+                "acquisitionMasksKnown": frame.acquisitionMasksKnown,
             },
+            expected=expected64,
+            acquired=acquired64,
+            acquisition_masks_known=frame.acquisitionMasksKnown,
+            connection_generation=frame.connectionGeneration,
+            boot_id=frame.bootId,
         )
         self._commit(snapshot, values64, valid64, fresh64, raw_fixed64, error_codes64, np.full(64, -1), frame)
         return True
 
     def add_measurement(self, frame: MeasurementFrame) -> bool:
+        if not self._accept_identity(frame.connectionGeneration, frame.bootId):
+            return False
         if not self._accept(
             frame.mode,
             frame.rows,
@@ -291,6 +335,8 @@ class MatrixStore:
         valid64 = np.zeros(64, dtype=bool)
         fresh64 = np.zeros(64, dtype=bool)
         error_mask64 = np.zeros(64, dtype=bool)
+        expected64 = _frame_mask64(frame.expectedMask, cells)
+        acquired64 = _frame_mask64(frame.acquiredMask, cells)
         error_codes64 = np.full(64, -1, dtype=np.int16)
         error_reasons64 = np.full(64, "", dtype=object)
         pga64 = np.full(64, -1, dtype=np.int16)
@@ -354,6 +400,11 @@ class MatrixStore:
             raw_trailer=frame.rawTrailer,
             diagnostics=diagnostics,
             explicit_error=error_mask64,
+            expected=expected64,
+            acquired=acquired64,
+            acquisition_masks_known=frame.acquisitionMasksKnown,
+            connection_generation=frame.connectionGeneration,
+            boot_id=frame.bootId,
         )
         self._commit(snapshot, values64, valid64, fresh64, raw_fixed64, error_codes64, pga64, frame)
         return True
@@ -361,13 +412,18 @@ class MatrixStore:
     def add_mixed(self, frame: MixedMeasurementFrame) -> bool:
         """Atomically store one complete typed MixedMeasurementFrame."""
 
-        profile = _normalize_row_modes(frame.profile)
+        if not self._accept_identity(frame.connectionGeneration, frame.bootId):
+            return False
+        active_profile = tuple(frame.activeProfile)
+        profile_list = list(self._row_modes)
+        profile_list[: int(frame.rows)] = active_profile
+        profile = tuple(profile_list)
         if not self._accept_mixed(
             int(frame.seq),
             int(frame.rows),
             int(frame.rowsGeneration),
             int(frame.rowsRequestId),
-            profile,
+            active_profile,
             int(frame.profileGeneration),
             int(frame.profileRequestId),
         ):
@@ -379,6 +435,8 @@ class MatrixStore:
         valid64 = np.zeros(64, dtype=bool)
         fresh64 = np.zeros(64, dtype=bool)
         error64 = np.zeros(64, dtype=bool)
+        expected64 = _frame_mask64(frame.expectedMask, frame.cells)
+        acquired64 = _frame_mask64(frame.acquiredMask, frame.cells)
         error_codes64 = np.full(64, -1, dtype=np.int16)
         error_reasons64 = np.full(64, "", dtype=object)
         pga64 = np.full(64, -1, dtype=np.int16)
@@ -458,6 +516,11 @@ class MatrixStore:
             rowScales=tuple(row_scales),
             profileGeneration=int(frame.profileGeneration),
             profileRequestId=int(frame.profileRequestId),
+            expected=_bool_matrix(expected64, rows),
+            acquired=_bool_matrix(acquired64, rows),
+            acquisitionMasksKnown=True,
+            connectionGeneration=frame.connectionGeneration,
+            bootId=frame.bootId,
         )
         self._commit(snapshot, values64, valid64, fresh64, raw_fixed64, error_codes64, pga64, frame)
         return True
@@ -513,38 +576,113 @@ class MatrixStore:
                 capValues=source.capValues.copy(),
                 voltValues=source.voltValues.copy(),
                 resValues=source.resValues.copy(),
+                expected=source.expected.copy(),
+                acquired=source.acquired.copy(),
+                acquisitionMasksKnown=source.acquisitionMasksKnown,
+                connectionGeneration=source.connectionGeneration,
+                bootId=source.bootId,
+                quarantinedReason=source.quarantinedReason,
             )
 
     def clear(self) -> None:
         with self._lock:
             self._revision += 1
             self._latest = None
+            self._quarantined_reason = ""
             self._history.clear()
             for values in self._domain_values.values():
                 values.fill(np.nan)
 
     def reset_session(self) -> None:
-        """Clear data and all device-scoped frame identities."""
+        """Start a host transport session without inventing a device boot."""
 
         with self._lock:
             self._revision += 1
-            self._latest = None
-            self._history.clear()
-            self._active_rows = 8
             self._geometry_known = False
             self._rows_generation = None
             self._rows_request_id = None
             self._rows_frame_seq = None
-            self._applied_mode = "CAP"
             self._gate_generation = None
             self._gate_request_id = None
             self._gate_frame_seq = None
-            self._row_modes = ("CAP",) * 8
             self._profile_generation = None
             self._profile_request_id = None
             self._profile_frame_seq = None
-            for values in self._domain_values.values():
-                values.fill(np.nan)
+            self._resync_required = True
+            self._quarantined_reason = "WAITING_FOR_DEVICE_RESYNC"
+            if self._latest is not None:
+                self._latest = MatrixSnapshot(
+                    **{
+                        **self._latest.__dict__,
+                        "revision": self._revision,
+                        "quarantinedReason": "WAITING_FOR_DEVICE_RESYNC",
+                    }
+                )
+
+    def begin_connection(self, connection_generation: int) -> None:
+        """Start a physical link epoch while preserving experiment history."""
+
+        with self._lock:
+            self._connection_generation = int(connection_generation)
+            self._resync_required = True
+            self._quarantine_locked("WAITING_FOR_DEVICE_RESYNC")
+
+    def complete_resync(
+        self,
+        *,
+        mode: str,
+        rows: int,
+        row_modes: Any,
+        rows_generation: int | None,
+        rows_request_id: int | None,
+        rows_frame_seq: int | None,
+        mode_generation: int | None,
+        mode_request_id: int | None,
+        profile_generation: int | None,
+        profile_request_id: int | None,
+    ) -> None:
+        """Install a complete STATE/ROWS/ROWMODES snapshot atomically enough
+        for subsequent frame gating, then admit the next authoritative frame.
+        """
+
+        self.apply_measurement_mode(mode, mode_generation, mode_request_id, None)
+        self.apply_rows(rows, rows_generation, rows_request_id, rows_frame_seq)
+        self.apply_row_modes(row_modes, profile_generation, profile_request_id, None)
+        with self._lock:
+            self._resync_required = False
+            self._quarantined_reason = "WAITING_FOR_AUTHORITATIVE_FRAME"
+
+    def observe_device_reboot(self, new_boot_id: int) -> None:
+        """Clear boot-scoped gates while retaining experiment history."""
+
+        with self._lock:
+            self._revision += 1
+            self._geometry_known = False
+            self._rows_generation = None
+            self._rows_request_id = None
+            self._rows_frame_seq = None
+            self._gate_generation = None
+            self._gate_request_id = None
+            self._gate_frame_seq = None
+            self._profile_generation = None
+            self._profile_request_id = None
+            self._profile_frame_seq = None
+            self._boot_id = int(new_boot_id)
+            self._resync_required = True
+            self._quarantined_reason = "DEVICE_REBOOT_RESYNC"
+            if self._latest is not None:
+                self._latest = MatrixSnapshot(
+                    **{
+                        **self._latest.__dict__,
+                        "revision": self._revision,
+                        "bootId": int(new_boot_id),
+                        "quarantinedReason": "DEVICE_REBOOT_RESYNC",
+                    }
+                )
+
+    def observe_boot_identity(self, boot_id: int) -> None:
+        with self._lock:
+            self._boot_id = int(boot_id)
 
     def set_active_rows_for_display(self, rows: int) -> None:
         if not (1 <= int(rows) <= 8):
@@ -570,6 +708,9 @@ class MatrixStore:
     ) -> bool:
         normalized = _normalize_mode(mode)
         with self._lock:
+            if self._resync_required:
+                self._quarantine_locked("WAITING_FOR_DEVICE_RESYNC")
+                return False
             # A heterogeneous full-profile RMAPP disables every homogeneous
             # frame path, even when the active ROWS prefix is one mode.
             # In-flight legacy data from the previous profile must not replace
@@ -577,27 +718,35 @@ class MatrixStore:
             homogeneous_mode = self._row_modes[0] if len(set(self._row_modes)) == 1 else None
             if homogeneous_mode is None or normalized != homogeneous_mode or normalized != self._applied_mode:
                 self.rejectedWrongMode += 1
+                self._quarantine_locked("WAITING_FOR_RMAPP" if self._profile_request_id is not None else "STALE_PROFILE")
                 return False
             if self._geometry_known and int(rows) != self._active_rows:
                 self.rejectedWrongMode += 1
+                self._quarantine_locked("STALE_PROFILE")
                 return False
             if self._rows_frame_seq is not None and int(seq) < self._rows_frame_seq:
                 self.rejectedBeforeBoundary += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if self._gate_frame_seq is not None and int(seq) < self._gate_frame_seq:
                 self.rejectedBeforeBoundary += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if not modern and self._rows_generation is not None and generation != self._rows_generation:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if not modern and self._rows_request_id is not None and request_id != self._rows_request_id:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if modern and self._gate_generation is not None and generation != self._gate_generation:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if modern and self._gate_request_id is not None and request_id != self._gate_request_id:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             return True
 
@@ -612,29 +761,40 @@ class MatrixStore:
         request_id: int,
     ) -> bool:
         with self._lock:
+            if self._resync_required:
+                self._quarantine_locked("WAITING_FOR_DEVICE_RESYNC")
+                return False
             if self._geometry_known and rows != self._active_rows:
                 self.rejectedWrongMode += 1
+                self._quarantine_locked("STALE_PROFILE")
                 return False
             if self._rows_frame_seq is not None and seq < self._rows_frame_seq:
                 self.rejectedBeforeBoundary += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if self._rows_generation is not None and rows_generation != self._rows_generation:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if self._rows_request_id is not None and rows_request_id != self._rows_request_id:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
-            if profile != self._row_modes:
+            if tuple(profile[:rows]) != tuple(self._row_modes[:rows]):
                 self.rejectedWrongMode += 1
+                self._quarantine_locked("STALE_PROFILE")
                 return False
             if self._profile_frame_seq is not None and int(seq) < self._profile_frame_seq:
                 self.rejectedBeforeBoundary += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if self._profile_generation is not None and generation != self._profile_generation:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             if self._profile_request_id is not None and request_id != self._profile_request_id:
                 self.rejectedStaleGeneration += 1
+                self._quarantine_locked("GENERATION_MISMATCH")
                 return False
             return True
 
@@ -661,6 +821,11 @@ class MatrixStore:
         raw_trailer: str,
         diagnostics: dict[str, Any],
         explicit_error: np.ndarray | None = None,
+        expected: np.ndarray | None = None,
+        acquired: np.ndarray | None = None,
+        acquisition_masks_known: bool = False,
+        connection_generation: int = 0,
+        boot_id: int | None = None,
     ) -> MatrixSnapshot:
         normalized = _normalize_mode(mode)
         quantity, unit, scale, format_name = MODE_PRESENTATION[normalized]
@@ -701,6 +866,11 @@ class MatrixStore:
             rowScales=_row_scales(self._row_modes),
             profileGeneration=self._profile_generation,
             profileRequestId=self._profile_request_id,
+            expected=_bool_matrix(np.zeros(64, dtype=bool) if expected is None else expected, rows),
+            acquired=_bool_matrix(np.zeros(64, dtype=bool) if acquired is None else acquired, rows),
+            acquisitionMasksKnown=bool(acquisition_masks_known),
+            connectionGeneration=int(connection_generation),
+            bootId=boot_id,
         )
 
     def _commit(
@@ -739,6 +909,7 @@ class MatrixStore:
                 "resValues": self._domain_values["RES"].copy(),
             }
             self._latest = MatrixSnapshot(**committed)
+            self._quarantined_reason = ""
             self._history.append(
                 snapshot.seq or 0,
                 (snapshot.timestampUs or 0) / 1_000_000.0,
@@ -750,14 +921,62 @@ class MatrixStore:
                 source=snapshot.sourceTransport,
                 scale=snapshot.scale,
                 fresh=fresh,
+                expected=np.asarray(snapshot.expected, dtype=bool).reshape(64),
+                acquired=np.asarray(snapshot.acquired, dtype=bool).reshape(64),
+                expected_known=snapshot.acquisitionMasksKnown,
+                acquired_known=snapshot.acquisitionMasksKnown,
+                fresh_known=frame is not None,
+                error=np.asarray(snapshot.error, dtype=bool).reshape(64),
                 raw_fixed=raw_fixed,
                 error_codes=error_codes,
+                error_reasons=np.asarray(snapshot.errorReasons, dtype=object).reshape(64),
                 pga=pga,
+                pga_bypass=np.asarray(snapshot.pgaBypass, dtype=bool).reshape(64),
                 generation=snapshot.firmwareGeneration,
                 request_id=snapshot.requestId,
                 row_modes=snapshot.rowModes,
                 row_units=snapshot.rowUnits,
                 row_scales=snapshot.rowScales,
+                connection_generation=snapshot.connectionGeneration,
+                boot_id=snapshot.bootId,
+                device_timestamp_us=snapshot.timestampUs,
+                host_wall_time=getattr(frame, "receivedTime", None),
+                host_monotonic_ns=getattr(frame, "receivedMonotonicNs", None),
+                rows_generation=(
+                    int(frame.rowsGeneration)
+                    if isinstance(frame, MixedMeasurementFrame)
+                    else int(frame.generation)
+                    if isinstance(frame, CapacitanceFrame)
+                    else None
+                ),
+                rows_request_id=(
+                    int(frame.rowsRequestId)
+                    if isinstance(frame, MixedMeasurementFrame)
+                    else int(frame.requestId)
+                    if isinstance(frame, CapacitanceFrame)
+                    else None
+                ),
+                mode_generation=int(frame.generation) if isinstance(frame, MeasurementFrame) else None,
+                mode_request_id=int(frame.requestId) if isinstance(frame, MeasurementFrame) else None,
+                profile_generation=(
+                    int(frame.profileGeneration)
+                    if isinstance(frame, MixedMeasurementFrame)
+                    else snapshot.profileGeneration
+                ),
+                profile_request_id=(
+                    int(frame.profileRequestId)
+                    if isinstance(frame, MixedMeasurementFrame)
+                    else snapshot.profileRequestId
+                ),
+                wire_profile=frame.wireProfile if isinstance(frame, MixedMeasurementFrame) else None,
+                rail_valid=bool(frame.railValid) if isinstance(frame, MeasurementFrame) else False,
+                rail_fresh=bool(frame.railValid) if isinstance(frame, MeasurementFrame) else False,
+                rail_age=int(frame.railAgeFrames) if isinstance(frame, MeasurementFrame) else None,
+                avdd_uv=int(frame.avddUv) if isinstance(frame, MeasurementFrame) else None,
+                avss_uv=int(frame.avssUv) if isinstance(frame, MeasurementFrame) else None,
+                rail_span_uv=(int(frame.avddUv) - int(frame.avssUv)) if isinstance(frame, MeasurementFrame) else None,
+                rail_source="frame" if isinstance(frame, MeasurementFrame) else "",
+                rail_reason=("ok" if frame.railValid else "rail_invalid") if isinstance(frame, MeasurementFrame) else "",
             )
 
     def _add_legacy_flat(
@@ -773,7 +992,9 @@ class MatrixStore:
         # Legacy imported voltage/resistance data has no MAPP generation. It is
         # retained for compatibility but is never used by the modern parser.
         self.apply_measurement_mode(mode, None, None, None)
-        fresh = np.asarray(valid, dtype=bool).reshape(64)
+        # Legacy payloads have no acquisition/freshness fact.  Preserve that
+        # uncertainty instead of silently promoting validity to freshness.
+        fresh = np.zeros(64, dtype=bool)
         snapshot = self._make_snapshot(
             mode=mode,
             rows=8,
@@ -837,7 +1058,37 @@ class MatrixStore:
             capValues=self._domain_values["CAP"].copy(),
             voltValues=self._domain_values["VOLT"].copy(),
             resValues=self._domain_values["RES"].copy(),
+            connectionGeneration=self._connection_generation,
+            bootId=self._boot_id,
+            quarantinedReason=self._quarantined_reason,
         )
+
+    def _identity_reject_reason(self, frame_connection: int | None, frame_boot: int | None) -> str:
+        if frame_connection not in {None, 0} and self._connection_generation not in {0, frame_connection}:
+            return "OLD_CONNECTION"
+        if frame_boot is not None and self._boot_id is not None and frame_boot != self._boot_id:
+            return "BOOT_MISMATCH"
+        return ""
+
+    def _accept_identity(self, frame_connection: int | None, frame_boot: int | None) -> bool:
+        with self._lock:
+            reason = self._identity_reject_reason(frame_connection, frame_boot)
+            if not reason:
+                return True
+            self._quarantine_locked(reason)
+            return False
+
+    def _quarantine_locked(self, reason: str) -> None:
+        self._quarantined_reason = str(reason)
+        self._revision += 1
+        if self._latest is not None:
+            self._latest = MatrixSnapshot(
+                **{
+                    **self._latest.__dict__,
+                    "revision": self._revision,
+                    "quarantinedReason": self._quarantined_reason,
+                }
+            )
 
 
 def _normalize_mode(mode: str) -> str:
@@ -876,6 +1127,14 @@ def _bool_matrix(values: np.ndarray, rows: int) -> np.ndarray:
     matrix = np.zeros((8, 8), dtype=bool)
     matrix[:rows, :] = np.asarray(values, dtype=bool).reshape(64)[: rows * 8].reshape(rows, 8)
     return matrix
+
+
+def _frame_mask64(values: np.ndarray, cells: int) -> np.ndarray:
+    output = np.zeros(64, dtype=bool)
+    source = np.asarray(values, dtype=bool).reshape(-1)
+    if source.size:
+        output[: min(int(cells), source.size)] = source[: min(int(cells), source.size)]
+    return output
 
 
 def _int_matrix(values: np.ndarray, rows: int, fill: int) -> np.ndarray:

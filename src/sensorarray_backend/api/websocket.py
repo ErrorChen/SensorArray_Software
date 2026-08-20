@@ -8,6 +8,7 @@ from sensorarray_backend.api.dependencies import get_runtime
 from sensorarray_backend.core.history import history_payload
 from sensorarray_backend.core.runtime import BackendRuntime
 from sensorarray_backend.core.snapshot import websocket_snapshot
+from sensorarray_backend.core.websocket_metrics import websocket_metrics
 
 router = APIRouter()
 
@@ -15,6 +16,7 @@ router = APIRouter()
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, runtime: BackendRuntime = Depends(get_runtime)) -> None:
     await websocket.accept()
+    websocket_metrics.connected()
     last_history_key: tuple[int, int, int, str, str] | None = None
     try:
         while True:
@@ -34,3 +36,5 @@ async def websocket_endpoint(websocket: WebSocket, runtime: BackendRuntime = Dep
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         return
+    finally:
+        websocket_metrics.disconnected()

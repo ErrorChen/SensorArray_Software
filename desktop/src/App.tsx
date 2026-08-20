@@ -14,6 +14,11 @@ import { StatusBar } from "./components/StatusBar/StatusBar";
 import { TrendGrid } from "./components/TrendGrid/TrendGrid";
 import { snapshotForDisplay } from "./state/appStore";
 import { clampSplitRatio, type SplitLimits } from "./state/layout";
+import {
+  recordBackendSnapshot,
+  recordCoalescedSnapshot,
+  recordPresentedFrame
+} from "./state/performanceInstrumentation";
 import { defaultSetupProfile, normaliseSetupProfile, setupProfileFromSnapshot } from "./state/setupProfile";
 import { readStoredSetupProfile, writeStoredSetupProfile } from "./state/setupProfileStorage";
 import type { SessionDataFormat, SetupProfile } from "./api/types";
@@ -44,6 +49,10 @@ export function App(): JSX.Element {
   const latestSelectionRef = useRef<SelectionSnapshot | undefined>(undefined);
   const selectionRequestSeqRef = useRef(0);
   const inactiveSelectionCorrectionRef = useRef("");
+  const pendingSnapshotRef = useRef<BackendSnapshotPayload | null>(null);
+  const pendingHistoryRef = useRef<HistoryPayload | null>(null);
+  const presentationRafRef = useRef<number | null>(null);
+  const lastPresentationAtRef = useRef(0);
 
   useEffect(() => {
     void resolveBackendUrl()
@@ -79,6 +88,13 @@ export function App(): JSX.Element {
   }, [setupProfile]);
 
   useEffect(() => {
+    if (!client) return;
+    void client.setLifecycleSettings(setupProfile.lifecycle).catch((settingsError) => {
+      setError(settingsError instanceof Error ? settingsError.message : String(settingsError));
+    });
+  }, [client, setupProfile.lifecycle]);
+
+  useEffect(() => {
     snapshotRef.current = snapshot;
   }, [snapshot]);
 
@@ -86,20 +102,72 @@ export function App(): JSX.Element {
     runtimeDirectoryRef.current = runtimeDirectory;
   }, [runtimeDirectory]);
 
+  const requestPresentation = useCallback(() => {
+    if (typeof document !== "undefined" && document.hidden) {
+      return;
+    }
+    if (presentationRafRef.current !== null) {
+      return;
+    }
+    const present = (now: number) => {
+      const elapsed = now - lastPresentationAtRef.current;
+      if (lastPresentationAtRef.current > 0 && elapsed < 40) {
+        presentationRafRef.current = requestAnimationFrame(present);
+        return;
+      }
+      presentationRafRef.current = null;
+      if (typeof document !== "undefined" && document.hidden) {
+        return;
+      }
+      const incoming = pendingSnapshotRef.current;
+      const incomingHistory = pendingHistoryRef.current;
+      pendingSnapshotRef.current = null;
+      pendingHistoryRef.current = null;
+      if (incoming) {
+        setSnapshot(incoming);
+        setVisualSnapshot((current) => snapshotForDisplay(incoming, current));
+        lastPresentationAtRef.current = now;
+        recordPresentedFrame(now);
+      }
+      if (incomingHistory) {
+        setHistory(incomingHistory);
+      }
+    };
+    presentationRafRef.current = requestAnimationFrame(present);
+  }, []);
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (!document.hidden) requestPresentation();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      if (presentationRafRef.current !== null) {
+        cancelAnimationFrame(presentationRafRef.current);
+        presentationRafRef.current = null;
+      }
+    };
+  }, [requestPresentation]);
+
   const handleMessage = useCallback(
     (message: WebSocketMessage) => {
       if (message.type === "snapshot") {
-        setSnapshot(message.payload);
-        setVisualSnapshot((current) => snapshotForDisplay(message.payload, current));
+        const hidden = typeof document !== "undefined" && document.hidden;
+        recordBackendSnapshot(hidden);
+        if (pendingSnapshotRef.current !== null) recordCoalescedSnapshot();
+        pendingSnapshotRef.current = message.payload;
+        requestPresentation();
       }
       if (message.type === "history") {
-        setHistory(message.payload);
+        pendingHistoryRef.current = message.payload;
+        requestPresentation();
       }
       if (message.type === "error") {
         setError(`${message.scope}: ${message.message}`);
       }
     },
-    [setSnapshot, setVisualSnapshot]
+    [requestPresentation]
   );
 
   useEffect(() => {
@@ -458,10 +526,10 @@ function timestampForFilename(date: Date): string {
 
 function sessionFormatFromPath(filePath: string): SessionDataFormat {
   const extension = filePath.split(".").pop()?.toLowerCase();
-  if (extension === "csv" || extension === "xlsx" || extension === "mat" || extension === "h5") {
+  if (extension === "csv" || extension === "xlsx" || extension === "mat" || extension === "h5" || extension === "zip") {
     return extension;
   }
-  throw new Error("Session export file extension must be .csv, .xlsx, .mat, or .h5");
+  throw new Error("Session export file extension must be .csv, .xlsx, .mat, .h5, or .zip");
 }
 
 function usePersistentRatio(key: string, defaultValue: number): [number, (nextRatio: number) => void] {

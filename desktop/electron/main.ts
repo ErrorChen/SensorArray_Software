@@ -86,7 +86,7 @@ ipcMain.handle("dialog:selectSessionDataFile", async () => {
     defaultPath: defaultSaveDirectory,
     properties: ["openFile"],
     filters: [
-      { name: "SensorArray session data", extensions: ["csv", "xlsx", "mat", "h5"] },
+      { name: "SensorArray session data", extensions: ["csv", "xlsx", "mat", "h5", "zip"] },
       { name: "All files", extensions: ["*"] }
     ]
   });
@@ -104,6 +104,7 @@ ipcMain.handle("dialog:saveExportedSession", async (_event, defaultName: string,
       { name: "SensorArray Excel workbook", extensions: ["xlsx"] },
       { name: "SensorArray MATLAB file", extensions: ["mat"] },
       { name: "SensorArray HDF5 file", extensions: ["h5"] },
+      { name: "SensorArray Mixed CSV bundle", extensions: ["zip"] },
       { name: "All files", extensions: ["*"] }
     ]
   };
@@ -128,6 +129,7 @@ ipcMain.handle("dialog:chooseSessionExportPath", async (_event, defaultName: str
       { name: "SensorArray Excel workbook", extensions: ["xlsx"] },
       { name: "SensorArray MATLAB file", extensions: ["mat"] },
       { name: "SensorArray HDF5 file", extensions: ["h5"] },
+      { name: "SensorArray Mixed CSV bundle", extensions: ["zip"] },
       { name: "All files", extensions: ["*"] }
     ]
   });

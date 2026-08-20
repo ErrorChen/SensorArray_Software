@@ -20,6 +20,8 @@ class TelemetryStore:
         self.lastGoodBattery: dict[str, Any] | None = None
         self.railTelemetry: RailTelemetry | None = None
         self.deviceIdentity = ""
+        self.currentBootId: int | None = None
+        self.previousBootLastGood: dict[str, Any] | None = None
         self._batteryConnectionStale = False
         self._railConnectionStale = False
         self.revision = 0
@@ -41,6 +43,8 @@ class TelemetryStore:
             self.latestBatteryAttempt = None
             self.lastGoodBattery = None
             self.railTelemetry = None
+            self.currentBootId = None
+            self.previousBootLastGood = None
         self.deviceIdentity = normalized
         self._batteryConnectionStale = True
         self._railConnectionStale = True
@@ -51,7 +55,37 @@ class TelemetryStore:
         self._railConnectionStale = True
         self.revision += 1
 
+    def observe_boot(self, boot_id: int) -> bool:
+        """Advance the authoritative MCU epoch without conflating reconnects.
+
+        Current telemetry is boot scoped.  A previous last-good battery value
+        remains available only as explicitly historical provenance; it can no
+        longer satisfy the active reading after a real reboot.
+        """
+
+        new_boot_id = int(boot_id)
+        changed = self.currentBootId is not None and self.currentBootId != new_boot_id
+        if changed:
+            if self.lastGoodBattery is not None:
+                self.previousBootLastGood = {
+                    **self.lastGoodBattery,
+                    "bootId": self.currentBootId,
+                }
+            self.latestBatteryAttempt = None
+            self.lastGoodBattery = None
+            self.railTelemetry = None
+            self._batteryConnectionStale = True
+            self._railConnectionStale = True
+        self.currentBootId = new_boot_id
+        self.revision += 1
+        return changed
+
     def update_battery(self, telemetry: BatteryTelemetry) -> None:
+        telemetry_boot = getattr(telemetry, "bootId", None)
+        if self.currentBootId is not None and telemetry_boot not in {None, self.currentBootId}:
+            # A queued record from an old connection epoch is diagnostic
+            # history, never active current-boot telemetry.
+            return
         self.latestBatteryAttempt = telemetry
         firmware_last_good_mv = getattr(telemetry, "lastGoodBatteryMv", None)
         firmware_last_good_valid = getattr(telemetry, "lastGoodValid", None)
@@ -83,6 +117,7 @@ class TelemetryStore:
                     "source": getattr(telemetry, "lastGoodSource", None) or "firmware",
                     "reason": getattr(telemetry, "lastGoodReason", None) or "ok",
                     "firmwareAuthoritative": True,
+                    "bootId": telemetry_boot if telemetry_boot is not None else self.currentBootId,
                 }
             else:
                 # An explicit firmware invalid state overrides host history.
@@ -97,12 +132,15 @@ class TelemetryStore:
                 "source": "host_session_fallback",
                 "reason": telemetry.reason or "ok",
                 "firmwareAuthoritative": False,
+                "bootId": telemetry_boot if telemetry_boot is not None else self.currentBootId,
             }
         if telemetry.valid is not False and telemetry.batteryMv is not None and telemetry.fresh is not False:
             self._batteryConnectionStale = False
         self.revision += 1
 
     def update_rail(self, telemetry: RailTelemetry) -> None:
+        if self.currentBootId is not None and telemetry.bootId not in {None, self.currentBootId}:
+            return
         self.railTelemetry = telemetry
         if getattr(telemetry, "fresh", None) is True:
             self._railConnectionStale = False
@@ -113,6 +151,8 @@ class TelemetryStore:
         self.lastGoodBattery = None
         self.railTelemetry = None
         self.deviceIdentity = ""
+        self.currentBootId = None
+        self.previousBootLastGood = None
         self._batteryConnectionStale = False
         self._railConnectionStale = False
         self.revision += 1
@@ -151,6 +191,8 @@ class TelemetryStore:
                 "latestAttempt": latest_payload,
                 "lastGood": None,
                 "deviceIdentity": self.deviceIdentity,
+                "bootId": self.currentBootId,
+                "previousBootLastGood": self._previous_boot_payload(now),
             }
 
         latest_is_fresh = bool(
@@ -186,6 +228,8 @@ class TelemetryStore:
             "latestAttempt": latest_payload,
             "lastGood": last_good,
             "deviceIdentity": self.deviceIdentity,
+            "bootId": self.currentBootId,
+            "previousBootLastGood": self._previous_boot_payload(now),
         }
 
     def rail_snapshot(self, now: float) -> dict[str, Any]:
@@ -200,8 +244,13 @@ class TelemetryStore:
                 "source": "internal_monitor",
                 "reason": "unavailable",
                 "timestamp": None,
+                "avddUv": None,
+                "avssUv": None,
+                "spanUv": None,
+                "bootId": self.currentBootId,
             }
         payload = asdict(telemetry)
+        payload["spanUv"] = telemetry.spanUv
         timestamp = float(payload.get("timestamp") or now)
         age_ms = payload.get("ageMs")
         age_seconds = max(0.0, now - timestamp) + (max(0, int(age_ms)) / 1000.0 if age_ms is not None else 0.0)
@@ -210,6 +259,16 @@ class TelemetryStore:
             if str(payload.get("reason") or "").lower() in {"", "ok", "fresh"}:
                 payload["reason"] = "connection_stale"
         payload.update({"ageSeconds": age_seconds, "age": age_seconds})
+        return payload
+
+    def _previous_boot_payload(self, now: float) -> dict[str, Any] | None:
+        if self.previousBootLastGood is None:
+            return None
+        payload = dict(self.previousBootLastGood)
+        received = payload.get("receivedTime")
+        payload["ageSeconds"] = max(0.0, float(now) - float(received)) if received is not None else None
+        battery_mv = payload.get("batteryMv")
+        payload["batteryText"] = f"{int(battery_mv) / 1000.0:.3f} V" if battery_mv is not None else "N/A"
         return payload
 
     @staticmethod

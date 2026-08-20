@@ -14,15 +14,20 @@ class LegacyMatvProtocol:
     name = "LegacyMatvProtocol"
 
     def parse_line(self, line: str, envelope: TransportEnvelope) -> VoltageFrame | ParserErrorEvent | None:
+        # This adapter is a compatibility probe behind the current ASCII
+        # router. An unrelated firmware diagnostic may contain CSV-special
+        # characters; it must not become a legacy MATV parser rejection.
+        # Confirm the literal legacy tag before asking csv.reader to parse it.
+        candidate_tag = line.split(",", maxsplit=1)[0].strip()
+        if candidate_tag not in MATV_TYPES:
+            return None
         try:
-            fields = next(csv.reader([line]))
+            fields = next(csv.reader([line], strict=True))
         except csv.Error as exc:
             return ParserErrorEvent(envelope.source, envelope.channel, "matv_csv", str(exc), envelope.sessionGeneration, line)
         if not fields:
             return None
         tag = fields[0].strip()
-        if tag not in MATV_TYPES:
-            return None
         if tag.endswith("_HEADER"):
             return None
         try:

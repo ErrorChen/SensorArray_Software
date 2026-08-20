@@ -76,4 +76,19 @@ describe("RowModeProfileControl", () => {
     expect(html).toContain("Applying row modes");
     expect((html.match(/disabled=""/g) ?? []).length).toBeGreaterThanOrEqual(9);
   });
+
+  it("blocks applying a draft containing CAP while FDC restart is required", () => {
+    const snapshot = createBackendSnapshot({ mode: "RES" });
+    snapshot.fdcIsolation = { sd: "high", verified: true, restartRequired: true };
+    const profile = defaultSetupProfile(".");
+    const html = renderToStaticMarkup(createElement(RowModeProfileControl, {
+      client: {} as never,
+      snapshot,
+      setupProfile: profile,
+      onSetupProfileChange: () => undefined,
+      onError: () => undefined
+    }));
+    expect(html).toContain("This profile contains CAP, which is unavailable until the device is restarted.");
+    expect(html).toContain('<button class="primary" disabled="">Apply row modes</button>');
+  });
 });

@@ -127,7 +127,7 @@ class ReplayTransport:
 
 
 def _session_file_to_replay_bytes(path: Path) -> bytes | None:
-    if path.suffix.lower() in {".csv", ".xlsx", ".mat", ".h5", ".hdf5"}:
+    if path.suffix.lower() in {".csv", ".xlsx", ".mat", ".h5", ".hdf5", ".zip"}:
         return frames_to_measurement_ascii_bytes(load_session_frames(path))
     if path.suffix.lower() != ".json":
         return None

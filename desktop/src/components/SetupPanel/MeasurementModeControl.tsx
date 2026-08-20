@@ -43,6 +43,7 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
   }, [requestingMode, snapshot?.measurement]);
 
   const view = useMemo(() => measurementControlView(snapshot, requestingMode), [requestingMode, snapshot]);
+  const capRestartRequired = snapshot?.fdcIsolation?.restartRequired === true;
 
   async function requestMode(mode: MeasurementMode): Promise<void> {
     if (!client || view.busy || requestingMode) {
@@ -91,7 +92,8 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
           <button
             key={mode}
             className={view.appliedMode === mode && !view.pendingMode ? "active" : ""}
-            disabled={!client || view.busy || requestingMode !== null}
+            disabled={!client || view.busy || requestingMode !== null || (mode === "CAP" && capRestartRequired)}
+            title={mode === "CAP" && capRestartRequired ? "Restart the device to reinitialise FDC frontends before selecting CAP" : undefined}
             aria-pressed={view.appliedMode === mode && !view.pendingMode}
             onClick={() => void requestMode(mode)}
           >
@@ -99,6 +101,7 @@ export function MeasurementModeControl({ client, snapshot, setupProfile, onSetup
           </button>
         ))}
       </div>
+      {capRestartRequired ? <div className="modeOnlyNotice">CAP is unavailable while FDC shutdown is active. Restart the device first.</div> : null}
       <div className={`measurementTransition ${view.error || localError ? "error" : ""}`} data-testid="measurement-transition-state">
         {requestingMode ? `Requesting ${requestingMode}\u2026` : view.status}
       </div>

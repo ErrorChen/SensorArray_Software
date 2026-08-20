@@ -78,6 +78,9 @@ export function createBackendSnapshot(options: SnapshotOptions = {}): BackendSna
       rawFixed: numbers.map((row) => [...row]),
       valid: booleans.map((row) => [...row]),
       fresh: booleans.map((row) => [...row]),
+      expected: booleans.map((row) => [...row]),
+      acquired: booleans.map((row) => [...row]),
+      acquisitionMasksKnown: true,
       error: booleanMatrix(false),
       errorCodes: nullableNumberMatrix(),
       errorReasons: nullableStringMatrix(),
@@ -113,6 +116,7 @@ export function createBackendSnapshot(options: SnapshotOptions = {}): BackendSna
       pauseDisplay: false,
       freezeColor: false,
       unitMode: "auto",
+      voltageReference: "vss_relative",
       circuitOffsetPf: 33,
       trendLatestN: 600,
       colorRange: { min: null, max: null, frozen: false, quantity }

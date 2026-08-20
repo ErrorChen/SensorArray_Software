@@ -7,25 +7,18 @@ tests remain authoritative for real wire bytes.
 
 ## Contract status
 
-The host baseline for this change is
-`b86bdcf9d5f7d8cd7ca8bbfa8d2fe9bdad976c4f`. The firmware baseline is
-`331c44589318db9ba642cf3ab33bb08ca3dd8a34`.
+The firmware validation baseline is
+`8045e9e9ec9599533c52c15dfcb6002f79fd15f1`. The software revision under
+validation must be recorded separately because it changes during repair.
 
 That firmware revision provides the established homogeneous CAP/VOLT/RES
 families, `MODE`, `ROWMODES`, heterogeneous `M/MR/K`, FF30 lifecycle events,
 internal rail telemetry, and battery last-good fields. The production C
 formatter in `main/output/sensorarrayTextProtocol.c` is the byte-level
-authority. In particular, it emits short mixed identity keys, single-letter
-row modes, and comma-separated row data; copied firmware prose and its Python
-tool currently contain stale long-mode examples and do not override the C
-formatter.
-
-There is one known source-level incompatibility in `331c445`: homogeneous
-`ROWMODES` requests enter the legacy frame path, but row-profile completion and
-`RMAPP`/`RMERR` are implemented only in the mixed branch. The Host preserves
-strict transaction semantics and times out rather than treating a data frame
-as application. This is a firmware blocker for homogeneous row-profile and
-switching-stress acceptance, not a reason to weaken correlation.
+authority. It emits short mixed identity keys, long `MR` modes
+`CAP|VOLT|RES`, and comma-separated row data. Firmware `8045e9e9` completes
+homogeneous and heterogeneous `ROWMODES` transactions with `RMAPP` or `RMERR`;
+the Host retains strict request-ID correlation in both cases.
 
 The firmware schema is consumed once by
 `sensorarray_app.protocol.mixed_ascii.MixedMeasurementAsciiParser`. Replay
@@ -88,7 +81,7 @@ can recover.
 
 `ROWS=n` accepts every integer `n` from 1 through 8. `cells` must equal
 `rows * 8`; legacy homogeneous headers also carry `n=cells`, while canonical
-mixed headers do not. Inactive high mask bits are ignored and inactive cells
+mixed headers do not. Inactive high mask bits are rejected and inactive cells
 remain null.
 
 ## Homogeneous CAP frame
@@ -202,29 +195,26 @@ A complete mixed frame can synchronize the profile on first attachment only
 when no row-profile request is pending. It cannot complete a pending request or
 override a mismatched `RMAPP`.
 
-For firmware `331c445`, heterogeneous profiles have the complete path above.
-A homogeneous profile receives `RMACK`, but the firmware source does not emit a
-matching terminal row-profile event or clear the profile transition. The Host
-must retain its prior applied state and report timeout. Use the legacy
-`MODE=CAP|VOLT|RES` transaction for the supported set-all quick action until
-the firmware completion defect is corrected.
+Firmware `8045e9e9` uses the complete path above for heterogeneous and
+homogeneous profiles. `MODE=CAP|VOLT|RES` remains a supported set-all quick
+action, but it is not a workaround for a row-profile transaction.
 
 ## Canonical firmware mixed M/MR/K frame
 
-Firmware `331c445` chooses this family from the complete saved eight-row
-profile. Therefore `ROWS=4` plus `CCCCRVVR` still emits `M/MR/K`, even though
-the active prefix is all CAP. Only a fully homogeneous saved profile emits the
-corresponding legacy C/D/K or V|R/D/P/K family.
+Firmware `8045e9e9` supplies an eight-character wire profile whose inactive
+suffix is literal `N`. The Host accepts any valid active C/V/R prefix,
+including an active prefix containing only one mode, and requires exactly one
+matching `MR` for every active physical row.
 
 The exact C source formatter schema is:
 
 ```text
 M,seq=201,ts=201000,rows=5,cells=40,rgen=4,rrid=31,pgen=11,prid=62,profile=RVVCCVVR,fmt=mix1
-MR,s=1,m=R,unit=ohm,scale=-3,valid=FF,fresh=FF,error=00,fmt=mohm-x,D=10025000,...,...
-MR,s=2,m=V,unit=V,scale=-6,valid=FF,fresh=FF,error=00,fmt=uv-x,D=-1250,...,...
-MR,s=3,m=V,unit=V,scale=-6,valid=FF,fresh=FF,error=00,fmt=uv-x,D=...,...
-MR,s=4,m=C,unit=pF,scale=-6,valid=FF,fresh=FF,error=00,fmt=pf6,D=6315000,...,...
-MR,s=5,m=C,unit=pF,scale=-6,valid=FF,fresh=FF,error=00,fmt=pf6,D=...,...
+MR,s=1,m=RES,unit=ohm,scale=-3,valid=FF,fresh=FF,error=00,fmt=mohm-x,D=10025000,...,...
+MR,s=2,m=VOLT,unit=V,scale=-6,valid=FF,fresh=FF,error=00,fmt=uv-x,D=-1250,...,...
+MR,s=3,m=VOLT,unit=V,scale=-6,valid=FF,fresh=FF,error=00,fmt=uv-x,D=...,...
+MR,s=4,m=CAP,unit=pF,scale=-6,valid=FF,fresh=FF,error=00,fmt=pf6,D=6315000,...,...
+MR,s=5,m=CAP,unit=pF,scale=-6,valid=FF,fresh=FF,error=00,fmt=pf6,D=...,...
 K,seq=201,rgen=4,rrid=31,pgen=11,prid=62,crc=<8 hexadecimal digits>
 ```
 
@@ -244,7 +234,7 @@ must match `profile[s-1]`; its unit, scale, and format must be:
 | `V` | VOLT | `V` | `-6` | `uv-x` |
 | `R` | RES | `ohm` | `-3` | `mohm-x` |
 
-Canonical `331c445` mixed rows do not carry PGA, reference, rail, or age
+Canonical `8045e9e9` mixed rows do not carry PGA, reference, rail, or age
 fields. They remain optional in the typed row model for legacy Replay and
 future additive metadata, but the Host never infers or fabricates them when
 the canonical frame omits them.
@@ -254,8 +244,8 @@ The parser accepts a frame only after all of these checks pass:
 - one M header, then exactly one MR for every physical row S1 through
   S`rows`, in ascending order, then one K trailer;
 - no duplicate, missing, inactive, or reordered rows;
-- `cells=rows*8`, `fmt=mix1`, and a valid heterogeneous saved profile of eight
-  characters;
+- `cells=rows*8`, `fmt=mix1`, and a valid eight-character wire profile with an
+  exact inactive `N` suffix; the active prefix need not be heterogeneous;
 - row mode/profile, unit/scale/format, eight-value, mask, and `Xhh` consistency;
 - matching M/K sequence, ROWS identities, and profile identities;
 - CRC over exact M and ordered MR bytes including LF, excluding K.
@@ -266,7 +256,7 @@ duplicate-row, profile-mismatched, or bad-CRC frame is atomic rejection and
 cannot partially update MatrixStore.
 
 The Host additionally reads the former long-key/pipe-separated Replay schema as
-a compatibility alias, but it never emits that alias as canonical `331c445`
+a compatibility alias, but it never emits that alias as canonical `8045e9e9`
 traffic. Any future divergence is resolved against firmware formatter source,
 not patched independently in React.
 
@@ -313,7 +303,7 @@ latestBatteryAttempt
 lastGoodBattery
 ```
 
-Firmware `331c445` publishes `lastGoodMv`, `lastGoodValid`, `lastGoodFresh`,
+Firmware `8045e9e9` publishes `lastGoodMv`, `lastGoodValid`, `lastGoodFresh`,
 `lastGoodAgeMs`, and `lastGoodFrame`; those fields are authoritative. The Host
 also reads the earlier short `bl*` aliases. If neither schema is present, it
 retains the last valid measurement seen in the current device session. For

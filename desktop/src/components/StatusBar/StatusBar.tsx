@@ -24,6 +24,12 @@ export function StatusBar({ snapshot, socketState }: Props): JSX.Element {
           <RadioTower size={16} /> Transport: {connection?.mode ?? "serial"} / {connection?.state ?? "disconnected"}
         </span>
         <span className="statusItem">{connection?.deviceLabel || "No device"}</span>
+        {(snapshot?.transport?.reconnectAttempt ?? 0) > 0 ? (
+          <span className="statusWarning">
+            reconnect {snapshot?.transport?.reconnectAttempt} · {(snapshot?.transport?.reconnectBackoff ?? 0).toFixed(1)}s
+          </span>
+        ) : null}
+        <span className="statusItem">boot {snapshot?.device?.bootId ?? "-"}</span>
         <span className="statusItem">
           <Activity size={16} /> Measurement: {appliedMode}
           {pendingMode ? ` \u2192 ${pendingMode} (${snapshot?.measurement.transitionState ?? "requested"})` : ""}
@@ -36,6 +42,11 @@ export function StatusBar({ snapshot, socketState }: Props): JSX.Element {
         ))}
         {!snapshot?.rates && typeof frame?.fps === "number" ? <span className="statusItem">Host frames {frame.fps.toFixed(1)} fps</span> : null}
         <span className="statusItem">{battery}</span>
+        {snapshot?.recording?.state === "RECORDING" ? (
+          <span className={snapshot.recording.droppedFrames ? "statusWarning" : "statusItem"}>
+            REC {snapshot.recording.writtenFrames}/{snapshot.recording.receivedFrames} · drop {snapshot.recording.droppedFrames}
+          </span>
+        ) : null}
         {adsUnconfirmed ? <span className="statusWarning">ADS identity unconfirmed</span> : null}
         <span className={`socketState ${socketState}`}>{socketState}</span>
       </div>

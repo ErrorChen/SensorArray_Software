@@ -45,6 +45,7 @@ def test_fastapi_status_schema_contains_required_snapshot_fields():
     assert "title" in payload["selection"]
     assert payload["display"]["displayMode"] == "absolute_pf"
     assert payload["display"]["circuitOffsetPf"] == 33.0
+    assert "calibration" in payload
 
 
 def test_websocket_publishes_snapshot_and_history():

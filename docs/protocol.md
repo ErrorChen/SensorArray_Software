@@ -1,6 +1,6 @@
 # Protocol documentation moved
 
-The former CAP-only b41 notes in this file are superseded by
+The former CAP-only legacy notes in this file are superseded by
 [Host measurement protocol compatibility notes](measurement-protocol.md).
 
 That document describes current CAP/VOLT/RES host compatibility, including

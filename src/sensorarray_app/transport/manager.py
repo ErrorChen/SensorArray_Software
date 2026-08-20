@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+from dataclasses import asdict
 from pathlib import Path
 
 from sensorarray_app.constants import DEFAULT_SERIAL_BAUD
@@ -8,6 +9,7 @@ from sensorarray_app.domain.models import TransportEnvelope, TransportStateEvent
 from sensorarray_app.transport.ble_transport import BleTransport
 from sensorarray_app.transport.replay_transport import ReplayTransport
 from sensorarray_app.transport.serial_transport import SerialTransport
+from sensorarray_app.transport.base import TransportNotSent
 from sensorarray_app.transport.session import SessionManager
 from sensorarray_app.transport.wifi_udp_transport import WifiUdpTransport
 
@@ -22,12 +24,19 @@ class TransportManager:
             "state": "DISCONNECTED",
             "device": "",
             "sessionGeneration": 0,
+            "connectionGeneration": 0,
+            "reconnectAttempt": 0,
+            "reconnectBackoff": 0.0,
+            "deviceIdentity": None,
             "error": "",
         }
 
     def disconnect(self) -> None:
-        if self.current is not None:
-            self.current.stop()
+        current = self.current
+        if current is not None:
+            # stop() is required to confirm its worker/client has exited.  A
+            # failure is surfaced and a replacement transport is not created.
+            current.stop()
         self.current = None
         generation = self.sessions.next_generation()
         self.status.update(
@@ -36,12 +45,19 @@ class TransportManager:
                 "state": "DISCONNECTED",
                 "device": "",
                 "sessionGeneration": generation,
+                "connectionGeneration": 0,
+                "deviceIdentity": None,
+                "queueCounters": {},
+                "priorityBacklog": 0,
+                "notificationCounts": {},
+                "notificationBytes": {},
+                "hostRawQueueOverflow": 0,
                 "message": "",
                 "error": "",
             }
         )
 
-    def connect_serial(self, port: str, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = False) -> int:
+    def connect_serial(self, port: str, baud: int = DEFAULT_SERIAL_BAUD, auto_reconnect: bool = True) -> int:
         if not str(port or "").strip():
             raise ValueError("serial port is required")
         self.disconnect()
@@ -54,6 +70,7 @@ class TransportManager:
                 "state": "CONNECTING",
                 "device": port,
                 "sessionGeneration": generation,
+                "connectionGeneration": 0,
                 "message": "",
                 "error": "",
             }
@@ -77,10 +94,24 @@ class TransportManager:
         )
         return generation
 
-    def connect_ble(self, address: str, device_id: str = "") -> int:
+    def connect_ble(
+        self,
+        address: str,
+        device_id: str = "",
+        *,
+        ble_device=None,
+        auto_reconnect: bool = True,
+    ) -> int:
         self.disconnect()
         generation = self.sessions.generation
-        self.current = BleTransport(self.outputQueue, generation, address, device_id=device_id)
+        self.current = BleTransport(
+            self.outputQueue,
+            generation,
+            address,
+            device_id=device_id,
+            ble_device=ble_device,
+            auto_reconnect=auto_reconnect,
+        )
         self.current.start()
         self.status.update(
             {
@@ -88,6 +119,12 @@ class TransportManager:
                 "state": "CONNECTING",
                 "device": address,
                 "sessionGeneration": generation,
+                "connectionGeneration": 0,
+                "deviceIdentity": {
+                    "transport": "ble",
+                    "address": str(address),
+                    "deviceId": str(device_id),
+                },
                 "message": "",
                 "error": "",
             }
@@ -113,8 +150,15 @@ class TransportManager:
 
     def send_command(self, command: str) -> None:
         if self.current is None:
-            raise RuntimeError("no transport connected")
+            raise TransportNotSent("no transport connected; command was not sent")
         self.current.send_command(command)
+
+    def request_expected_restart_reconnect(self) -> bool:
+        current = self.current
+        if not isinstance(current, SerialTransport):
+            return False
+        current.request_reconnect("firmware acknowledged expected RESTART")
+        return True
 
     def write(self, data: bytes) -> dict[str, int | str | bool]:
         if self.current is None:
@@ -142,5 +186,36 @@ class TransportManager:
                 "state": event.state,
                 "message": event.message,
                 "error": errorMessage,
+                "connectionGeneration": int(event.metadata.get("connectionGeneration", 0) or 0),
+                "reconnectAttempt": int(event.metadata.get("reconnectAttempt", 0) or 0),
+                "reconnectBackoff": float(event.metadata.get("reconnectBackoff", 0.0) or 0.0),
+                "deviceIdentity": event.metadata.get("identity") or self.status.get("deviceIdentity"),
+                "queueCounters": event.metadata.get("queueCounters", self.status.get("queueCounters", {})),
+                "priorityBacklog": int(event.metadata.get("priorityBacklog", self.status.get("priorityBacklog", 0)) or 0),
+                "notificationCounts": event.metadata.get("notificationCounts", self.status.get("notificationCounts", {})),
+                "notificationBytes": event.metadata.get("notificationBytes", self.status.get("notificationBytes", {})),
+                "hostRawQueueOverflow": int(event.metadata.get("hostRawQueueOverflow", self.status.get("hostRawQueueOverflow", 0)) or 0),
             }
         )
+
+    def diagnostics(self) -> dict:
+        current = self.current
+        if isinstance(current, BleTransport):
+            fragment_stats = getattr(getattr(current, "_fragmenter", None), "stats", None)
+            return {
+                "source": "ble",
+                "queueCounters": dict(current.queueCounters),
+                "priorityBacklog": current.priorityBacklog,
+                "notificationCounts": dict(current._notify_counts),
+                "notificationBytes": dict(current._notify_bytes),
+                "fragment": asdict(fragment_stats) if fragment_stats is not None else {},
+            }
+        if isinstance(current, SerialTransport):
+            return {
+                "source": "serial",
+                "rawQueueOverflow": int(current.rawQueueOverflow),
+                "lifecycleDrops": int(current.lifecycleDrops),
+                "bytesReceived": int(current.bytesReceived),
+                "packetsReceived": int(current.packetsReceived),
+            }
+        return {"source": str(self.status.get("transport", "none"))}

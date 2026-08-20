@@ -51,7 +51,7 @@ export function prepareGuiReplayFixtures(repoRoot: string): GuiReplayFixtures {
       "MACK,id=42,old=CAP,new=VOLT,state=accepted\n",
       "MAPP,id=42,gen=7,old=CAP,new=VOLT,seq=8,state=applied,transitionUs=500\n",
       voltageSource,
-      // Exact RAIL? response keys from firmware 331c445. `src=monitor` is
+      // Exact RAIL? response keys from firmware 8045e9e9. `src=monitor` is
       // normalised by the typed backend to the UI-facing internal_monitor.
       "ARL,src=monitor,raw=123,mon=5126000,rail=5126000,avdd=3126000,avss=-2000000,exp=5126000,err=0,rv=1,rs=ok,age=0,ref=restored,pwr=restored,mux=restored\n",
       // Keep the synthetic device connected while the Electron assertion and
@@ -260,7 +260,7 @@ function mutatePacket(packet: string, mutation: PacketMutation): string {
   return packetWithCrc(lines.join("\n"));
 }
 
-function buildCapPacket(sourcePacket: string, rows: number): string {
+export function buildCapPacket(sourcePacket: string, rows: number): string {
   if (!Number.isInteger(rows) || rows < 1 || rows > 8) {
     throw new Error(`CAP rows must be 1..8, received ${rows}`);
   }
@@ -270,6 +270,7 @@ function buildCapPacket(sourcePacket: string, rows: number): string {
     .flatMap((line) => line.split(",").slice(1))
     .slice(0, rows * 8);
   const activeMask = ((1 << rows) - 1).toString(16).toUpperCase().padStart(2, "0");
+  const activeCellMask = ((1n << BigInt(rows * 8)) - 1n).toString(16).toUpperCase().padStart(16, "0");
   let header = sourceLines[0];
   const fields: Record<string, string> = {
     seq: String(rows),
@@ -279,6 +280,8 @@ function buildCapPacket(sourcePacket: string, rows: number): string {
     rf: activeMask,
     pf: activeMask,
     sf: activeMask,
+    expected: activeCellMask,
+    acquired: activeCellMask,
     n: String(rows * 8)
   };
   for (const [field, value] of Object.entries(fields)) {
@@ -326,14 +329,16 @@ export function buildMixedPacket(options: {
     throw new Error(`invalid mixed fixture geometry/profile: rows=${rows}, profile=${profile}`);
   }
   const modes = {
-    C: { unit: "pF", scale: -6, format: "pf6" },
-    V: { unit: "V", scale: -6, format: "uv-x" },
-    R: { unit: "ohm", scale: -3, format: "mohm-x" }
+    C: { name: "CAP", unit: "pF", scale: -6, format: "pf6" },
+    V: { name: "VOLT", unit: "V", scale: -6, format: "uv-x" },
+    R: { name: "RES", unit: "ohm", scale: -3, format: "mohm-x" }
   } as const;
   const rowsGeneration = 4;
   const rowsRequestId = 14;
+  const wireProfile = `${profile.slice(0, rows)}${"N".repeat(8 - rows)}`;
+  const globalMask = ((1n << BigInt(rows * 8)) - 1n).toString(16).toUpperCase().padStart(16, "0");
   const lines = [
-    `M,seq=${seq},ts=${seq * 1000},rows=${rows},cells=${rows * 8},rgen=${rowsGeneration},rrid=${rowsRequestId},pgen=${profileGeneration},prid=${profileRequestId},profile=${profile},fmt=mix1`
+    `M,seq=${seq},ts=${seq * 1000},rows=${rows},cells=${rows * 8},rgen=${rowsGeneration},rrid=${rowsRequestId},pgen=${profileGeneration},prid=${profileRequestId},profile=${wireProfile},expected=${globalMask},acquired=${globalMask},fmt=mix1`
   ];
   for (let row = 1; row <= rows; row += 1) {
     const mode = profile[row - 1] as keyof typeof modes;
@@ -344,7 +349,7 @@ export function buildMixedPacket(options: {
       return String(10_025_000 + row * 1_000 + cell * 10);
     });
     lines.push(
-      `MR,s=${row},m=${mode},unit=${descriptor.unit},scale=${descriptor.scale},valid=FF,fresh=FF,error=00,fmt=${descriptor.format},D=${values.join(",")}`
+      `MR,s=${row},m=${descriptor.name},unit=${descriptor.unit},scale=${descriptor.scale},expected=FF,acquired=FF,valid=FF,fresh=FF,error=00,fmt=${descriptor.format},D=${values.join(",")}`
     );
   }
   const payload = `${lines.join("\n")}\n`;

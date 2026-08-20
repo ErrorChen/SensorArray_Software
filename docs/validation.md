@@ -17,27 +17,24 @@ test is not Electron GUI acceptance. A firmware build is not wire/HIL evidence.
 Unavailable hardware or missing firmware capability is reported as
 `BLOCKED / NOT RUN`, never inferred from fixtures.
 
-## Firmware precondition and current blocker
+## Firmware precondition
 
 The authoritative firmware revision is
-`331c44589318db9ba642cf3ab33bb08ca3dd8a34`. Validate its production C
+`8045e9e9ec9599533c52c15dfcb6002f79fd15f1`. Validate its production C
 formatter, not stale copied examples. Canonical mixed wire uses
-`rgen/rrid/pgen/prid`, `MR,s=<row>,m=C|V|R`, canonical `fmt`, comma-separated
+`rgen/rrid/pgen/prid`, `MR,s=<row>,m=CAP|VOLT|RES`, canonical `fmt`, comma-separated
 `D=` values, and the short-key `K` trailer. CRC covers exact `M` plus ordered
 `MR` bytes including LF.
 
-Source audit identifies one firmware-side acceptance blocker: homogeneous
-`ROWMODES=CCCCCCCC|VVVVVVVV|RRRRRRRR` emits `RMACK`, then takes the legacy
-frame path. In that path firmware `331c445` neither completes rowProfile nor
-prints `RMAPP`/`RMERR`; those operations occur only inside the mixed branch.
-The Host must time out strictly and must not use C/V/R data as an applied event.
-Report this separately:
+Firmware `8045e9e9` supplies terminal row-profile events for homogeneous and
+heterogeneous profiles. The Host must still reject a missing/wrong terminal
+and must not use C/V/R data as an applied event. Report these separately:
 
 ```text
-331c445 exact mixed parser compatibility: software fixture/source PASS or FAIL
+8045e9e9 exact mixed parser compatibility: software fixture/source PASS or FAIL
 Heterogeneous BLE RMACK/RMAPP and mixed frame HIL: measured PASS/FAIL/BLOCKED
-Homogeneous ROWMODES terminal transaction: BLOCKED (firmware defect)
-Switching stress containing homogeneous ROWMODES: FAIL/BLOCKED at that step
+Homogeneous ROWMODES terminal transaction: measured PASS/FAIL/BLOCKED
+Switching stress containing homogeneous ROWMODES: measured PASS/FAIL/BLOCKED
 ```
 
 Do not use Serial as a hidden applied-event source for a BLE PASS.
@@ -232,11 +229,32 @@ Use the full Electron GUI at 115200 baud:
 3. Exercise every ROWS value 1 through 8 with matching ROWS transaction and
    geometry frame.
 4. Exercise global CAP -> RES -> CAP and CAP -> VOLT -> CAP.
-5. Apply `RVVCCVVR` and `CRVCRVCR`; require matching RMACK/RMAPP and sustained
-   mixed frames with correct profile generation/request ID/physical row.
+5. Apply `RVVCCVVR`; require matching RMACK/RMAPP and sustained mixed frames
+   with correct profile generation/request ID/physical row.
 6. Inspect heatmap labels/scales, tooltip units, CAP-only controls, rail
    telemetry, battery latest/last-good, raw log, and status.
 7. Disconnect/reconnect and verify session/device isolation.
+
+Before judging FULL ingest, issue `FPSCAP=OFF` and `OUTCAP=OFF`, then require
+`FPS?` to report `cfcap=0,ofcap=0`. Bracket every sustained interval with
+`PERF?`. For a fixed sequence interval, PASS requires every observed gap to be
+partitioned into firmware non-fresh frames or source-specific firmware drops,
+with zero new Host-unexplained gap, parser reject, CRC failure, and Host raw
+queue overflow. Do not use SF50's aggregate all-sink drop count to hide a
+source-specific loss.
+
+`PERF.frames` is the causal sequence watermark for that reply. A gap above the
+latest watermark is reported as `pendingFirmwareEvidenceGap`, not immediately
+as Host loss, because the reply may have waited behind newer measurement
+frames in the transport queue. Use the opening and closing `PERF.frames`
+watermarks as the fixed interval boundaries. Frames already observed beyond
+the closing watermark are an explicitly excluded live tail; a continuously
+running FULL stream is not expected to let a queued reply catch its moving
+latest-frame boundary.
+`hostUnexplainedSequenceGap` contains only gaps at or below a covered firmware
+watermark that are not explained by source-specific firmware counters. Never
+associate a delayed `PERF` reply with the Host sequence that happened to be
+current when the reply arrived.
 
 Serial evidence is useful but cannot replace the BLE FF30 requirements below.
 
@@ -245,6 +263,13 @@ Serial evidence is useful but cannot replace the BLE FF30 requirements below.
 Use the GUI Scan -> verified SensorArray -> Connect flow. Verify service `00FF`
 and the existing single subscriptions to CTRL TX `FF11`, DATA `FF20`, and LOG
 `FF30`. Do not create a second client or subscribe to FF30 twice.
+
+After the functional checks, force 30 unexpected BLE link drops while leaving
+the GUI session active. Every cycle must automatically reconnect to the same
+device, increment `connectionGeneration`, run bootstrap/resynchronisation, and
+prove FF11/FF20/FF30 again with a strict mode transaction and a fresh data
+frame. A manual Stop/Start is a separate lifecycle check and cannot substitute
+for these unexpected-disconnect cycles.
 
 ### Global transaction
 
@@ -305,31 +330,64 @@ unbounded React render loop, parser corruption, CRC runaway, stale profile,
 unit crossover, or transaction desynchronization. The requirement is 120
 seconds per state, not ten minutes and not a combined 120 seconds.
 
+In addition, the Serial FULL scientific-recorder endurance gate runs for at
+least 450 seconds (7.5 minutes). It requires `receivedFrames == writtenFrames`,
+zero recorder drops, a clean finalised session, bounded renderer memory, and
+the same parser/CRC/sequence-integrity conditions. The recorder gate is
+independent of the four 120-second mode/profile runs.
+
 ## Switching stress
 
-Run at least ten complete cycles of the global sequences:
+Run at least ten complete cycles of this exact global/profile sequence:
 
 ```text
-CAP -> RES -> CAP
-CAP -> VOLT -> CAP
-```
-
-Also cycle these row profiles, requiring matching transaction completion each
-time:
-
-```text
-CCCCCCCC
+CAP
+RES
+VOLT
 RVVCCVVR
-VVVVVVVV
-CRVCRVCR
+CCCCCCCC
 RRRRRRRR
+VVVVVVVV
 ```
 
 Record every request ID, accepted event, applied event, generation, and
 boundary sequence. A timeout, wrong-ID acceptance, or data-frame-inferred
-application fails that cycle. With exact firmware `331c445`, the homogeneous
-entries are expected to expose the known missing-terminal-event defect; do not
-skip them or relabel the partial heterogeneous subset as full stress PASS.
+application fails that cycle. Do not skip homogeneous entries or relabel a
+partial heterogeneous subset as full stress PASS.
+
+## Hardware test entry points
+
+Build the desktop application first, then run each real-hardware phase from
+`desktop/` with the real serial port in `SENSORARRAY_HIL_SERIAL_PORT`:
+
+```text
+node hardware-e2e/runHardwareHil.mjs --phase=serial-wire
+node hardware-e2e/runHardwareHil.mjs --phase=serial
+node hardware-e2e/runHardwareHil.mjs --phase=serial-switching
+node hardware-e2e/runHardwareHil.mjs --phase=lifecycle
+node hardware-e2e/runHardwareHil.mjs --phase=gui-stress
+node hardware-e2e/runHardwareHil.mjs --phase=ble
+node hardware-e2e/runHardwareHil.mjs --phase=ble-reconnect
+node hardware-e2e/runHardwareHil.mjs --phase=mixed
+node hardware-e2e/runHardwareHil.mjs --phase=wifi
+```
+
+`serial` includes the 450-second recorder endurance interval and the four
+120-second state intervals. `serial-switching` executes ten complete cycles of
+the required global/profile sequence. `lifecycle` verifies Recover, guarded
+FDC enable/disable, restart, automatic reconnect, new boot identity, bootstrap,
+and completion-after-reboot. `ble-reconnect` executes 30 forced link drops in
+one Host session and one firmware boot; every new connection epoch must
+bootstrap, complete a GUI ROWS transaction over FF11/FF30, and deliver a fresh
+FF20 frame. Deliberate disconnect/bootstrap/configuration boundaries are
+reported separately from the lossless 120-second sustained-run windows.
+`gui-stress` executes 100 rounds comprising 400
+tab changes, 100 resizes, and 100 minimise/restore cycles while lossless
+recording remains active. Each phase writes its own JSON and screenshots under
+`validation_artifacts/hardware`; one phase's PASS must not be promoted to
+another phase. `wifi` performs only the bounded GUI discovery/confirmation
+smoke and reports `BLOCKED` when the default SoftAP endpoint does not answer;
+an unconfirmed fallback address is never counted as hardware PASS.
 
 ## Wi-Fi and packaging
 

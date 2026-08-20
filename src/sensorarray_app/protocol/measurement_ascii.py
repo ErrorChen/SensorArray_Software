@@ -10,8 +10,13 @@ from sensorarray_app.protocol.crc import crc32_reflected
 
 
 HEADER_RE = re.compile(r"^([VR]),")
-DATA_RE = re.compile(r"^D(\d+),")
-PGA_RE = re.compile(r"^P(\d+),")
+# D4 is also an authoritative firmware runtime-diagnostic tag. Measurement
+# chunks never start with key=value, which safely disambiguates interleaved
+# ``D4,d=...`` logs while retaining strict validation of malformed D tokens.
+DATA_RE = re.compile(r"^D(\d+),(?![A-Za-z][A-Za-z0-9_]*=)")
+# P5/P50 are firmware performance summaries. Packed PGA chunks begin with a
+# hexadecimal payload, never a key=value field.
+PGA_RE = re.compile(r"^P(\d+),(?![A-Za-z][A-Za-z0-9_]*=)")
 TRAILER_RE = re.compile(r"^K,")
 X_TOKEN_RE = re.compile(r"^X([0-9A-Fa-f]{2})$")
 MAX_CHUNK_VALUES = 16
@@ -19,7 +24,7 @@ PENDING_TIMEOUT_NS = 2_000_000_000
 VALID_PGA_LITERALS = frozenset({0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20})
 
 # These values are the production sensorarrayCellError_t values retained by
-# firmware 331c445. Unknown values must remain visible rather than being
+# firmware 8045e9e9. Unknown values must remain visible rather than being
 # coerced to zero or causing a parser failure.
 CELL_ERROR_REASONS = {
     0x00: "No firmware cell error",
@@ -95,6 +100,8 @@ class _PendingMeasurementFrame:
     validBits: int
     freshBits: int
     errorBits: int
+    expectedBits: int
+    acquiredBits: int
     badCellCount: int
     expectedChunkLines: int
     startMonotonicNs: int
@@ -229,7 +236,7 @@ class MeasurementAsciiParser:
         fields = _parse_key_values(line)
         try:
             seq = _parse_decimal(fields, "seq")
-            timestampUs = _parse_decimal(fields, "ts", 0)
+            timestampUs = _parse_decimal(fields, "ts")
             rows = _parse_decimal(fields, "rows")
             cells = _parse_decimal(fields, "cells")
             generation = _parse_decimal(fields, "gen")
@@ -240,6 +247,8 @@ class MeasurementAsciiParser:
             validBits = _parse_mask(fields, "valid")
             freshBits = _parse_mask(fields, "fresh")
             errorBits = _parse_mask(fields, "error")
+            expectedBits = _parse_mask(fields, "expected", exactWidth=16)
+            acquiredBits = _parse_mask(fields, "acquired", exactWidth=16)
             badCellCount = _parse_decimal(fields, "bad")
             # The current production formatter always emits this diagnostic
             # set. Parse every field now so malformed/missing metadata cannot
@@ -271,9 +280,15 @@ class MeasurementAsciiParser:
                 envelope,
                 rawLine,
             )
-        activeBits = (1 << cells) - 1
-        if any(mask & ~activeBits for mask in (validBits, freshBits, errorBits)):
-            return self._reject("mask_out_of_range", "valid/fresh/error contains inactive cell bits", envelope, rawLine)
+        if min(seq, timestampUs, generation, requestId) < 0:
+            return self._reject("negative_identity", "V/R identities and timestamp must be non-negative", envelope, rawLine)
+        activeBits = (1 << cells) - 1 if cells < 64 else (1 << 64) - 1
+        if any(mask & ~activeBits for mask in (validBits, freshBits, errorBits, expectedBits, acquiredBits)):
+            return self._reject("mask_out_of_range", "V/R mask contains inactive cell bits", envelope, rawLine)
+        if acquiredBits & ~expectedBits:
+            return self._reject("acquired_outside_expected", "V/R acquired must be a subset of expected", envelope, rawLine)
+        if freshBits & ~acquiredBits:
+            return self._reject("fresh_outside_acquired", "V/R fresh must be a subset of acquired", envelope, rawLine)
         expectedBadCellCount = cells - validBits.bit_count()
         if badCellCount != expectedBadCellCount:
             return self._reject(
@@ -305,6 +320,8 @@ class MeasurementAsciiParser:
             validBits=validBits,
             freshBits=freshBits,
             errorBits=errorBits,
+            expectedBits=expectedBits,
+            acquiredBits=acquiredBits,
             badCellCount=badCellCount,
             expectedChunkLines=(cells + MAX_CHUNK_VALUES - 1) // MAX_CHUNK_VALUES,
             startMonotonicNs=envelope.receivedMonotonicNs,
@@ -423,6 +440,8 @@ class MeasurementAsciiParser:
             expectedCrc = int(fields["crc"], 16)
         except (KeyError, ValueError) as exc:
             return [self._reject_pending("bad_k", f"invalid K fields: {exc}", envelope)]
+        if re.fullmatch(r"[0-9A-Fa-f]{8}", fields.get("crc", "")) is None:
+            return [self._reject_pending("bad_crc_width", "V/R K crc must be exactly eight hex characters", envelope)]
 
         if (seq, generation, requestId) != (pending.seq, pending.generation, pending.requestId):
             self.stats.headerMismatch += 1
@@ -458,6 +477,8 @@ class MeasurementAsciiParser:
         validMask = _mask_array(pending.validBits, pending.cells)
         freshMask = _mask_array(pending.freshBits, pending.cells)
         errorMask = _mask_array(pending.errorBits, pending.cells)
+        expectedMask = _mask_array(pending.expectedBits, pending.cells)
+        acquiredMask = _mask_array(pending.acquiredBits, pending.cells)
         tokenInvalid = ~np.isfinite(rawValues)
         if not np.array_equal(validMask, ~tokenInvalid):
             return [self._reject_pending("valid_token_mismatch", "header valid mask disagrees with D Xhh tokens", envelope)]
@@ -511,6 +532,11 @@ class MeasurementAsciiParser:
             rawHeader=pending.headerLine,
             rawTrailer=line,
             rawFields=dict(pending.fields),
+            expectedMask=expectedMask,
+            acquiredMask=acquiredMask,
+            acquisitionMasksKnown=True,
+            connectionGeneration=envelope.connectionGeneration,
+            bootId=envelope.bootId,
         )
         if self.stats.lastSeq is not None and pending.seq > self.stats.lastSeq + 1:
             self.stats.sequenceGaps += pending.seq - self.stats.lastSeq - 1
@@ -576,8 +602,11 @@ def _parse_decimal(fields: dict[str, str], name: str, default: int | None = None
     return int(fields[name], 10)
 
 
-def _parse_mask(fields: dict[str, str], name: str) -> int:
-    return int(fields[name], 16)
+def _parse_mask(fields: dict[str, str], name: str, *, exactWidth: int = 16) -> int:
+    text = fields[name].strip()
+    if re.fullmatch(rf"[0-9A-Fa-f]{{{exactWidth}}}", text) is None:
+        raise ValueError(f"{name} must be exactly {exactWidth} hex characters")
+    return int(text, 16)
 
 
 def _parse_binary_bool(fields: dict[str, str], name: str) -> bool:
